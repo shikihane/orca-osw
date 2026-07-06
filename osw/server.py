@@ -190,7 +190,7 @@ async def handle_use(ctx: ServerContext, request: dict) -> None:
             "agent_id": agent_id,
             "terminal": handle,
             "worktree_path": worktree_path,
-            "provider_command": request.get("command", ""),
+            "provider_command": "",
             "state": "assigned",
             "caller_terminal": request.get("caller_terminal"),
             "last_prompt": prompt,
@@ -393,4 +393,7 @@ async def reconcile_loop(ctx: ServerContext) -> None:
                 if agent["terminal"] not in live_handles:
                     ctx.state["agents"][agent_id]["state"] = "lost"
                     ctx.state["agents"][agent_id]["updated_at"] = now_iso()
+                    scope = ctx.watchers.get(agent_id)
+                    if scope is not None:
+                        scope.cancel()
             write_state(ctx.root, ctx.state)

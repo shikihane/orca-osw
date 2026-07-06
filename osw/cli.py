@@ -35,9 +35,10 @@ def _handle_result(result: dict | None, on_ok) -> None:
     """Shared result handling for new/use/all/del: timeout, error, or success."""
     if result is None:
         typer.echo(
-            f"Timed out waiting for supervisor response after {RESULT_TIMEOUT:.0f}s.",
+            "OSW serve did not return a result within 15 seconds.",
             err=True,
         )
+        typer.echo("Check python osw.py status.", err=True)
         raise typer.Exit(1)
 
     if result.get("ok"):
@@ -63,12 +64,18 @@ def serve() -> None:
 
 
 @app.command()
-def new(prompt: str) -> None:
+def new(
+    prompt: str,
+    caller_terminal: str = typer.Option(None, "--caller-terminal", help="Terminal handle to receive completion reports"),
+) -> None:
     """Create a new agent terminal and send it a task prompt."""
     root = resolve_project_root()
     require_serve(root)
 
-    request_id = write_request(root, "new", {"prompt": prompt})
+    payload: dict = {"prompt": prompt}
+    if caller_terminal:
+        payload["caller_terminal"] = caller_terminal
+    request_id = write_request(root, "new", payload)
     result = read_result(root, request_id, timeout=RESULT_TIMEOUT)
 
     def on_ok(result: dict) -> None:
@@ -83,12 +90,16 @@ def new(prompt: str) -> None:
 def use(
     prompt: str,
     terminal: str = typer.Option(..., "--terminal", help="Terminal handle to adopt"),
+    caller_terminal: str = typer.Option(None, "--caller-terminal", help="Terminal handle to receive completion reports"),
 ) -> None:
     """Adopt an already-running terminal as a managed agent."""
     root = resolve_project_root()
     require_serve(root)
 
-    request_id = write_request(root, "use", {"terminal": terminal, "prompt": prompt})
+    payload: dict = {"terminal": terminal, "prompt": prompt}
+    if caller_terminal:
+        payload["caller_terminal"] = caller_terminal
+    request_id = write_request(root, "use", payload)
     result = read_result(root, request_id, timeout=RESULT_TIMEOUT)
 
     def on_ok(result: dict) -> None:
