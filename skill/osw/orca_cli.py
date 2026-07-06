@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 
 import anyio
 
@@ -14,13 +15,25 @@ class OrcaError(Exception):
         super().__init__(message)
 
 
+def _resolve_orca() -> str:
+    """Find the full path to the orca executable (.cmd/.exe/.bat)."""
+    path = shutil.which("orca")
+    if path is None:
+        raise OrcaError(
+            "Orca CLI not found. Make sure 'orca' is installed and on PATH.",
+            127,
+        )
+    return path
+
+
 async def run_orca(*args: str) -> dict:
     """Run the `orca` CLI with the given arguments and return parsed JSON output.
 
     Always requests JSON output (appends "--json" if not already present).
     Raises OrcaError if the process exits with a nonzero return code.
     """
-    cmd = ["orca", *args]
+    orca = _resolve_orca()
+    cmd = [orca, *args]
     if "--json" not in cmd:
         cmd.append("--json")
 

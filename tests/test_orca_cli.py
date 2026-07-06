@@ -15,6 +15,12 @@ def anyio_backend():
     return "asyncio"
 
 
+@pytest.fixture(autouse=True)
+def _mock_resolve_orca():
+    with patch("osw.orca_cli._resolve_orca", return_value="orca"):
+        yield
+
+
 def _completed(returncode=0, stdout=b"{}", stderr=b""):
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
