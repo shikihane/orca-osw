@@ -24,12 +24,26 @@ async def run_orca(*args: str) -> dict:
     if "--json" not in cmd:
         cmd.append("--json")
 
-    result = await anyio.run_process(cmd, check=False)
+    try:
+        result = await anyio.run_process(cmd, check=False)
+    except FileNotFoundError:
+        raise OrcaError(
+            "Orca CLI not found. Make sure 'orca' is installed and on PATH.",
+            127,
+        )
+    except OSError as exc:
+        raise OrcaError(f"Failed to run orca: {exc}", 1)
 
     if result.returncode != 0:
         raise OrcaError(result.stderr.decode(), result.returncode)
 
-    return json.loads(result.stdout)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raise OrcaError(
+            f"Orca returned invalid JSON: {result.stdout.decode()[:200]}",
+            1,
+        )
 
 
 async def worktree_current() -> dict:
