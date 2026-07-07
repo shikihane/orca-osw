@@ -301,3 +301,91 @@ async def test_terminal_info_args():
     cmd = mock_run.call_args.args[0]
     assert cmd == ["orca", "terminal", "info", "--terminal", "t1", "--json"]
     assert result == payload
+
+
+@pytest.mark.anyio
+async def test_detect_current_terminal_matches_preview():
+    payload = {"result": {"terminals": [
+        {"handle": "t1", "preview": "some other output"},
+        {"handle": "t2", "preview": "log line osw_trace_abc123 here"},
+    ]}}
+    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
+    with patch("osw.orca_cli.anyio.run_process", mock_run):
+        result = await orca_cli.detect_current_terminal("osw_trace_abc123")
+
+    assert result == "t2"
+
+
+@pytest.mark.anyio
+async def test_detect_current_terminal_no_match():
+    payload = {"result": {"terminals": [{"handle": "t1", "preview": "nothing"}]}}
+    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
+    with patch("osw.orca_cli.anyio.run_process", mock_run):
+        result = await orca_cli.detect_current_terminal("osw_trace_missing")
+
+    assert result is None
+
+
+@pytest.mark.anyio
+async def test_orchestration_task_create_args():
+    payload = {"result": {"task": {"id": "task_abc123"}}}
+    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
+    with patch("osw.orca_cli.anyio.run_process", mock_run):
+        task_id = await orca_cli.orchestration_task_create("do the thing", title="thing")
+
+    cmd = mock_run.call_args.args[0]
+    assert cmd == [
+        "orca",
+        "orchestration",
+        "task-create",
+        "--spec",
+        "do the thing",
+        "--task-title",
+        "thing",
+        "--json",
+    ]
+    assert task_id == "task_abc123"
+
+
+@pytest.mark.anyio
+async def test_orchestration_dispatch_args():
+    mock_run = AsyncMock(return_value=_completed(stdout=b"{}"))
+    with patch("osw.orca_cli.anyio.run_process", mock_run):
+        await orca_cli.orchestration_dispatch(
+            "task_abc", "t-worker", from_handle="t-coord"
+        )
+
+    cmd = mock_run.call_args.args[0]
+    assert cmd == [
+        "orca",
+        "orchestration",
+        "dispatch",
+        "--task",
+        "task_abc",
+        "--to",
+        "t-worker",
+        "--from",
+        "t-coord",
+        "--inject",
+        "--json",
+    ]
+
+
+@pytest.mark.anyio
+async def test_orchestration_check_unwraps_messages():
+    payload = {"result": {"messages": [{"id": "msg_1", "type": "worker_done"}]}}
+    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
+    with patch("osw.orca_cli.anyio.run_process", mock_run):
+        messages = await orca_cli.orchestration_check("t-coord")
+
+    cmd = mock_run.call_args.args[0]
+    assert cmd == [
+        "orca",
+        "orchestration",
+        "check",
+        "--terminal",
+        "t-coord",
+        "--unread",
+        "--json",
+    ]
+    assert messages == [{"id": "msg_1", "type": "worker_done"}]

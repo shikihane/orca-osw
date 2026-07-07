@@ -145,3 +145,60 @@ async def terminal_show(handle: str | None = None) -> dict:
 
 async def terminal_info(handle: str) -> dict:
     return await run_orca("terminal", "info", "--terminal", handle)
+
+
+async def detect_current_terminal(marker: str) -> str | None:
+    """Find the terminal whose preview contains *marker*.
+
+    The caller prints the marker to its own terminal first; this is the
+    only reliable way to identify "the terminal I am running in"
+    (`orca terminal show` returns the UI-focused terminal instead).
+    """
+    terminals = await terminal_list()
+    for term in terminals:
+        if marker in term.get("preview", ""):
+            return term.get("handle") or None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Orchestration (official inter-agent task protocol)
+# ---------------------------------------------------------------------------
+
+async def orchestration_task_create(spec: str, title: str | None = None) -> str:
+    """Create an orchestration task and return its task id."""
+    args = ["orchestration", "task-create", "--spec", spec]
+    if title:
+        args += ["--task-title", title]
+    data = await run_orca(*args)
+    task = data.get("result", {}).get("task", {}) if isinstance(data, dict) else {}
+    return task.get("id", "")
+
+
+async def orchestration_dispatch(
+    task_id: str,
+    to_handle: str,
+    from_handle: str | None = None,
+    inject: bool = True,
+) -> dict:
+    """Dispatch a task to a worker terminal (injects the official preamble)."""
+    args = ["orchestration", "dispatch", "--task", task_id, "--to", to_handle]
+    if from_handle:
+        args += ["--from", from_handle]
+    if inject:
+        args.append("--inject")
+    return await run_orca(*args)
+
+
+async def orchestration_check(terminal: str, types: str | None = None) -> list[dict]:
+    """Fetch unread orchestration messages for *terminal* (marks them read)."""
+    args = ["orchestration", "check", "--terminal", terminal, "--unread"]
+    if types:
+        args += ["--types", types]
+    data = await run_orca(*args)
+    if isinstance(data, dict):
+        inner = data.get("result", data)
+        messages = inner.get("messages")
+        if isinstance(messages, list):
+            return messages
+    return []
