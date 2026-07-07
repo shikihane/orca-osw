@@ -11,7 +11,6 @@ from pathlib import Path
 import anyio
 import anyio.abc
 
-from osw.handoff import format_completion_report
 from osw.log import get_logger
 from osw.orca_cli import (
     OrcaError,
@@ -808,3 +807,20 @@ def _trunc(text: str, max_len: int = 60) -> str:
 def _oneline(text: str, max_len: int = 160) -> str:
     """Collapse whitespace/newlines into a single line and truncate."""
     return _trunc(" ".join((text or "").split()), max_len)
+
+
+def format_completion_report(
+    agent_id: str, terminal: str, report_file: str, summary: str = ""
+) -> str:
+    """Single-line completion notification sent to the caller terminal.
+
+    Single-line because newlines get mangled through orca.CMD --text on
+    Windows; the leading '#' keeps it inert in a shell. Full data lives
+    in the JSON report file.
+    """
+    message = f"# [osw] task-finished agent={agent_id} terminal={terminal}"
+    if report_file:
+        message += f" report={report_file}"
+    if summary:
+        message += f" summary={' '.join(summary.split())}"
+    return message

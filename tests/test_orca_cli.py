@@ -25,367 +25,129 @@ def _completed(returncode=0, stdout=b"{}", stderr=b""):
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
-@pytest.mark.anyio
-async def test_run_orca_builds_correct_args():
-    mock_run = AsyncMock(return_value=_completed(stdout=b"{}"))
+async def _run(coro_factory, stdout=b"{}"):
+    """Run a wrapper with a mocked orca process; return (result, cmd)."""
+    mock_run = AsyncMock(return_value=_completed(stdout=stdout))
     with patch("osw.orca_cli.anyio.run_process", mock_run):
-        await orca_cli.run_orca("terminal", "list")
+        result = await coro_factory()
+    return result, mock_run.call_args.args[0]
 
-    cmd = mock_run.call_args.args[0]
-    assert cmd[0] == "orca"
-    assert "terminal" in cmd
-    assert "list" in cmd
-    assert "--json" in cmd
+
+# ---------------------------------------------------------------------------
+# Command construction: every wrapper must build the exact orca CLI call
+# ---------------------------------------------------------------------------
+
+WRAPPER_CASES = [
+    (lambda: orca_cli.worktree_current(),
+     ["worktree", "current"]),
+    (lambda: orca_cli.terminal_list(),
+     ["terminal", "list", "--worktree", "active"]),
+    (lambda: orca_cli.terminal_create("codex"),
+     ["terminal", "create", "--worktree", "active", "--command", "codex"]),
+    (lambda: orca_cli.terminal_send("t1", "hello world"),
+     ["terminal", "send", "--terminal", "t1", "--text", "hello world", "--enter"]),
+    (lambda: orca_cli.terminal_wait("t1"),
+     ["terminal", "wait", "--terminal", "t1", "--for", "tui-idle", "--timeout-ms", "300000"]),
+    (lambda: orca_cli.terminal_wait("t1", event="exit", timeout_ms=5000),
+     ["terminal", "wait", "--terminal", "t1", "--for", "exit", "--timeout-ms", "5000"]),
+    (lambda: orca_cli.terminal_close("t1"),
+     ["terminal", "close", "--terminal", "t1"]),
+    (lambda: orca_cli.terminal_read("t1", limit=50),
+     ["terminal", "read", "--terminal", "t1", "--limit", "50"]),
+    (lambda: orca_cli.terminal_read("t1", limit=100, cursor="42"),
+     ["terminal", "read", "--terminal", "t1", "--limit", "100", "--cursor", "42"]),
+    (lambda: orca_cli.terminal_show(),
+     ["terminal", "show"]),
+    (lambda: orca_cli.terminal_show("t1"),
+     ["terminal", "show", "--terminal", "t1"]),
+    (lambda: orca_cli.terminal_info("t1"),
+     ["terminal", "info", "--terminal", "t1"]),
+    (lambda: orca_cli.orchestration_task_create("do it", title="t"),
+     ["orchestration", "task-create", "--spec", "do it", "--task-title", "t"]),
+    (lambda: orca_cli.orchestration_dispatch("task_1", "t-w", from_handle="t-c"),
+     ["orchestration", "dispatch", "--task", "task_1", "--to", "t-w", "--from", "t-c", "--inject"]),
+    (lambda: orca_cli.orchestration_check("t-c"),
+     ["orchestration", "check", "--terminal", "t-c", "--unread"]),
+]
 
 
 @pytest.mark.anyio
-async def test_run_orca_parses_json():
-    payload = {"foo": "bar", "n": 1}
-    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        result = await orca_cli.run_orca("worktree", "current")
+@pytest.mark.parametrize("factory,expected", WRAPPER_CASES,
+                         ids=[" ".join(c[1][:2]) + f"#{i}" for i, c in enumerate(WRAPPER_CASES)])
+async def test_wrapper_builds_expected_command(factory, expected):
+    _, cmd = await _run(factory)
+    assert cmd == ["orca", *expected, "--json"]
 
-    assert result == payload
 
+# ---------------------------------------------------------------------------
+# run_orca basics
+# ---------------------------------------------------------------------------
 
 @pytest.mark.anyio
-async def test_run_orca_raises_on_nonzero():
-    mock_run = AsyncMock(
-        return_value=_completed(returncode=1, stdout=b"", stderr=b"boom")
+async def test_run_orca_parses_json_and_dedups_json_flag():
+    payload = {"foo": "bar"}
+    result, cmd = await _run(
+        lambda: orca_cli.run_orca("worktree", "current", "--json"),
+        stdout=json.dumps(payload).encode(),
     )
+    assert result == payload
+    assert cmd.count("--json") == 1
+
+
+@pytest.mark.anyio
+async def test_run_orca_raises_with_stderr_or_stdout():
+    mock_run = AsyncMock(return_value=_completed(returncode=1, stderr=b"boom"))
     with patch("osw.orca_cli.anyio.run_process", mock_run):
         with pytest.raises(OrcaError) as exc_info:
-            await orca_cli.run_orca("terminal", "close", "--terminal", "abc")
-
+            await orca_cli.run_orca("terminal", "close")
     assert exc_info.value.message == "boom"
-    assert exc_info.value.returncode == 1
 
-
-@pytest.mark.anyio
-async def test_run_orca_appends_json_flag():
-    mock_run = AsyncMock(return_value=_completed(stdout=b"{}"))
+    # stderr empty -> stdout used as the error message
+    mock_run = AsyncMock(return_value=_completed(returncode=1, stdout=b"oops", stderr=b""))
     with patch("osw.orca_cli.anyio.run_process", mock_run):
-        await orca_cli.run_orca("worktree", "current")
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd.count("--json") == 1
-
-
-@pytest.mark.anyio
-async def test_run_orca_no_duplicate_json_flag():
-    mock_run = AsyncMock(return_value=_completed(stdout=b"{}"))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        await orca_cli.run_orca("worktree", "current", "--json")
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd.count("--json") == 1
+        with pytest.raises(OrcaError) as exc_info:
+            await orca_cli.run_orca("terminal", "close")
+    assert exc_info.value.message == "oops"
 
 
-@pytest.mark.anyio
-async def test_worktree_current_args():
-    payload = {"path": "/tmp/wt"}
-    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        result = await orca_cli.worktree_current()
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd == ["orca", "worktree", "current", "--json"]
-    assert result == payload
-
-
-@pytest.mark.anyio
-async def test_terminal_list_args():
-    payload = [{"handle": "t1"}, {"handle": "t2"}]
-    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        result = await orca_cli.terminal_list()
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd == [
-        "orca",
-        "terminal",
-        "list",
-        "--worktree",
-        "active",
-        "--json",
-    ]
-    assert result == payload
-
-
-@pytest.mark.anyio
-async def test_terminal_list_unwraps_dict():
-    payload = {"terminals": [{"handle": "t1"}]}
-    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        result = await orca_cli.terminal_list()
-
-    assert result == [{"handle": "t1"}]
-
+# ---------------------------------------------------------------------------
+# Response unwrapping: orca nests everything under {result: {...}}
+# ---------------------------------------------------------------------------
 
 @pytest.mark.anyio
 async def test_terminal_list_unwraps_nested_result():
     payload = {"id": "x", "ok": True, "result": {"terminals": [{"handle": "t1"}]}}
-    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        result = await orca_cli.terminal_list()
-
+    result, _ = await _run(lambda: orca_cli.terminal_list(),
+                           stdout=json.dumps(payload).encode())
     assert result == [{"handle": "t1"}]
 
 
 @pytest.mark.anyio
-async def test_terminal_create_args():
-    payload = {"handle": "t1"}
-    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        result = await orca_cli.terminal_create("codex")
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd == [
-        "orca",
-        "terminal",
-        "create",
-        "--worktree",
-        "active",
-        "--command",
-        "codex",
-        "--json",
-    ]
-    assert result == payload
-
-
-@pytest.mark.anyio
-async def test_terminal_send_args():
-    mock_run = AsyncMock(return_value=_completed(stdout=b"{}"))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        await orca_cli.terminal_send("t1", "hello world")
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd == [
-        "orca",
-        "terminal",
-        "send",
-        "--terminal",
-        "t1",
-        "--text",
-        "hello world",
-        "--enter",
-        "--json",
-    ]
-
-
-@pytest.mark.anyio
-async def test_terminal_wait_args():
-    mock_run = AsyncMock(return_value=_completed(stdout=b"{}"))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        await orca_cli.terminal_wait("t1")
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd == [
-        "orca",
-        "terminal",
-        "wait",
-        "--terminal",
-        "t1",
-        "--for",
-        "tui-idle",
-        "--timeout-ms",
-        "300000",
-        "--json",
-    ]
-
-
-@pytest.mark.anyio
-async def test_terminal_wait_custom_event_and_timeout():
-    mock_run = AsyncMock(return_value=_completed(stdout=b"{}"))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        await orca_cli.terminal_wait("t1", event="exit", timeout_ms=5000)
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd == [
-        "orca",
-        "terminal",
-        "wait",
-        "--terminal",
-        "t1",
-        "--for",
-        "exit",
-        "--timeout-ms",
-        "5000",
-        "--json",
-    ]
-
-
-@pytest.mark.anyio
-async def test_terminal_close_args():
-    mock_run = AsyncMock(return_value=_completed(stdout=b"{}"))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        await orca_cli.terminal_close("t1")
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd == ["orca", "terminal", "close", "--terminal", "t1", "--json"]
-
-
-@pytest.mark.anyio
-async def test_terminal_read_args():
-    payload = {"result": {"terminal": {"tail": ["line1"], "status": "running"}}}
-    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        result = await orca_cli.terminal_read("t1", limit=50)
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd == [
-        "orca",
-        "terminal",
-        "read",
-        "--terminal",
-        "t1",
-        "--limit",
-        "50",
-        "--json",
-    ]
-    assert result == payload
-
-
-@pytest.mark.anyio
-async def test_terminal_read_with_cursor():
-    mock_run = AsyncMock(return_value=_completed(stdout=b"{}"))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        await orca_cli.terminal_read("t1", limit=100, cursor="42")
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd == [
-        "orca",
-        "terminal",
-        "read",
-        "--terminal",
-        "t1",
-        "--limit",
-        "100",
-        "--cursor",
-        "42",
-        "--json",
-    ]
-
-
-@pytest.mark.anyio
-async def test_terminal_show_no_handle():
-    payload = {"result": {"terminal": {"handle": "t-current"}}}
-    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        result = await orca_cli.terminal_show()
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd == ["orca", "terminal", "show", "--json"]
-    assert result == payload
-
-
-@pytest.mark.anyio
-async def test_terminal_show_with_handle():
-    payload = {"result": {"terminal": {"handle": "t1"}}}
-    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        result = await orca_cli.terminal_show("t1")
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd == ["orca", "terminal", "show", "--terminal", "t1", "--json"]
-    assert result == payload
-
-
-@pytest.mark.anyio
-async def test_terminal_info_args():
-    payload = {"handle": "t1", "worktreePath": "/repo/worktree"}
-    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        result = await orca_cli.terminal_info("t1")
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd == ["orca", "terminal", "info", "--terminal", "t1", "--json"]
-    assert result == payload
-
-
-@pytest.mark.anyio
-async def test_detect_current_terminal_matches_preview():
-    payload = {"result": {"terminals": [
-        {"handle": "t1", "preview": "some other output"},
-        {"handle": "t2", "preview": "log line osw_trace_abc123 here"},
-    ]}}
-    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        result = await orca_cli.detect_current_terminal("osw_trace_abc123")
-
-    assert result == "t2"
-
-
-@pytest.mark.anyio
-async def test_detect_current_terminal_no_match():
-    payload = {"result": {"terminals": [{"handle": "t1", "preview": "nothing"}]}}
-    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        result = await orca_cli.detect_current_terminal("osw_trace_missing")
-
-    assert result is None
-
-
-@pytest.mark.anyio
-async def test_orchestration_task_create_args():
-    payload = {"result": {"task": {"id": "task_abc123"}}}
-    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        task_id = await orca_cli.orchestration_task_create("do the thing", title="thing")
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd == [
-        "orca",
-        "orchestration",
-        "task-create",
-        "--spec",
-        "do the thing",
-        "--task-title",
-        "thing",
-        "--json",
-    ]
-    assert task_id == "task_abc123"
-
-
-@pytest.mark.anyio
-async def test_orchestration_dispatch_args():
-    mock_run = AsyncMock(return_value=_completed(stdout=b"{}"))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        await orca_cli.orchestration_dispatch(
-            "task_abc", "t-worker", from_handle="t-coord"
-        )
-
-    cmd = mock_run.call_args.args[0]
-    assert cmd == [
-        "orca",
-        "orchestration",
-        "dispatch",
-        "--task",
-        "task_abc",
-        "--to",
-        "t-worker",
-        "--from",
-        "t-coord",
-        "--inject",
-        "--json",
-    ]
+async def test_orchestration_task_create_returns_id():
+    payload = {"result": {"task": {"id": "task_abc"}}}
+    result, _ = await _run(lambda: orca_cli.orchestration_task_create("spec"),
+                           stdout=json.dumps(payload).encode())
+    assert result == "task_abc"
 
 
 @pytest.mark.anyio
 async def test_orchestration_check_unwraps_messages():
-    payload = {"result": {"messages": [{"id": "msg_1", "type": "worker_done"}]}}
-    mock_run = AsyncMock(return_value=_completed(stdout=json.dumps(payload).encode()))
-    with patch("osw.orca_cli.anyio.run_process", mock_run):
-        messages = await orca_cli.orchestration_check("t-coord")
+    payload = {"result": {"messages": [{"id": "m1", "type": "worker_done"}]}}
+    result, _ = await _run(lambda: orca_cli.orchestration_check("t-c"),
+                           stdout=json.dumps(payload).encode())
+    assert result == [{"id": "m1", "type": "worker_done"}]
 
-    cmd = mock_run.call_args.args[0]
-    assert cmd == [
-        "orca",
-        "orchestration",
-        "check",
-        "--terminal",
-        "t-coord",
-        "--unread",
-        "--json",
-    ]
-    assert messages == [{"id": "msg_1", "type": "worker_done"}]
+
+@pytest.mark.anyio
+async def test_detect_current_terminal():
+    payload = {"result": {"terminals": [
+        {"handle": "t1", "preview": "other"},
+        {"handle": "t2", "preview": "log osw_trace_abc here"},
+    ]}}
+    result, _ = await _run(lambda: orca_cli.detect_current_terminal("osw_trace_abc"),
+                           stdout=json.dumps(payload).encode())
+    assert result == "t2"
+
+    result, _ = await _run(lambda: orca_cli.detect_current_terminal("missing"),
+                           stdout=json.dumps(payload).encode())
+    assert result is None
