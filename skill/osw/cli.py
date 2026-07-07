@@ -25,26 +25,23 @@ RESULT_TIMEOUT = 15.0
 def require_serve(root: Path) -> None:
     """Abort with a helpful message if the OSW supervisor is not running."""
     if not is_serve_running(root):
-        typer.echo("OSW serve is not running for this directory.", err=True)
-        typer.echo("Start it with:", err=True)
-        typer.echo("  python osw.py serve", err=True)
+        typer.echo("OSW serve is not running for this directory.")
+        typer.echo("Start it with:")
+        typer.echo("  python osw.py serve")
         raise typer.Exit(1)
 
 
 def _handle_result(result: dict | None, on_ok) -> None:
     """Shared result handling for new/use/all/del: timeout, error, or success."""
     if result is None:
-        typer.echo(
-            "OSW serve did not return a result within 15 seconds.",
-            err=True,
-        )
-        typer.echo("Check python osw.py status.", err=True)
+        typer.echo("OSW serve did not return a result within 15 seconds.")
+        typer.echo("Check python osw.py status.")
         raise typer.Exit(1)
 
     if result.get("ok"):
         on_ok(result)
     else:
-        typer.echo(f"Error: {result.get('error', 'unknown error')}", err=True)
+        typer.echo(f"Error: {result.get('error') or 'unknown error'}")
         raise typer.Exit(1)
 
 
@@ -60,7 +57,13 @@ def init() -> None:
 def serve() -> None:
     """Run the foreground supervisor for the current directory."""
     root = resolve_project_root()
-    anyio.run(run_server, root)
+    typer.echo(f"OSW supervisor starting for {root}")
+    typer.echo("Press Ctrl+C to stop.")
+    try:
+        anyio.run(run_server, root)
+    except KeyboardInterrupt:
+        pass
+    typer.echo("OSW supervisor stopped.")
 
 
 @app.command()
@@ -156,7 +159,7 @@ def list_(
     try:
         state = read_state(root)
     except FileNotFoundError:
-        typer.echo("Not initialized. Run `python osw.py init` first.", err=True)
+        typer.echo("Not initialized. Run `python osw.py init` first.")
         raise typer.Exit(1)
 
     agents = state.get("agents", {})
@@ -188,7 +191,7 @@ def status() -> None:
     try:
         state = read_state(root)
     except FileNotFoundError:
-        typer.echo("Not initialized. Run `python osw.py init` first.", err=True)
+        typer.echo("Not initialized. Run `python osw.py init` first.")
         raise typer.Exit(1)
 
     running = is_serve_running(root)
