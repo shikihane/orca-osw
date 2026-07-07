@@ -126,39 +126,29 @@ def init(
 
 
 def _pick_variant(cli: dict, variants: list[dict]) -> dict | None:
-    """Second-level pick: a discovered variant or a hand-typed command."""
-    if variants:
-        shown = variants
-        if len(variants) > 20:
-            keyword = typer.prompt("filter (optional)", default="").strip().lower()
-            if keyword:
-                shown = [v for v in variants if keyword in v["name"].lower()] or variants
-            shown = shown[:30]
-        typer.echo(f"variants for {cli['name']}:")
-        for i, opt in enumerate(shown, 1):
-            typer.echo(f"  {i}. {opt['name']:<28} {opt['command']}")
-        typer.echo("  0. custom command")
-        while True:
-            choice = typer.prompt("select", default="0").strip()
-            try:
-                index = int(choice)
-            except ValueError:
-                typer.echo("  invalid choice, try again")
-                continue
-            if index == 0:
-                break
-            if 1 <= index <= len(shown):
-                return dict(shown[index - 1])
+    """Second-level pick from discovered variants (never free-typed)."""
+    shown = variants
+    if len(variants) > 20:
+        keyword = typer.prompt("filter (optional)", default="").strip().lower()
+        if keyword:
+            shown = [v for v in variants if keyword in v["name"].lower()] or variants
+        shown = shown[:30]
+    typer.echo(f"variants for {cli['name']}:")
+    for i, opt in enumerate(shown, 1):
+        typer.echo(f"  {i}. {opt['name']:<28} {opt['command']}")
+    typer.echo("  b. back (skip this tier)")
+    while True:
+        choice = typer.prompt("select", default="1").strip().lower()
+        if choice == "b":
+            return None
+        try:
+            index = int(choice)
+        except ValueError:
             typer.echo("  invalid choice, try again")
-    else:
-        typer.echo(f"no discoverable variants for {cli['name']};"
-                   " enter the command yourself")
-
-    command = typer.prompt("command", default=cli["name"]).strip()
-    if not command:
-        return None
-    name = typer.prompt("entry name", default=command.split()[0]).strip()
-    return {"name": name, "command": command} if name else None
+            continue
+        if 1 <= index <= len(shown):
+            return dict(shown[index - 1])
+        typer.echo("  invalid choice, try again")
 
 
 def _interactive_tier_setup(root: Path, found: list[dict]) -> None:

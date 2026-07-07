@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import tomllib
+from pathlib import Path
 
 # Candidate agent CLIs to probe for on PATH. This is a *scan list*,
 # not configuration — nothing ends up in state.json unless the
@@ -47,21 +49,55 @@ def scan_agent_clis(probe_version: bool = True) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def probe_variants(name: str, path: str | None = None) -> list[dict]:
-    """Discover model variants by querying the CLI itself.
+    """Discover model variants by querying the CLI or its local config.
 
-    Returns [{"name", "command"}] built from the CLI's own output
-    (pi --list-models, claude --help aliases, ...). CLIs without a
-    discovery interface return [] — the operator supplies arguments
-    manually for those.
+    Returns [{"name", "command"}], never empty for an installed CLI:
+    the CLI's bare command (its own defaults) is always a selectable
+    option, so the operator picks instead of typing.
     """
     exe = path or shutil.which(name)
     if exe is None:
         return []
+    bare = [{"name": f"{name}-default", "command": name}]
     if name == "pi":
-        return parse_pi_models(_run_capture([exe, "--list-models"]))
+        return parse_pi_models(_run_capture([exe, "--list-models"])) or bare
     if name == "claude":
-        return parse_claude_aliases(_run_capture([exe, "--help"]))
-    return []
+        return parse_claude_aliases(_run_capture([exe, "--help"])) or bare
+    if name == "codex":
+        return bare + codex_variants(_read_codex_config())
+    return bare
+
+
+# The valid values of codex's model_reasoning_effort config key.
+# These are CLI protocol constants (like its sandbox modes), not model
+# data — codex exposes no way to enumerate them at runtime.
+CODEX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+
+
+def _read_codex_config() -> dict:
+    """Read the user's ~/.codex/config.toml (real per-machine data)."""
+    path = Path.home() / ".codex" / "config.toml"
+    try:
+        with path.open("rb") as f:
+            return tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def codex_variants(config: dict) -> list[dict]:
+    """Build codex entries: the configured model x reasoning efforts."""
+    model = str(config.get("model") or "").strip()
+    label = model or "model"
+    variants = []
+    for effort in CODEX_EFFORTS:
+        command = f"codex -c model_reasoning_effort={effort}"
+        if model:
+            command += f' -m {model}'
+        variants.append({
+            "name": f"codex-{label}-{effort}",
+            "command": command,
+        })
+    return variants
 
 
 def parse_pi_models(output: str) -> list[dict]:

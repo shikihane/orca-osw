@@ -58,18 +58,25 @@ def test_init_interactive_assigns_tiers(tmp_path, monkeypatch):
         {"name": "claude", "path": "C:\\bin\\claude.EXE", "version": ""},
         {"name": "codex", "path": "C:\\bin\\codex.CMD", "version": ""},
     ]
-    claude_variants = [
-        {"name": "claude-opus", "command": "claude --model opus"},
-        {"name": "claude-sonnet", "command": "claude --model sonnet"},
-    ]
+    variants = {
+        "claude": [
+            {"name": "claude-opus", "command": "claude --model opus"},
+            {"name": "claude-sonnet", "command": "claude --model sonnet"},
+        ],
+        "codex": [
+            {"name": "codex-default", "command": "codex"},
+            {"name": "codex-gpt-5.5-medium",
+             "command": "codex -c model_reasoning_effort=medium -m gpt-5.5"},
+        ],
+    }
 
     def fake_probe(name, path=None):
-        return claude_variants if name == "claude" else []
+        return variants[name]
 
     # strong: agent 1 (claude) -> variant 2 (sonnet)
-    # medium: agent 2 (codex, no variants) -> command + name typed
+    # medium: agent 2 (codex)  -> variant 2 (gpt-5.5-medium)
     # weak:   skip
-    user_input = "1\n2\n2\ncodex -c model_reasoning_effort=medium\ncodex-mid\ns\n"
+    user_input = "1\n2\n2\n2\ns\n"
     with patch("osw.cli.scan_agent_clis", return_value=found), \
          patch("osw.cli.probe_variants", side_effect=fake_probe):
         result = runner.invoke(app, ["init", "-i"], input=user_input)
@@ -80,7 +87,8 @@ def test_init_interactive_assigns_tiers(tmp_path, monkeypatch):
         {"name": "claude-sonnet", "command": "claude --model sonnet"}
     ]
     assert models["medium"] == [
-        {"name": "codex-mid", "command": "codex -c model_reasoning_effort=medium"}
+        {"name": "codex-gpt-5.5-medium",
+         "command": "codex -c model_reasoning_effort=medium -m gpt-5.5"}
     ]
     assert models["weak"] == []
 

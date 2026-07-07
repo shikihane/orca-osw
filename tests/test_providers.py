@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from osw.providers import parse_claude_aliases, parse_pi_models
+from osw.providers import CODEX_EFFORTS, codex_variants, parse_claude_aliases, parse_pi_models
 
 # Real output shapes captured from the actual CLIs
 
@@ -43,3 +43,17 @@ def test_parsers_tolerate_garbage():
     assert parse_pi_models("unexpected error text") == []
     assert parse_claude_aliases("") == []
     assert parse_claude_aliases("no model flag here") == []
+
+
+def test_codex_variants_from_config():
+    variants = codex_variants({"model": "gpt-5.5"})
+    assert len(variants) == len(CODEX_EFFORTS)
+    assert {"name": "codex-gpt-5.5-high",
+            "command": "codex -c model_reasoning_effort=high -m gpt-5.5"} in variants
+
+
+def test_codex_variants_without_config():
+    variants = codex_variants({})
+    # still selectable: efforts against the CLI's own default model
+    assert {"name": "codex-model-medium",
+            "command": "codex -c model_reasoning_effort=medium"} in variants
