@@ -14,9 +14,10 @@ OSW ships with ZERO model configuration. Nothing about the machine is
 assumed; you must detect the environment and configure it before `new`
 will work.
 
-1. `python <skill-dir>/osw.py init` — creates `.orca/osw/` and scans
-   PATH for known agent CLIs (claude, codex, pi, gemini, aider, ...).
-   NEVER pass `-i/--interactive` — that flag starts a blocking
+1. `python <skill-dir>/osw.py init --no-interactive` — creates
+   `.orca/osw/` and scans PATH for known agent CLIs (claude, codex,
+   pi, gemini, aider, ...). ALWAYS pass `--no-interactive`: without it
+   init auto-detects a real terminal and may start a blocking
    question-and-answer setup meant for humans typing at a keyboard.
 2. Inspect what the scan found. For each CLI you intend to use, probe
    its options yourself (`<cli> --help`) to learn how to select model

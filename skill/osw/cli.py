@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -85,8 +86,9 @@ def _handle_result(result: dict | None, on_ok) -> None:
 @app.command()
 def init(
     interactive: bool = typer.Option(
-        False, "--interactive", "-i",
-        help="Pick tier models via prompts (humans only; never use from an agent)",
+        None, "--interactive/--no-interactive", "-i",
+        help="Force the guided prompt setup on or off. Default: on when "
+             "run from a real terminal, off when stdio is piped (agents).",
     ),
 ) -> None:
     """Initialize OSW state for the current directory."""
@@ -105,16 +107,27 @@ def init(
     else:
         typer.echo("  no known agent CLIs found on PATH")
 
+    if interactive is None:
+        # A human at a keyboard has a real terminal on both ends; agent
+        # harnesses run commands with piped stdio.
+        interactive = sys.stdin.isatty() and sys.stdout.isatty()
+
     if interactive and found:
         _interactive_tier_setup(root, found)
         return
 
     typer.echo("")
-    typer.echo("Model tiers are EMPTY. Before using `new`, assign models, e.g.:")
-    typer.echo('  python osw.py model add --tier medium --name codex-mid'
-               ' --command "codex -c model_reasoning_effort=medium"')
+    typer.echo("Model tiers are EMPTY. Assign models before using `new`.")
+    suggestions = preset_options(found)
+    if suggestions:
+        typer.echo("Suggested entries (pick tiers yourself):")
+        for opt in suggestions:
+            typer.echo(
+                f'  python osw.py model add --tier <strong|medium|weak>'
+                f' --name {opt["name"]} --command "{opt["command"]}"'
+            )
     typer.echo("Verify with: python osw.py model list")
-    typer.echo("(Humans can rerun `init -i` for a guided setup.)")
+    typer.echo("(Humans: run `init -i` for a guided setup.)")
 
 
 def _interactive_tier_setup(root: Path, found: list[dict]) -> None:
