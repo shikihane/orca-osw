@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,12 +10,7 @@ from pathlib import Path
 import anyio
 import anyio.abc
 
-from osw.handoff import (
-    FORCED_HANDOFF_PROMPT,
-    extract_handoff_filename,
-    format_completion_report,
-    format_handoff_failed_message,
-)
+from osw.handoff import format_completion_report
 from osw.log import get_logger
 from osw.orca_cli import (
     OrcaError,
@@ -22,13 +18,16 @@ from osw.orca_cli import (
     terminal_create,
     terminal_info,
     terminal_list,
+    terminal_read,
     terminal_send,
+    terminal_show,
     terminal_wait,
 )
 from osw.state import (
     inbox_dir,
     next_agent_id,
     read_state,
+    write_report,
     write_result,
     write_state,
 )
@@ -101,7 +100,7 @@ async def inbox_loop(ctx: ServerContext) -> None:
                 command = request.get("command")
                 req_id = request.get("request_id", "?")
                 log.info(
-                    "[bold cyan]inbox[/bold cyan] command=%s  request_id=%s",
+                    "inbox command=%s  request_id=%s",
                     command, req_id,
                 )
 
@@ -129,7 +128,7 @@ async def handle_new(ctx: ServerContext, request: dict) -> None:
     log.info("new: creating terminal  provider=%s  prompt=%s", command, _trunc(prompt))
 
     try:
-        result = await terminal_create(str(ctx.root), command)
+        result = await terminal_create(command)
     except OrcaError as exc:
         log.error("new: terminal_create failed: %s", exc)
         write_result(ctx.root, request["request_id"], {
@@ -138,7 +137,8 @@ async def handle_new(ctx: ServerContext, request: dict) -> None:
         })
         return
 
-    handle = result.get("handle", result.get("terminal", ""))
+    terminal_obj = result.get("result", {}).get("terminal", {})
+    handle = terminal_obj.get("handle", result.get("handle", ""))
     log.info("new: terminal created  handle=%s", handle)
 
     async with ctx.lock:
@@ -158,13 +158,6 @@ async def handle_new(ctx: ServerContext, request: dict) -> None:
         }
         write_state(ctx.root, ctx.state)
 
-    if prompt:
-        try:
-            await terminal_send(handle, prompt)
-            log.info("new: prompt sent to %s", handle)
-        except OrcaError as exc:
-            log.warning("new: failed to send prompt to %s: %s", handle, exc)
-
     write_result(ctx.root, request["request_id"], {
         "ok": True,
         "agent_id": agent_id,
@@ -174,7 +167,7 @@ async def handle_new(ctx: ServerContext, request: dict) -> None:
     })
 
     log.info(
-        "[bold green]new: agent registered[/bold green]  %s → %s",
+        "new: agent registered  %s -> %s",
         agent_id, handle,
     )
     ctx.task_group.start_soon(watcher, ctx, agent_id)
@@ -243,7 +236,7 @@ async def handle_use(ctx: ServerContext, request: dict) -> None:
     })
 
     log.info(
-        "[bold green]use: agent registered[/bold green]  %s → %s",
+        "use: agent registered  %s -> %s",
         agent_id, handle,
     )
     ctx.task_group.start_soon(watcher, ctx, agent_id)
@@ -300,7 +293,7 @@ async def handle_del(ctx: ServerContext, request: dict) -> None:
         write_state(ctx.root, ctx.state)
 
     if removed:
-        log.info("[bold red]del: removed %s[/bold red]", agent_id)
+        log.info("del: removed %s", agent_id)
     else:
         log.warning("del: agent %s not found", agent_id)
 
@@ -314,6 +307,63 @@ async def handle_del(ctx: ServerContext, request: dict) -> None:
 # Per-agent watcher
 # ---------------------------------------------------------------------------
 
+# Completion detection tuning
+START_TIMEOUT_SECS = 120   # max time to wait for the agent to start producing output
+START_POLL_SECS = 1.0      # poll interval while waiting for the agent to start
+IDLE_STABLE_MS = 5000      # idle only counts if no output for this long
+WAIT_TIMEOUT_MS = 600_000
+
+
+async def _last_output_at(handle: str) -> int:
+    data = await terminal_show(handle)
+    term = data.get("result", {}).get("terminal", {})
+    return int(term.get("lastOutputAt") or 0)
+
+
+async def _wait_task_finished(handle: str, agent_id: str) -> None:
+    """Wait until the agent has actually worked and then gone idle.
+
+    tui-idle alone is unreliable: right after the prompt is sent the TUI is
+    still idle, so a bare wait returns immediately. Instead:
+      1. Wait for lastOutputAt to advance past the post-send baseline
+         (the agent started producing output).
+      2. Wait for tui-idle, then verify the idle is stable — the last
+         output must be at least IDLE_STABLE_MS in the past. Otherwise
+         keep waiting.
+    """
+    baseline = await _last_output_at(handle)
+    deadline = time.monotonic() + START_TIMEOUT_SECS
+    started = False
+    while time.monotonic() < deadline:
+        await anyio.sleep(START_POLL_SECS)
+        if await _last_output_at(handle) > baseline:
+            started = True
+            break
+    if started:
+        log.info("watcher(%s): agent started working", agent_id)
+    else:
+        log.warning(
+            "watcher(%s): no output detected within %ds, proceeding to idle wait",
+            agent_id, START_TIMEOUT_SECS,
+        )
+
+    while True:
+        await terminal_wait(handle, "tui-idle", timeout_ms=WAIT_TIMEOUT_MS)
+        last = await _last_output_at(handle)
+        idle_for = time.time() * 1000 - last
+        if idle_for >= IDLE_STABLE_MS:
+            log.info(
+                "watcher(%s): idle stable (%.0fms since last output)",
+                agent_id, idle_for,
+            )
+            return
+        log.debug(
+            "watcher(%s): idle not stable (%.0fms since last output), re-waiting",
+            agent_id, idle_for,
+        )
+        await anyio.sleep(1)
+
+
 async def watcher(ctx: ServerContext, agent_id: str) -> None:
     scope = anyio.CancelScope()
     ctx.watchers[agent_id] = scope
@@ -326,14 +376,15 @@ async def watcher(ctx: ServerContext, agent_id: str) -> None:
                 return
 
             handle = agent["terminal"]
+            prompt = agent.get("last_prompt", "")
             log.info("watcher(%s): started  terminal=%s", agent_id, handle)
 
-            # ---- Phase 1: wait for the agent to become idle ----
-            log.info("watcher(%s): waiting for tui-idle (timeout 10min)", agent_id)
+            # ---- Phase 1: wait for agent ready ----
+            log.info("watcher(%s): waiting for agent ready", agent_id)
             try:
                 await terminal_wait(handle, "tui-idle", timeout_ms=600_000)
             except OrcaError as exc:
-                log.error("watcher(%s): wait failed: %s", agent_id, exc)
+                log.error("watcher(%s): ready-wait failed: %s", agent_id, exc)
                 async with ctx.lock:
                     if agent_id in ctx.state["agents"]:
                         ctx.state["agents"][agent_id]["state"] = "error"
@@ -341,102 +392,89 @@ async def watcher(ctx: ServerContext, agent_id: str) -> None:
                         write_state(ctx.root, ctx.state)
                 return
 
-            log.info(
-                "[bold yellow]watcher(%s): agent idle[/bold yellow], triggering handoff",
-                agent_id,
-            )
+            # ---- Phase 2: send prompt ----
+            if prompt:
+                log.info("watcher(%s): agent ready, sending prompt", agent_id)
+                try:
+                    await terminal_send(handle, prompt)
+                except OrcaError as exc:
+                    log.error("watcher(%s): send failed: %s", agent_id, exc)
+                    async with ctx.lock:
+                        if agent_id in ctx.state["agents"]:
+                            ctx.state["agents"][agent_id]["state"] = "error"
+                            ctx.state["agents"][agent_id]["updated_at"] = now_iso()
+                            write_state(ctx.root, ctx.state)
+                    return
+
+                # ---- Phase 3: wait for task completion ----
+                log.info("watcher(%s): waiting for task completion", agent_id)
+                try:
+                    await _wait_task_finished(handle, agent_id)
+                except OrcaError as exc:
+                    log.error("watcher(%s): completion-wait failed: %s", agent_id, exc)
+                    async with ctx.lock:
+                        if agent_id in ctx.state["agents"]:
+                            ctx.state["agents"][agent_id]["state"] = "error"
+                            ctx.state["agents"][agent_id]["updated_at"] = now_iso()
+                            write_state(ctx.root, ctx.state)
+                    return
+
+            log.info("watcher(%s): agent done", agent_id)
+
+            # ---- Capture output and write the structured report ----
+            output_tail: list[str] = []
+            terminal_status = ""
+            try:
+                read_data = await terminal_read(handle, limit=200)
+                term = read_data.get("result", {}).get("terminal", {})
+                output_tail = term.get("tail", []) or []
+                terminal_status = term.get("status", "")
+            except OrcaError as exc:
+                log.warning(
+                    "watcher(%s): failed to capture output: %s", agent_id, exc,
+                )
+
+            finished_at = now_iso()
+            report_payload = {
+                "version": 1,
+                "event": "task_finished",
+                "agent_id": agent_id,
+                "terminal": handle,
+                "state": "done",
+                "prompt": prompt,
+                "created_at": agent.get("created_at"),
+                "finished_at": finished_at,
+                "terminal_status": terminal_status,
+                "output_tail": output_tail,
+            }
+            report_path = write_report(ctx.root, agent_id, report_payload)
+            log.info("watcher(%s): report written to %s", agent_id, report_path)
+
             async with ctx.lock:
                 if agent_id in ctx.state["agents"]:
-                    ctx.state["agents"][agent_id]["state"] = "idle"
-                    ctx.state["agents"][agent_id]["updated_at"] = now_iso()
+                    ctx.state["agents"][agent_id]["state"] = "done"
+                    ctx.state["agents"][agent_id]["updated_at"] = finished_at
+                    ctx.state["agents"][agent_id]["report_file"] = str(report_path)
                     write_state(ctx.root, ctx.state)
 
-            # ---- Phase 2: send forced handoff prompt ----
-            try:
-                await terminal_send(handle, FORCED_HANDOFF_PROMPT)
-                log.info("watcher(%s): handoff prompt sent", agent_id)
-            except OrcaError as exc:
-                log.error("watcher(%s): failed to send handoff: %s", agent_id, exc)
-                async with ctx.lock:
-                    if agent_id in ctx.state["agents"]:
-                        ctx.state["agents"][agent_id]["state"] = "error"
-                        ctx.state["agents"][agent_id]["updated_at"] = now_iso()
-                        write_state(ctx.root, ctx.state)
-                return
-
-            # ---- Phase 3: wait for idle again (shorter timeout) ----
-            log.info("watcher(%s): waiting for handoff completion (timeout 2min)", agent_id)
-            try:
-                wait_result = await terminal_wait(
-                    handle, "tui-idle", timeout_ms=120_000,
-                )
-            except OrcaError as exc:
-                log.error("watcher(%s): handoff wait failed: %s", agent_id, exc)
-                async with ctx.lock:
-                    if agent_id in ctx.state["agents"]:
-                        ctx.state["agents"][agent_id]["state"] = "error"
-                        ctx.state["agents"][agent_id]["updated_at"] = now_iso()
-                        write_state(ctx.root, ctx.state)
-                return
-
-            # ---- Phase 4: extract handoff filename ----
-            output = ""
-            if isinstance(wait_result, dict):
-                output = wait_result.get("output", wait_result.get("text", ""))
-                if not output:
-                    output = json.dumps(wait_result)
-
-            filename = extract_handoff_filename(output)
             caller_terminal = (
                 ctx.state["agents"].get(agent_id, {}).get("caller_terminal")
             )
-
-            if filename:
-                log.info(
-                    "[bold green]watcher(%s): handoff complete[/bold green]  file=%s",
-                    agent_id, filename,
+            if caller_terminal:
+                message = format_completion_report(
+                    agent_id, handle, str(report_path)
                 )
-                async with ctx.lock:
-                    if agent_id in ctx.state["agents"]:
-                        ctx.state["agents"][agent_id]["state"] = "done"
-                        ctx.state["agents"][agent_id]["last_handoff_file"] = filename
-                        ctx.state["agents"][agent_id]["updated_at"] = now_iso()
-                        write_state(ctx.root, ctx.state)
-
-                if caller_terminal:
-                    report = format_completion_report(agent_id, handle, filename)
-                    try:
-                        await terminal_send(caller_terminal, report)
-                        log.info(
-                            "watcher(%s): report sent to caller %s",
-                            agent_id, caller_terminal,
-                        )
-                    except OrcaError as exc:
-                        log.warning(
-                            "watcher(%s): failed to report to caller %s: %s",
-                            agent_id, caller_terminal, exc,
-                        )
-            else:
-                log.warning(
-                    "[bold red]watcher(%s): handoff failed[/bold red]  "
-                    "no HANDOFF_*.md found in output",
-                    agent_id,
-                )
-                async with ctx.lock:
-                    if agent_id in ctx.state["agents"]:
-                        ctx.state["agents"][agent_id]["state"] = "handoff_failed"
-                        ctx.state["agents"][agent_id]["updated_at"] = now_iso()
-                        write_state(ctx.root, ctx.state)
-
-                if caller_terminal:
-                    msg = format_handoff_failed_message()
-                    try:
-                        await terminal_send(caller_terminal, msg)
-                    except OrcaError as exc:
-                        log.warning(
-                            "watcher(%s): failed to notify caller of handoff failure: %s",
-                            agent_id, exc,
-                        )
+                try:
+                    await terminal_send(caller_terminal, message)
+                    log.info(
+                        "watcher(%s): notification sent to caller %s",
+                        agent_id, caller_terminal,
+                    )
+                except OrcaError as exc:
+                    log.warning(
+                        "watcher(%s): failed to notify caller %s: %s",
+                        agent_id, caller_terminal, exc,
+                    )
     finally:
         ctx.watchers.pop(agent_id, None)
         log.debug("watcher(%s): exited", agent_id)
@@ -452,7 +490,7 @@ async def reconcile_loop(ctx: ServerContext) -> None:
         await anyio.sleep(30)
 
         try:
-            terminals = await terminal_list(str(ctx.root))
+            terminals = await terminal_list()
         except OrcaError as exc:
             log.warning("reconcile: terminal_list failed: %s", exc)
             continue
@@ -465,7 +503,7 @@ async def reconcile_loop(ctx: ServerContext) -> None:
         async with ctx.lock:
             lost_agents = []
             for agent_id, agent in list(ctx.state.get("agents", {}).items()):
-                if agent.get("state") == "lost":
+                if agent.get("state") in ("lost", "done", "error"):
                     continue
                 if agent["terminal"] not in live_handles:
                     ctx.state["agents"][agent_id]["state"] = "lost"

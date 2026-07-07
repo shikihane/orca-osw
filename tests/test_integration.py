@@ -86,7 +86,7 @@ def test_full_new_agent_flow(tmp_path):
 
     async def scenario() -> None:
         mock_create = AsyncMock(
-            return_value={"terminal": "mock_term_001", "worktreePath": str(tmp_path)}
+            return_value={"result": {"terminal": {"handle": "mock_term_001"}}, "ok": True}
         )
         mock_send = AsyncMock(return_value={"ok": True})
         mock_wait = AsyncMock(side_effect=_hang_forever)
@@ -223,8 +223,8 @@ def test_all_broadcasts_to_managed_agents(tmp_path):
     async def scenario() -> None:
         mock_create = AsyncMock(
             side_effect=[
-                {"terminal": "term-a", "worktreePath": str(tmp_path)},
-                {"terminal": "term-b", "worktreePath": str(tmp_path)},
+                {"result": {"terminal": {"handle": "term-a"}}, "ok": True},
+                {"result": {"terminal": {"handle": "term-b"}}, "ok": True},
             ]
         )
         mock_send = AsyncMock(return_value={"ok": True})
