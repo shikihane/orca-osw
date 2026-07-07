@@ -47,11 +47,15 @@ async def run_orca(*args: str) -> dict:
 
     if result.returncode != 0:
         stderr_text = result.stderr.decode().strip()
+        stdout_text = result.stdout.decode().strip()
         log.debug(
-            "orca exited %d  stderr=%s",
-            result.returncode, stderr_text[:200] if stderr_text else "(empty)",
+            "orca exited %d  stderr=%s  stdout=%s",
+            result.returncode,
+            stderr_text[:200] if stderr_text else "(empty)",
+            stdout_text[:200] if stdout_text else "(empty)",
         )
-        raise OrcaError(stderr_text, result.returncode)
+        error_msg = stderr_text or stdout_text
+        raise OrcaError(error_msg, result.returncode)
 
     try:
         data = json.loads(result.stdout)
@@ -73,33 +77,34 @@ async def worktree_current() -> dict:
     return await run_orca("worktree", "current")
 
 
-async def terminal_list(worktree_path: str) -> list[dict]:
-    result = await run_orca(
-        "terminal", "list", "--worktree", f"path:{worktree_path}"
+async def terminal_list(worktree: str = "active") -> list[dict]:
+    data = await run_orca(
+        "terminal", "list", "--worktree", worktree,
     )
-    if isinstance(result, list):
-        return result
-    if isinstance(result, dict):
-        for value in result.values():
-            if isinstance(value, list):
-                return value
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        inner = data.get("result", data)
+        terminals = inner.get("terminals")
+        if isinstance(terminals, list):
+            return terminals
     return []
 
 
-async def terminal_create(worktree_path: str, command: str) -> dict:
+async def terminal_create(command: str, worktree: str = "active") -> dict:
     return await run_orca(
         "terminal",
         "create",
         "--worktree",
-        f"path:{worktree_path}",
+        worktree,
         "--command",
         command,
     )
 
 
-async def terminal_send(handle: str, message: str) -> dict:
+async def terminal_send(handle: str, text: str) -> dict:
     return await run_orca(
-        "terminal", "send", "--terminal", handle, "--message", message
+        "terminal", "send", "--terminal", handle, "--text", text, "--enter",
     )
 
 
@@ -120,6 +125,22 @@ async def terminal_wait(
 
 async def terminal_close(handle: str) -> dict:
     return await run_orca("terminal", "close", "--terminal", handle)
+
+
+async def terminal_read(
+    handle: str, limit: int = 200, cursor: str | None = None
+) -> dict:
+    args = ["terminal", "read", "--terminal", handle, "--limit", str(limit)]
+    if cursor is not None:
+        args += ["--cursor", cursor]
+    return await run_orca(*args)
+
+
+async def terminal_show(handle: str | None = None) -> dict:
+    args = ["terminal", "show"]
+    if handle:
+        args += ["--terminal", handle]
+    return await run_orca(*args)
 
 
 async def terminal_info(handle: str) -> dict:
