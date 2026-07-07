@@ -5,10 +5,12 @@ import shutil
 
 import anyio
 
+from osw.log import get_logger
+
+log = get_logger("orca")
+
 
 class OrcaError(Exception):
-    """Raised when the `orca` CLI exits with a nonzero return code."""
-
     def __init__(self, message: str, returncode: int) -> None:
         self.message = message
         self.returncode = returncode
@@ -16,7 +18,6 @@ class OrcaError(Exception):
 
 
 def _resolve_orca() -> str:
-    """Find the full path to the orca executable (.cmd/.exe/.bat)."""
     path = shutil.which("orca")
     if path is None:
         raise OrcaError(
@@ -27,15 +28,12 @@ def _resolve_orca() -> str:
 
 
 async def run_orca(*args: str) -> dict:
-    """Run the `orca` CLI with the given arguments and return parsed JSON output.
-
-    Always requests JSON output (appends "--json" if not already present).
-    Raises OrcaError if the process exits with a nonzero return code.
-    """
     orca = _resolve_orca()
     cmd = [orca, *args]
     if "--json" not in cmd:
         cmd.append("--json")
+
+    log.debug("exec: %s", " ".join(cmd))
 
     try:
         result = await anyio.run_process(cmd, check=False)
@@ -48,24 +46,34 @@ async def run_orca(*args: str) -> dict:
         raise OrcaError(f"Failed to run orca: {exc}", 1)
 
     if result.returncode != 0:
-        raise OrcaError(result.stderr.decode(), result.returncode)
+        stderr_text = result.stderr.decode().strip()
+        log.debug(
+            "orca exited %d  stderr=%s",
+            result.returncode, stderr_text[:200] if stderr_text else "(empty)",
+        )
+        raise OrcaError(stderr_text, result.returncode)
 
     try:
-        return json.loads(result.stdout)
+        data = json.loads(result.stdout)
     except json.JSONDecodeError:
         raise OrcaError(
             f"Orca returned invalid JSON: {result.stdout.decode()[:200]}",
             1,
         )
 
+    log.debug(
+        "orca ok  args=%s  keys=%s",
+        args[:2],
+        list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+    )
+    return data
+
 
 async def worktree_current() -> dict:
-    """Return info about the current Orca-managed worktree."""
     return await run_orca("worktree", "current")
 
 
 async def terminal_list(worktree_path: str) -> list[dict]:
-    """List terminals for the given worktree path."""
     result = await run_orca(
         "terminal", "list", "--worktree", f"path:{worktree_path}"
     )
@@ -79,7 +87,6 @@ async def terminal_list(worktree_path: str) -> list[dict]:
 
 
 async def terminal_create(worktree_path: str, command: str) -> dict:
-    """Create a new terminal running `command` in the given worktree."""
     return await run_orca(
         "terminal",
         "create",
@@ -91,7 +98,6 @@ async def terminal_create(worktree_path: str, command: str) -> dict:
 
 
 async def terminal_send(handle: str, message: str) -> dict:
-    """Send a message to the terminal identified by `handle`."""
     return await run_orca(
         "terminal", "send", "--terminal", handle, "--message", message
     )
@@ -100,7 +106,6 @@ async def terminal_send(handle: str, message: str) -> dict:
 async def terminal_wait(
     handle: str, event: str = "tui-idle", timeout_ms: int = 300000
 ) -> dict:
-    """Wait for `event` to occur on the terminal identified by `handle`."""
     return await run_orca(
         "terminal",
         "wait",
@@ -114,10 +119,8 @@ async def terminal_wait(
 
 
 async def terminal_close(handle: str) -> dict:
-    """Close the terminal identified by `handle`."""
     return await run_orca("terminal", "close", "--terminal", handle)
 
 
 async def terminal_info(handle: str) -> dict:
-    """Return info (including worktreePath) for the terminal identified by `handle`."""
     return await run_orca("terminal", "info", "--terminal", handle)

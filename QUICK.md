@@ -5,7 +5,7 @@
 ## 1. Install dependencies
 
 ```bash
-python -m pip install anyio typer
+python -m pip install anyio typer rich
 ```
 
 ## 2. Initialize

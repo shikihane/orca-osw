@@ -23,3 +23,11 @@ Install with:
 """
         sys.stderr.write(message)
         sys.exit(1)
+
+    try:
+        import rich
+    except ImportError:
+        sys.stderr.write(
+            "Note: 'rich' is not installed. Logging will use plain text.\n"
+            "Install for colored output: python -m pip install rich\n"
+        )

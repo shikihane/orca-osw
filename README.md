@@ -9,7 +9,7 @@ A lightweight Python tool for managing Orca-backed agent sessions from the curre
 - **Directory-scoped** — each working directory is an independent management scope, even across git worktrees
 - **Async supervisor** — AnyIO-based concurrency; inbox polling, per-agent watchers, and reconciliation run without blocking each other
 - **Automatic handoff** — detects agent idle, triggers `/handoff`, extracts `HANDOFF_*.md`, notifies the caller terminal
-- **Minimal dependencies** — only `anyio` and `typer`
+- **Minimal dependencies** — only `anyio`, `typer`, and optionally `rich` for colored logs
 
 ## Requirements
 
@@ -18,7 +18,7 @@ A lightweight Python tool for managing Orca-backed agent sessions from the curre
 - `anyio` and `typer`:
 
 ```
-python -m pip install anyio typer
+python -m pip install anyio typer rich
 ```
 
 ## Quick Start

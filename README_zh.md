@@ -9,7 +9,7 @@
 - **目录隔离** — 每个工作目录是独立的管理范围，即使跨 git worktree 也互不影响
 - **异步监督器** — 基于 AnyIO 的并发架构；收件箱轮询、逐 agent 观察者、状态协调互不阻塞
 - **自动交接** — 检测 agent 空闲后自动触发 `/handoff`，提取 `HANDOFF_*.md` 文件名，通知调用方终端
-- **最少依赖** — 仅需 `anyio` 和 `typer`
+- **最少依赖** — 仅需 `anyio`、`typer`，可选 `rich` 获得彩色日志
 
 ## 环境要求
 
@@ -18,7 +18,7 @@
 - `anyio` 和 `typer`：
 
 ```
-python -m pip install anyio typer
+python -m pip install anyio typer rich
 ```
 
 ## 快速开始

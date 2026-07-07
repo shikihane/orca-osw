@@ -6,6 +6,7 @@ from pathlib import Path
 import anyio
 import typer
 
+from osw.log import get_logger, setup_logging
 from osw.server import run_server
 from osw.state import (
     init_state_dir,
@@ -17,14 +18,23 @@ from osw.state import (
     write_request,
 )
 
+log = get_logger("cli")
+
 app = typer.Typer(help="OSW — Orca Agent Supervisor")
 
 RESULT_TIMEOUT = 15.0
 
 
+@app.callback()
+def main(
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging"),
+) -> None:
+    setup_logging(verbose=verbose)
+
+
 def require_serve(root: Path) -> None:
-    """Abort with a helpful message if the OSW supervisor is not running."""
     if not is_serve_running(root):
+        log.error("supervisor is not running for %s", root)
         typer.echo("OSW serve is not running for this directory.")
         typer.echo("Start it with:")
         typer.echo("  python osw.py serve")
@@ -32,8 +42,8 @@ def require_serve(root: Path) -> None:
 
 
 def _handle_result(result: dict | None, on_ok) -> None:
-    """Shared result handling for new/use/all/del: timeout, error, or success."""
     if result is None:
+        log.error("supervisor did not respond within %.0fs", RESULT_TIMEOUT)
         typer.echo("OSW serve did not return a result within 15 seconds.")
         typer.echo("Check python osw.py status.")
         raise typer.Exit(1)
@@ -41,7 +51,9 @@ def _handle_result(result: dict | None, on_ok) -> None:
     if result.get("ok"):
         on_ok(result)
     else:
-        typer.echo(f"Error: {result.get('error') or 'unknown error'}")
+        error_msg = result.get("error") or "unknown error"
+        log.error("command failed: %s", error_msg)
+        typer.echo(f"Error: {error_msg}")
         raise typer.Exit(1)
 
 
@@ -50,6 +62,7 @@ def init() -> None:
     """Initialize OSW state for the current directory."""
     root = resolve_project_root()
     init_state_dir(root)
+    log.info("initialized state at %s", state_file(root))
     typer.echo(f"Initialized OSW state at {state_file(root)}")
 
 
@@ -75,16 +88,19 @@ def new(
     root = resolve_project_root()
     require_serve(root)
 
+    log.info("sending 'new' request  prompt=%s", prompt[:60])
     payload: dict = {"prompt": prompt}
     if caller_terminal:
         payload["caller_terminal"] = caller_terminal
     request_id = write_request(root, "new", payload)
+    log.debug("request_id=%s, waiting for result...", request_id)
     result = read_result(root, request_id, timeout=RESULT_TIMEOUT)
 
     def on_ok(result: dict) -> None:
-        typer.echo(
-            f"Created {result.get('agent_id')} on terminal {result.get('terminal')}"
-        )
+        agent_id = result.get("agent_id")
+        terminal = result.get("terminal")
+        log.info("agent created  %s → %s", agent_id, terminal)
+        typer.echo(f"Created {agent_id} on terminal {terminal}")
 
     _handle_result(result, on_ok)
 
@@ -99,16 +115,19 @@ def use(
     root = resolve_project_root()
     require_serve(root)
 
+    log.info("sending 'use' request  terminal=%s", terminal)
     payload: dict = {"terminal": terminal, "prompt": prompt}
     if caller_terminal:
         payload["caller_terminal"] = caller_terminal
     request_id = write_request(root, "use", payload)
+    log.debug("request_id=%s, waiting for result...", request_id)
     result = read_result(root, request_id, timeout=RESULT_TIMEOUT)
 
     def on_ok(result: dict) -> None:
-        typer.echo(
-            f"Adopted {result.get('agent_id')} on terminal {result.get('terminal')}"
-        )
+        agent_id = result.get("agent_id")
+        term = result.get("terminal")
+        log.info("agent adopted  %s → %s", agent_id, term)
+        typer.echo(f"Adopted {agent_id} on terminal {term}")
 
     _handle_result(result, on_ok)
 
@@ -119,15 +138,19 @@ def all_(message: str) -> None:
     root = resolve_project_root()
     require_serve(root)
 
+    log.info("sending 'all' request  msg=%s", message[:60])
     request_id = write_request(root, "all", {"message": message})
     result = read_result(root, request_id, timeout=RESULT_TIMEOUT)
 
     def on_ok(result: dict) -> None:
         sent = result.get("sent", [])
         errors = result.get("errors", [])
+        log.info("broadcast complete  sent=%d  errors=%d", len(sent), len(errors))
         typer.echo(f"Sent to {len(sent)} agent(s): {', '.join(sent)}")
         if errors:
-            typer.echo(f"Errors: {errors}", err=True)
+            for err in errors:
+                log.warning("broadcast error: %s", err)
+            typer.echo(f"Errors: {errors}")
 
     _handle_result(result, on_ok)
 
@@ -141,11 +164,14 @@ def del_(
     root = resolve_project_root()
     require_serve(root)
 
+    log.info("sending 'del' request  agent_id=%s  close=%s", agent_id, close)
     request_id = write_request(root, "del", {"agent_id": agent_id, "close": close})
     result = read_result(root, request_id, timeout=RESULT_TIMEOUT)
 
     def on_ok(result: dict) -> None:
-        typer.echo(f"Removed {result.get('agent_id')}")
+        aid = result.get("agent_id")
+        log.info("agent removed: %s", aid)
+        typer.echo(f"Removed {aid}")
 
     _handle_result(result, on_ok)
 
@@ -197,6 +223,11 @@ def status() -> None:
     running = is_serve_running(root)
     typer.echo(f"Serve: {'running' if running else 'not running'}")
     typer.echo(f"State file: {state_file(root)}")
+
+    serve_info = state.get("serve")
+    if serve_info:
+        typer.echo(f"PID: {serve_info.get('pid')}")
+        typer.echo(f"Started: {serve_info.get('started_at')}")
 
     counts: dict[str, int] = {}
     for agent in state.get("agents", {}).values():

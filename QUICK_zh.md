@@ -5,7 +5,7 @@
 ## 1. 安装依赖
 
 ```bash
-python -m pip install anyio typer
+python -m pip install anyio typer rich
 ```
 
 ## 2. 初始化
