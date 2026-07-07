@@ -19,6 +19,44 @@ KNOWN_AGENT_CLIS = [
     "copilot",
 ]
 
+# Suggested tier entries per provider, shown as a menu during
+# `init --interactive`. These are CANDIDATES only — nothing is written
+# unless the user explicitly picks one, and a custom-command escape
+# hatch always exists.
+PROVIDER_PRESETS: dict[str, list[dict]] = {
+    "claude": [
+        {"name": "claude-opus", "command": "claude --model opus"},
+        {"name": "claude-sonnet", "command": "claude --model sonnet"},
+        {"name": "claude-haiku", "command": "claude --model haiku"},
+    ],
+    "codex": [
+        {"name": "codex-high", "command": "codex -c model_reasoning_effort=high"},
+        {"name": "codex-medium", "command": "codex -c model_reasoning_effort=medium"},
+        {"name": "codex-low", "command": "codex -c model_reasoning_effort=low"},
+    ],
+    "pi": [
+        {"name": "pi-deepseek", "command": "pi --model deepseek"},
+        {"name": "pi-kimi", "command": "pi --model kimi"},
+    ],
+}
+
+
+def preset_options(found: list[dict]) -> list[dict]:
+    """Build the selectable entries for the detected CLIs.
+
+    CLIs with known presets contribute their variants; anything else
+    contributes its bare command.
+    """
+    options: list[dict] = []
+    for cli in found:
+        presets = PROVIDER_PRESETS.get(cli["name"])
+        if presets:
+            options.extend(presets)
+        else:
+            options.append({"name": cli["name"], "command": cli["name"]})
+    return options
+
+
 _VERSION_TIMEOUT = 10
 
 

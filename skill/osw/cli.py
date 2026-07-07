@@ -10,7 +10,7 @@ import typer
 
 from osw.log import enable_file_logging, get_logger, setup_logging
 from osw.orca_cli import detect_current_terminal
-from osw.providers import scan_agent_clis
+from osw.providers import preset_options, scan_agent_clis
 from osw.server import run_server
 from osw.state import (
     init_state_dir,
@@ -83,7 +83,12 @@ def _handle_result(result: dict | None, on_ok) -> None:
 
 
 @app.command()
-def init() -> None:
+def init(
+    interactive: bool = typer.Option(
+        False, "--interactive", "-i",
+        help="Pick tier models via prompts (humans only; never use from an agent)",
+    ),
+) -> None:
     """Initialize OSW state for the current directory."""
     root = resolve_project_root()
     init_state_dir(root)
@@ -100,11 +105,64 @@ def init() -> None:
     else:
         typer.echo("  no known agent CLIs found on PATH")
 
+    if interactive and found:
+        _interactive_tier_setup(root, found)
+        return
+
     typer.echo("")
     typer.echo("Model tiers are EMPTY. Before using `new`, assign models, e.g.:")
     typer.echo('  python osw.py model add --tier medium --name codex-mid'
                ' --command "codex -c model_reasoning_effort=medium"')
     typer.echo("Verify with: python osw.py model list")
+    typer.echo("(Humans can rerun `init -i` for a guided setup.)")
+
+
+def _interactive_tier_setup(root: Path, found: list[dict]) -> None:
+    """Guided tier assignment: one pick per tier from the preset menu."""
+    state = read_state(root)
+    options = preset_options(found)
+    used_names = set()
+
+    for tier in TIERS:
+        typer.echo("")
+        typer.echo(f"[{tier}] choose a model:")
+        for i, opt in enumerate(options, 1):
+            typer.echo(f"  {i}. {opt['name']:<18} {opt['command']}")
+        typer.echo("  c. custom command")
+        typer.echo("  s. skip this tier")
+
+        entry = None
+        while entry is None:
+            choice = typer.prompt("select", default="s").strip().lower()
+            if choice == "s":
+                break
+            if choice == "c":
+                name = typer.prompt("entry name").strip()
+                command = typer.prompt("command").strip()
+                if name and command:
+                    entry = {"name": name, "command": command}
+                continue
+            try:
+                index = int(choice) - 1
+                if 0 <= index < len(options):
+                    entry = dict(options[index])
+            except ValueError:
+                pass
+            if entry is None:
+                typer.echo("  invalid choice, try again")
+
+        if entry is None:
+            typer.echo(f"  {tier}: skipped")
+            continue
+        if entry["name"] in used_names:
+            entry["name"] = f"{entry['name']}-{tier}"
+        used_names.add(entry["name"])
+        state["models"][tier].append(entry)
+        typer.echo(f"  {tier}: {entry['name']} -> {entry['command']}")
+
+    write_state(root, state)
+    typer.echo("")
+    typer.echo("Saved. Review with: python osw.py model list")
 
 
 # ---------------------------------------------------------------------------

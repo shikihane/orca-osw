@@ -16,6 +16,8 @@ will work.
 
 1. `python <skill-dir>/osw.py init` — creates `.orca/osw/` and scans
    PATH for known agent CLIs (claude, codex, pi, gemini, aider, ...).
+   NEVER pass `-i/--interactive` — that flag starts a blocking
+   question-and-answer setup meant for humans typing at a keyboard.
 2. Inspect what the scan found. For each CLI you intend to use, probe
    its options yourself (`<cli> --help`) to learn how to select model
    variants (e.g. `claude --model haiku`, `codex -c model_reasoning_effort=high`,
