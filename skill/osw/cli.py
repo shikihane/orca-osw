@@ -9,7 +9,7 @@ import anyio
 import typer
 
 from osw.log import enable_file_logging, get_logger, setup_logging
-from osw.orca_cli import terminal_list
+from osw.orca_cli import detect_current_terminal
 from osw.server import run_server
 from osw.state import (
     init_state_dir,
@@ -51,14 +51,12 @@ def _detect_caller_terminal() -> str | None:
     log.info("caller detect  trace=%s", marker)
     time.sleep(0.3)
     try:
-        terminals = anyio.run(terminal_list)
+        handle = anyio.run(detect_current_terminal, marker)
     except Exception:
         return None
-    for term in terminals:
-        if marker in term.get("preview", ""):
-            handle = term.get("handle", "")
-            log.info("caller detected  terminal=%s", handle)
-            return handle or None
+    if handle:
+        log.info("caller detected  terminal=%s", handle)
+        return handle
     log.warning("caller detect failed, no terminal matched trace")
     return None
 
