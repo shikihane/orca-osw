@@ -153,10 +153,60 @@ async def inbox_loop(ctx: ServerContext) -> None:
 # Command handlers
 # ---------------------------------------------------------------------------
 
+MODEL_TIERS = ("strong", "medium", "weak")
+DEFAULT_TIER = "medium"
+
+
+def _resolve_model(
+    state: dict, tier: str, model_name: str | None
+) -> tuple[dict | None, str]:
+    """Pick a model entry. Returns (entry, error).
+
+    A model name matches across all tiers and wins over tier. An
+    empty requested tier falls back to the other tiers in
+    MODEL_TIERS order.
+    """
+    models = state.get("models", {})
+
+    if model_name:
+        for t in MODEL_TIERS:
+            for entry in models.get(t) or []:
+                if entry.get("name") == model_name:
+                    return entry, ""
+        return None, f"model '{model_name}' not found in models config"
+
+    if tier not in MODEL_TIERS:
+        return None, f"unknown tier '{tier}' (expected one of {'/'.join(MODEL_TIERS)})"
+
+    search_order = [tier] + [t for t in MODEL_TIERS if t != tier]
+    for t in search_order:
+        entries = models.get(t) or []
+        if entries:
+            if t != tier:
+                log.warning("models: tier '%s' is empty, using '%s' instead", tier, t)
+            return entries[0], ""
+    return None, "models config is empty"
+
+
 async def handle_new(ctx: ServerContext, request: dict) -> None:
-    command = ctx.state["models"]["strong"][0]["command"]
     prompt = request.get("prompt", "")
-    log.info("new: creating terminal  provider=%s  prompt=%s", command, _trunc(prompt))
+    tier = request.get("tier") or DEFAULT_TIER
+    model_name = request.get("model")
+
+    entry, error = _resolve_model(ctx.state, tier, model_name)
+    if entry is None:
+        log.error("new: %s", error)
+        write_result(ctx.root, request["request_id"], {
+            "ok": False,
+            "error": error,
+        })
+        return
+
+    command = entry.get("command", "")
+    log.info(
+        "new: creating terminal  model=%s  provider=%s  prompt=%s",
+        entry.get("name", "?"), command, _trunc(prompt),
+    )
 
     try:
         result = await terminal_create(command)
@@ -180,6 +230,7 @@ async def handle_new(ctx: ServerContext, request: dict) -> None:
             "terminal": handle,
             "worktree_path": str(ctx.root),
             "provider_command": command,
+            "model_name": entry.get("name", ""),
             "state": "assigned",
             "caller_terminal": request.get("caller_terminal"),
             "last_prompt": prompt,
@@ -194,12 +245,13 @@ async def handle_new(ctx: ServerContext, request: dict) -> None:
         "agent_id": agent_id,
         "terminal": handle,
         "worktree_path": str(ctx.root),
+        "model": entry.get("name", ""),
         "state": "assigned",
     })
 
     log.info(
-        "new: agent registered  %s -> %s",
-        agent_id, handle,
+        "new: agent registered  %s -> %s  model=%s",
+        agent_id, handle, entry.get("name", ""),
     )
     ctx.task_group.start_soon(watcher, ctx, agent_id)
 

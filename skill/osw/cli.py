@@ -104,6 +104,8 @@ def serve() -> None:
 @app.command()
 def new(
     prompt: str,
+    tier: str = typer.Option("medium", "--tier", "-t", help="Model tier: strong, medium, or weak"),
+    model: str = typer.Option(None, "--model", "-m", help="Specific model entry name (overrides --tier)"),
     caller_terminal: str = typer.Option(None, "--caller-terminal", help="Terminal handle to receive completion reports"),
 ) -> None:
     """Create a new agent terminal and send it a task prompt."""
@@ -111,11 +113,17 @@ def new(
     enable_file_logging(logs_dir(root))
     require_serve(root)
 
+    if tier not in ("strong", "medium", "weak"):
+        typer.echo(f"Error: unknown tier '{tier}' (expected strong, medium, or weak)")
+        raise typer.Exit(1)
+
     if not caller_terminal:
         caller_terminal = _detect_caller_terminal()
 
-    log.info("sending 'new' request  prompt=%s", prompt[:60])
-    payload: dict = {"prompt": prompt}
+    log.info("sending 'new' request  tier=%s model=%s prompt=%s", tier, model or "-", prompt[:60])
+    payload: dict = {"prompt": prompt, "tier": tier}
+    if model:
+        payload["model"] = model
     if caller_terminal:
         payload["caller_terminal"] = caller_terminal
     request_id = write_request(root, "new", payload)
@@ -125,8 +133,8 @@ def new(
     def on_ok(r: dict) -> None:
         agent_id = r.get("agent_id")
         terminal = r.get("terminal")
-        log.info("agent created  %s -> %s", agent_id, terminal)
-        typer.echo(f"Created {agent_id} on terminal {terminal}")
+        log.info("agent created  %s -> %s  model=%s", agent_id, terminal, r.get("model", ""))
+        typer.echo(f"Created {agent_id} on terminal {terminal} (model: {r.get('model', '?')})")
 
     _handle_result(result, on_ok)
 

@@ -88,6 +88,109 @@ async def test_handle_new_creates_agent(server_ctx):
     server_ctx.task_group.start_soon.assert_called_once()
 
 
+@pytest.mark.anyio
+async def test_handle_new_default_tier_is_medium(server_ctx):
+    mock_create = AsyncMock(return_value={"handle": "term-1"})
+
+    request = {
+        "request_id": "req-tier",
+        "command": "new",
+        "prompt": "task",
+    }
+
+    with patch("osw.server.terminal_create", mock_create):
+        await handle_new(server_ctx, request)
+
+    # Default state: medium tier -> "pi"
+    assert mock_create.call_args.args[0] == "pi"
+    agent = server_ctx.state["agents"]["agent_001"]
+    assert agent["provider_command"] == "pi"
+    assert agent["model_name"] == "medium-default"
+
+
+@pytest.mark.anyio
+async def test_handle_new_tier_strong(server_ctx):
+    mock_create = AsyncMock(return_value={"handle": "term-1"})
+
+    request = {
+        "request_id": "req-tier2",
+        "command": "new",
+        "prompt": "task",
+        "tier": "strong",
+    }
+
+    with patch("osw.server.terminal_create", mock_create):
+        await handle_new(server_ctx, request)
+
+    assert mock_create.call_args.args[0] == "codex"
+    assert server_ctx.state["agents"]["agent_001"]["model_name"] == "strong-default"
+
+
+@pytest.mark.anyio
+async def test_handle_new_model_by_name(server_ctx):
+    server_ctx.state["models"]["weak"].append(
+        {"name": "pi-kimi", "command": "pi --model kimi"}
+    )
+    mock_create = AsyncMock(return_value={"handle": "term-1"})
+
+    request = {
+        "request_id": "req-model",
+        "command": "new",
+        "prompt": "task",
+        "tier": "strong",
+        "model": "pi-kimi",
+    }
+
+    with patch("osw.server.terminal_create", mock_create):
+        await handle_new(server_ctx, request)
+
+    # --model wins over --tier
+    assert mock_create.call_args.args[0] == "pi --model kimi"
+    assert server_ctx.state["agents"]["agent_001"]["model_name"] == "pi-kimi"
+
+
+@pytest.mark.anyio
+async def test_handle_new_unknown_model_errors(server_ctx):
+    mock_create = AsyncMock(return_value={"handle": "term-1"})
+
+    request = {
+        "request_id": "req-badmodel",
+        "command": "new",
+        "prompt": "task",
+        "model": "no-such-model",
+    }
+
+    with patch("osw.server.terminal_create", mock_create):
+        await handle_new(server_ctx, request)
+
+    mock_create.assert_not_called()
+    assert len(server_ctx.state["agents"]) == 0
+    result_path = state_mod.results_dir(server_ctx.root) / "req-badmodel.json"
+    with result_path.open() as f:
+        result = json.load(f)
+    assert result["ok"] is False
+    assert "no-such-model" in result["error"]
+
+
+@pytest.mark.anyio
+async def test_handle_new_empty_tier_falls_back(server_ctx):
+    server_ctx.state["models"]["medium"] = []
+    mock_create = AsyncMock(return_value={"handle": "term-1"})
+
+    request = {
+        "request_id": "req-fallback",
+        "command": "new",
+        "prompt": "task",
+        "tier": "medium",
+    }
+
+    with patch("osw.server.terminal_create", mock_create):
+        await handle_new(server_ctx, request)
+
+    # medium empty -> falls back to strong
+    assert mock_create.call_args.args[0] == "codex"
+
+
 # ------------------------------------------------------------------
 # handle_use
 # ------------------------------------------------------------------
