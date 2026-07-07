@@ -24,7 +24,9 @@ def extract_handoff_filename(text: str) -> str | None:
     return match.group(0)
 
 
-def format_completion_report(agent_id: str, terminal: str, report_file: str) -> str:
+def format_completion_report(
+    agent_id: str, terminal: str, report_file: str, summary: str = ""
+) -> str:
     """Format the single-line completion notification.
 
     Must stay single-line: newlines get mangled when passed through
@@ -38,6 +40,8 @@ def format_completion_report(agent_id: str, terminal: str, report_file: str) -> 
     message = f"# [osw] task-finished agent={agent_id} terminal={terminal}"
     if report_file:
         message += f" report={report_file}"
+    if summary:
+        message += f" summary={' '.join(summary.split())}"
     return message
 
 

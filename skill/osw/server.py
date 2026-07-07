@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,10 @@ from osw.handoff import format_completion_report
 from osw.log import get_logger
 from osw.orca_cli import (
     OrcaError,
+    detect_current_terminal,
+    orchestration_check,
+    orchestration_dispatch,
+    orchestration_task_create,
     terminal_close,
     terminal_create,
     terminal_info,
@@ -46,11 +51,27 @@ class ServerContext:
     watchers: dict[str, anyio.CancelScope] = field(default_factory=dict)
     lock: anyio.Lock = field(default_factory=anyio.Lock)
     task_group: anyio.abc.TaskGroup | None = None
+    coordinator: str | None = None
+    done_events: dict[str, anyio.Event] = field(default_factory=dict)
+    worker_msgs: dict[str, dict] = field(default_factory=dict)
+    task_agents: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------------------------
+
+async def _detect_serve_terminal() -> str | None:
+    """Identify the terminal this serve process runs in via a trace marker."""
+    marker = f"osw_serve_{uuid.uuid4().hex[:12]}"
+    log.info("supervisor terminal trace  %s", marker)
+    await anyio.sleep(0.5)
+    try:
+        return await detect_current_terminal(marker)
+    except OrcaError as exc:
+        log.warning("serve terminal detection failed: %s", exc)
+        return None
+
 
 async def run_server(root: Path) -> None:
     state = read_state(root)
@@ -63,6 +84,14 @@ async def run_server(root: Path) -> None:
     ctx = ServerContext(root=root, state=state)
     log.info("supervisor started  pid=%d  root=%s", os.getpid(), root)
     log.info("state: %s", root / ".orca" / "osw" / "state.json")
+
+    ctx.coordinator = await _detect_serve_terminal()
+    if ctx.coordinator:
+        log.info("coordinator terminal: %s (orchestration mode)", ctx.coordinator)
+    else:
+        log.warning(
+            "serve terminal not identified; falling back to prompt-injection mode"
+        )
     log.info("inbox polling every 0.5s, reconciliation every 30s")
 
     try:
@@ -70,6 +99,8 @@ async def run_server(root: Path) -> None:
             ctx.task_group = tg
             tg.start_soon(inbox_loop, ctx)
             tg.start_soon(reconcile_loop, ctx)
+            if ctx.coordinator:
+                tg.start_soon(orchestration_loop, ctx)
     except BaseException as exc:
         log.error("supervisor crashed: %s", exc)
         raise
@@ -220,13 +251,6 @@ async def handle_use(ctx: ServerContext, request: dict) -> None:
         }
         write_state(ctx.root, ctx.state)
 
-    if prompt:
-        try:
-            await terminal_send(handle, prompt)
-            log.info("use: prompt sent to %s", handle)
-        except OrcaError as exc:
-            log.warning("use: failed to send prompt to %s: %s", handle, exc)
-
     write_result(ctx.root, request["request_id"], {
         "ok": True,
         "agent_id": agent_id,
@@ -304,6 +328,96 @@ async def handle_del(ctx: ServerContext, request: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Orchestration message routing
+# ---------------------------------------------------------------------------
+
+ORCH_POLL_SECS = 2.0
+
+
+def _msg_payload(msg: dict) -> dict:
+    try:
+        payload = json.loads(msg.get("payload") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_agent(ctx: ServerContext, msg: dict) -> str | None:
+    """Map a message to an agent: by taskId payload, then by sender handle."""
+    payload = _msg_payload(msg)
+    task_id = payload.get("taskId") or payload.get("task_id")
+    if task_id and task_id in ctx.task_agents:
+        return ctx.task_agents[task_id]
+    sender = msg.get("from_handle", "")
+    for agent_id, agent in ctx.state.get("agents", {}).items():
+        if agent.get("terminal") == sender:
+            return agent_id
+    return None
+
+
+async def orchestration_loop(ctx: ServerContext) -> None:
+    log.debug("orchestration_loop started (interval=%.0fs)", ORCH_POLL_SECS)
+    while True:
+        await anyio.sleep(ORCH_POLL_SECS)
+        try:
+            messages = await orchestration_check(ctx.coordinator)
+        except OrcaError as exc:
+            log.warning("orchestration: check failed: %s", exc)
+            continue
+
+        for msg in messages:
+            await route_message(ctx, msg)
+
+
+async def route_message(ctx: ServerContext, msg: dict) -> None:
+    mtype = msg.get("type", "")
+    agent_id = _resolve_agent(ctx, msg)
+    if agent_id is None:
+        log.warning(
+            "orchestration: unroutable message id=%s type=%s from=%s subject=%s",
+            msg.get("id"), mtype, msg.get("from_handle"), _trunc(msg.get("subject", "")),
+        )
+        return
+
+    if mtype == "worker_done":
+        log.info(
+            "orchestration: worker_done  agent=%s subject=%s",
+            agent_id, _trunc(msg.get("subject", "")),
+        )
+        ctx.worker_msgs[agent_id] = msg
+        event = ctx.done_events.get(agent_id)
+        if event is not None:
+            event.set()
+    elif mtype == "heartbeat":
+        phase = _msg_payload(msg).get("phase", "")
+        log.info("orchestration: heartbeat  agent=%s phase=%s", agent_id, phase)
+        async with ctx.lock:
+            if agent_id in ctx.state["agents"]:
+                ctx.state["agents"][agent_id]["updated_at"] = now_iso()
+                ctx.state["agents"][agent_id]["phase"] = phase
+                write_state(ctx.root, ctx.state)
+    else:
+        # escalation / decision_gate / status — forward a pointer to the caller
+        log.info(
+            "orchestration: %s  agent=%s subject=%s",
+            mtype, agent_id, _trunc(msg.get("subject", "")),
+        )
+        caller = ctx.state["agents"].get(agent_id, {}).get("caller_terminal")
+        if caller:
+            line = (
+                f"# [osw] {mtype} agent={agent_id}"
+                f" subject={_oneline(msg.get('subject', ''))}"
+                f" msg_id={msg.get('id', '')}"
+            )
+            try:
+                await terminal_send(caller, line)
+            except OrcaError as exc:
+                log.warning(
+                    "orchestration: failed to forward %s to caller: %s", mtype, exc,
+                )
+
+
+# ---------------------------------------------------------------------------
 # Per-agent watcher
 # ---------------------------------------------------------------------------
 
@@ -312,6 +426,11 @@ START_TIMEOUT_SECS = 120   # max time to wait for the agent to start producing o
 START_POLL_SECS = 1.0      # poll interval while waiting for the agent to start
 IDLE_STABLE_MS = 5000      # idle only counts if no output for this long
 WAIT_TIMEOUT_MS = 600_000
+
+# Orchestration-mode completion tuning
+WORKER_DONE_TIMEOUT_SECS = 3600    # give up waiting for worker_done after this
+DONE_POLL_SECS = 2.0               # poll interval for event/idle checks
+FALLBACK_IDLE_STABLE_MS = 60_000   # fallback: worker silent this long = finished
 
 
 async def _last_output_at(handle: str) -> int:
@@ -364,9 +483,150 @@ async def _wait_task_finished(handle: str, agent_id: str) -> None:
         await anyio.sleep(1)
 
 
+async def _mark_error(ctx: ServerContext, agent_id: str) -> None:
+    async with ctx.lock:
+        if agent_id in ctx.state["agents"]:
+            ctx.state["agents"][agent_id]["state"] = "error"
+            ctx.state["agents"][agent_id]["updated_at"] = now_iso()
+            write_state(ctx.root, ctx.state)
+
+
+async def _dispatch_task(
+    ctx: ServerContext, agent_id: str, handle: str, prompt: str
+) -> str:
+    """Create an orchestration task and dispatch it to the worker terminal.
+
+    Returns the task id. Raises OrcaError on failure.
+    """
+    task_id = await orchestration_task_create(prompt, title=_trunc(prompt))
+    if not task_id:
+        raise OrcaError("task-create returned no task id", 1)
+    result = await orchestration_dispatch(
+        task_id, handle, from_handle=ctx.coordinator, inject=True,
+    )
+    dispatch = result.get("result", {}).get("dispatch") or {}
+    dispatch_id = dispatch.get("id", "")
+    log.info(
+        "watcher(%s): dispatched task=%s dispatch=%s", agent_id, task_id, dispatch_id,
+    )
+    ctx.task_agents[task_id] = agent_id
+    async with ctx.lock:
+        if agent_id in ctx.state["agents"]:
+            ctx.state["agents"][agent_id]["task_id"] = task_id
+            ctx.state["agents"][agent_id]["state"] = "working"
+            ctx.state["agents"][agent_id]["updated_at"] = now_iso()
+            write_state(ctx.root, ctx.state)
+    return task_id
+
+
+async def _wait_worker_done(
+    ctx: ServerContext, agent_id: str, handle: str
+) -> str:
+    """Wait for the worker_done message; fall back to idle detection.
+
+    Returns the completion source: "worker_done", "fallback_idle",
+    or "timeout".
+    """
+    event = ctx.done_events[agent_id]
+    try:
+        baseline = await _last_output_at(handle)
+    except OrcaError:
+        baseline = 0
+    started = False
+    deadline = time.monotonic() + WORKER_DONE_TIMEOUT_SECS
+
+    while time.monotonic() < deadline:
+        if event.is_set():
+            return "worker_done"
+        await anyio.sleep(DONE_POLL_SECS)
+        try:
+            last = await _last_output_at(handle)
+        except OrcaError:
+            continue
+        if last > baseline:
+            started = True
+        if started:
+            idle_for = time.time() * 1000 - last
+            if idle_for >= FALLBACK_IDLE_STABLE_MS:
+                log.warning(
+                    "watcher(%s): no worker_done, but idle %.0fs — assuming finished",
+                    agent_id, idle_for / 1000,
+                )
+                return "fallback_idle"
+    return "timeout"
+
+
+async def _finalize_agent(
+    ctx: ServerContext, agent_id: str, handle: str, prompt: str, source: str
+) -> None:
+    """Write the completion report, update state, and notify the caller."""
+    agent = ctx.state["agents"].get(agent_id, {})
+    worker_msg = ctx.worker_msgs.pop(agent_id, None)
+    worker_payload = _msg_payload(worker_msg) if worker_msg else {}
+
+    output_tail: list[str] = []
+    terminal_status = ""
+    try:
+        read_data = await terminal_read(handle, limit=100)
+        term = read_data.get("result", {}).get("terminal", {})
+        output_tail = term.get("tail", []) or []
+        terminal_status = term.get("status", "")
+    except OrcaError as exc:
+        log.warning("watcher(%s): failed to capture output: %s", agent_id, exc)
+
+    final_state = "error" if source == "timeout" else "done"
+    finished_at = now_iso()
+    report_payload = {
+        "version": 2,
+        "event": "task_finished",
+        "agent_id": agent_id,
+        "terminal": handle,
+        "state": final_state,
+        "completion_source": source,
+        "prompt": prompt,
+        "task_id": agent.get("task_id"),
+        "created_at": agent.get("created_at"),
+        "finished_at": finished_at,
+        "worker_subject": (worker_msg or {}).get("subject", ""),
+        "worker_summary": (worker_msg or {}).get("body", ""),
+        "files_modified": worker_payload.get("filesModified", []),
+        "worker_report_path": worker_payload.get("reportPath", ""),
+        "terminal_status": terminal_status,
+        "output_tail": output_tail,
+    }
+    report_path = write_report(ctx.root, agent_id, report_payload)
+    log.info("watcher(%s): report written to %s", agent_id, report_path)
+
+    async with ctx.lock:
+        if agent_id in ctx.state["agents"]:
+            ctx.state["agents"][agent_id]["state"] = final_state
+            ctx.state["agents"][agent_id]["updated_at"] = finished_at
+            ctx.state["agents"][agent_id]["report_file"] = str(report_path)
+            write_state(ctx.root, ctx.state)
+
+    caller_terminal = agent.get("caller_terminal")
+    if caller_terminal:
+        summary = _oneline((worker_msg or {}).get("body", ""))
+        message = format_completion_report(
+            agent_id, handle, str(report_path), summary=summary,
+        )
+        try:
+            await terminal_send(caller_terminal, message)
+            log.info(
+                "watcher(%s): notification sent to caller %s",
+                agent_id, caller_terminal,
+            )
+        except OrcaError as exc:
+            log.warning(
+                "watcher(%s): failed to notify caller %s: %s",
+                agent_id, caller_terminal, exc,
+            )
+
+
 async def watcher(ctx: ServerContext, agent_id: str) -> None:
     scope = anyio.CancelScope()
     ctx.watchers[agent_id] = scope
+    ctx.done_events[agent_id] = anyio.Event()
 
     try:
         with scope:
@@ -385,99 +645,61 @@ async def watcher(ctx: ServerContext, agent_id: str) -> None:
                 await terminal_wait(handle, "tui-idle", timeout_ms=600_000)
             except OrcaError as exc:
                 log.error("watcher(%s): ready-wait failed: %s", agent_id, exc)
-                async with ctx.lock:
-                    if agent_id in ctx.state["agents"]:
-                        ctx.state["agents"][agent_id]["state"] = "error"
-                        ctx.state["agents"][agent_id]["updated_at"] = now_iso()
-                        write_state(ctx.root, ctx.state)
+                await _mark_error(ctx, agent_id)
                 return
 
-            # ---- Phase 2: send prompt ----
+            source = "no_prompt"
             if prompt:
-                log.info("watcher(%s): agent ready, sending prompt", agent_id)
-                try:
-                    await terminal_send(handle, prompt)
-                except OrcaError as exc:
-                    log.error("watcher(%s): send failed: %s", agent_id, exc)
-                    async with ctx.lock:
-                        if agent_id in ctx.state["agents"]:
-                            ctx.state["agents"][agent_id]["state"] = "error"
-                            ctx.state["agents"][agent_id]["updated_at"] = now_iso()
-                            write_state(ctx.root, ctx.state)
+                if ctx.coordinator:
+                    # ---- Orchestration mode: official task dispatch ----
+                    try:
+                        await _dispatch_task(ctx, agent_id, handle, prompt)
+                        log.info(
+                            "watcher(%s): waiting for worker_done", agent_id,
+                        )
+                        source = await _wait_worker_done(ctx, agent_id, handle)
+                    except OrcaError as exc:
+                        log.warning(
+                            "watcher(%s): dispatch failed (%s), "
+                            "falling back to prompt injection",
+                            agent_id, exc,
+                        )
+                        source = await _legacy_prompt_flow(ctx, agent_id, handle, prompt)
+                else:
+                    # ---- Legacy mode: raw prompt + idle heuristics ----
+                    source = await _legacy_prompt_flow(ctx, agent_id, handle, prompt)
+
+                if source == "error":
                     return
 
-                # ---- Phase 3: wait for task completion ----
-                log.info("watcher(%s): waiting for task completion", agent_id)
-                try:
-                    await _wait_task_finished(handle, agent_id)
-                except OrcaError as exc:
-                    log.error("watcher(%s): completion-wait failed: %s", agent_id, exc)
-                    async with ctx.lock:
-                        if agent_id in ctx.state["agents"]:
-                            ctx.state["agents"][agent_id]["state"] = "error"
-                            ctx.state["agents"][agent_id]["updated_at"] = now_iso()
-                            write_state(ctx.root, ctx.state)
-                    return
-
-            log.info("watcher(%s): agent done", agent_id)
-
-            # ---- Capture output and write the structured report ----
-            output_tail: list[str] = []
-            terminal_status = ""
-            try:
-                read_data = await terminal_read(handle, limit=200)
-                term = read_data.get("result", {}).get("terminal", {})
-                output_tail = term.get("tail", []) or []
-                terminal_status = term.get("status", "")
-            except OrcaError as exc:
-                log.warning(
-                    "watcher(%s): failed to capture output: %s", agent_id, exc,
-                )
-
-            finished_at = now_iso()
-            report_payload = {
-                "version": 1,
-                "event": "task_finished",
-                "agent_id": agent_id,
-                "terminal": handle,
-                "state": "done",
-                "prompt": prompt,
-                "created_at": agent.get("created_at"),
-                "finished_at": finished_at,
-                "terminal_status": terminal_status,
-                "output_tail": output_tail,
-            }
-            report_path = write_report(ctx.root, agent_id, report_payload)
-            log.info("watcher(%s): report written to %s", agent_id, report_path)
-
-            async with ctx.lock:
-                if agent_id in ctx.state["agents"]:
-                    ctx.state["agents"][agent_id]["state"] = "done"
-                    ctx.state["agents"][agent_id]["updated_at"] = finished_at
-                    ctx.state["agents"][agent_id]["report_file"] = str(report_path)
-                    write_state(ctx.root, ctx.state)
-
-            caller_terminal = (
-                ctx.state["agents"].get(agent_id, {}).get("caller_terminal")
-            )
-            if caller_terminal:
-                message = format_completion_report(
-                    agent_id, handle, str(report_path)
-                )
-                try:
-                    await terminal_send(caller_terminal, message)
-                    log.info(
-                        "watcher(%s): notification sent to caller %s",
-                        agent_id, caller_terminal,
-                    )
-                except OrcaError as exc:
-                    log.warning(
-                        "watcher(%s): failed to notify caller %s: %s",
-                        agent_id, caller_terminal, exc,
-                    )
+            log.info("watcher(%s): agent done (source=%s)", agent_id, source)
+            await _finalize_agent(ctx, agent_id, handle, prompt, source)
     finally:
         ctx.watchers.pop(agent_id, None)
+        ctx.done_events.pop(agent_id, None)
         log.debug("watcher(%s): exited", agent_id)
+
+
+async def _legacy_prompt_flow(
+    ctx: ServerContext, agent_id: str, handle: str, prompt: str
+) -> str:
+    """Send the raw prompt and detect completion via idle heuristics."""
+    log.info("watcher(%s): agent ready, sending prompt", agent_id)
+    try:
+        await terminal_send(handle, prompt)
+    except OrcaError as exc:
+        log.error("watcher(%s): send failed: %s", agent_id, exc)
+        await _mark_error(ctx, agent_id)
+        return "error"
+
+    log.info("watcher(%s): waiting for task completion", agent_id)
+    try:
+        await _wait_task_finished(handle, agent_id)
+    except OrcaError as exc:
+        log.error("watcher(%s): completion-wait failed: %s", agent_id, exc)
+        await _mark_error(ctx, agent_id)
+        return "error"
+    return "idle_detect"
 
 
 # ---------------------------------------------------------------------------
@@ -529,3 +751,8 @@ def _trunc(text: str, max_len: int = 60) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len - 3] + "..."
+
+
+def _oneline(text: str, max_len: int = 160) -> str:
+    """Collapse whitespace/newlines into a single line and truncate."""
+    return _trunc(" ".join((text or "").split()), max_len)

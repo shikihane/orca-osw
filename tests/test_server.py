@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import anyio
 import pytest
 
+import anyio as anyio_mod
+
 from osw import state as state_mod
 from osw.handoff import format_completion_report
 from osw.server import (
@@ -15,6 +17,7 @@ from osw.server import (
     handle_new,
     handle_use,
     now_iso,
+    route_message,
     watcher,
 )
 
@@ -320,3 +323,167 @@ async def test_watcher_no_prompt_done_on_first_idle(server_ctx):
     assert agent["state"] == "done"
     mock_wait.assert_called_once()
     mock_send.assert_not_called()
+
+
+# ------------------------------------------------------------------
+# orchestration: message routing
+# ------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_route_worker_done_sets_event(server_ctx):
+    server_ctx.state["agents"]["agent_001"] = {
+        "agent_id": "agent_001",
+        "terminal": "t-worker",
+        "state": "working",
+        "caller_terminal": None,
+    }
+    server_ctx.task_agents["task_abc"] = "agent_001"
+    event = anyio_mod.Event()
+    server_ctx.done_events["agent_001"] = event
+
+    msg = {
+        "id": "msg_1",
+        "type": "worker_done",
+        "from_handle": "t-worker",
+        "subject": "Done",
+        "body": "Did the thing. Found nothing odd. Nothing left.",
+        "payload": '{"taskId":"task_abc","filesModified":["a.py"]}',
+    }
+    await route_message(server_ctx, msg)
+
+    assert event.is_set()
+    assert server_ctx.worker_msgs["agent_001"] is msg
+
+
+@pytest.mark.anyio
+async def test_route_worker_done_by_sender_handle(server_ctx):
+    server_ctx.state["agents"]["agent_001"] = {
+        "agent_id": "agent_001",
+        "terminal": "t-worker",
+        "state": "working",
+        "caller_terminal": None,
+    }
+    event = anyio_mod.Event()
+    server_ctx.done_events["agent_001"] = event
+
+    # No taskId in payload — routed by from_handle
+    msg = {
+        "id": "msg_2",
+        "type": "worker_done",
+        "from_handle": "t-worker",
+        "subject": "Done",
+        "body": "ok",
+        "payload": "",
+    }
+    await route_message(server_ctx, msg)
+
+    assert event.is_set()
+
+
+@pytest.mark.anyio
+async def test_route_escalation_forwards_to_caller(server_ctx):
+    server_ctx.state["agents"]["agent_001"] = {
+        "agent_id": "agent_001",
+        "terminal": "t-worker",
+        "state": "working",
+        "caller_terminal": "t-caller",
+    }
+    mock_send = AsyncMock(return_value={})
+
+    msg = {
+        "id": "msg_3",
+        "type": "escalation",
+        "from_handle": "t-worker",
+        "subject": "Blocked: need input",
+        "body": "details",
+        "payload": "",
+    }
+    with patch("osw.server.terminal_send", mock_send):
+        await route_message(server_ctx, msg)
+
+    mock_send.assert_called_once()
+    sent_to, sent_text = mock_send.call_args.args
+    assert sent_to == "t-caller"
+    assert "escalation" in sent_text
+    assert "agent_001" in sent_text
+    assert "\n" not in sent_text
+
+
+# ------------------------------------------------------------------
+# watcher — orchestration mode dispatches and finalizes on worker_done
+# ------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_watcher_orchestration_mode(server_ctx):
+    server_ctx.coordinator = "t-coord"
+    server_ctx.state["agents"]["agent_001"] = {
+        "agent_id": "agent_001",
+        "terminal": "t-worker",
+        "state": "assigned",
+        "caller_terminal": "t-caller",
+        "last_prompt": "Fix the tests",
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+    mock_wait = AsyncMock(return_value={})
+    mock_send = AsyncMock(return_value={})
+    mock_task_create = AsyncMock(return_value="task_xyz")
+    mock_dispatch = AsyncMock(return_value={"result": {"dispatch": {"id": "ctx_1"}}})
+    mock_show = AsyncMock(return_value={
+        "result": {"terminal": {"lastOutputAt": 1000}}
+    })
+    mock_read = AsyncMock(return_value={
+        "result": {"terminal": {"status": "running", "tail": ["done output"]}}
+    })
+
+    async def deliver_worker_done():
+        # Simulate orchestration_loop delivering worker_done shortly after dispatch
+        await anyio_mod.sleep(0.1)
+        msg = {
+            "id": "msg_9",
+            "type": "worker_done",
+            "from_handle": "t-worker",
+            "subject": "Done",
+            "body": "Fixed all tests. Two were flaky. Nothing left.",
+            "payload": '{"taskId":"task_xyz","filesModified":["tests/x.py"],"reportPath":"D:\\\\r.md"}',
+        }
+        await route_message(server_ctx, msg)
+
+    with patch("osw.server.terminal_wait", mock_wait), \
+         patch("osw.server.terminal_send", mock_send), \
+         patch("osw.server.orchestration_task_create", mock_task_create), \
+         patch("osw.server.orchestration_dispatch", mock_dispatch), \
+         patch("osw.server.terminal_show", mock_show), \
+         patch("osw.server.terminal_read", mock_read), \
+         patch("osw.server.DONE_POLL_SECS", 0.05):
+        async with anyio_mod.create_task_group() as tg:
+            tg.start_soon(deliver_worker_done)
+            await watcher(server_ctx, "agent_001")
+
+    agent = server_ctx.state["agents"]["agent_001"]
+    assert agent["state"] == "done"
+    assert agent["task_id"] == "task_xyz"
+
+    # Task created from the prompt and dispatched to the worker terminal
+    mock_task_create.assert_called_once()
+    assert mock_task_create.call_args.args[0] == "Fix the tests"
+    dispatch_args = mock_dispatch.call_args
+    assert dispatch_args.args[0] == "task_xyz"
+    assert dispatch_args.args[1] == "t-worker"
+    assert dispatch_args.kwargs["from_handle"] == "t-coord"
+
+    # No raw prompt injection in orchestration mode: only the caller notification
+    assert mock_send.call_count == 1
+    sent_to, sent_text = mock_send.call_args.args
+    assert sent_to == "t-caller"
+    assert "task-finished" in sent_text
+    assert "Fixed all tests." in sent_text
+
+    # Report carries the worker's structured result
+    with open(agent["report_file"], encoding="utf-8") as f:
+        report = json.load(f)
+    assert report["completion_source"] == "worker_done"
+    assert report["worker_summary"] == "Fixed all tests. Two were flaky. Nothing left."
+    assert report["files_modified"] == ["tests/x.py"]
+    assert report["task_id"] == "task_xyz"
