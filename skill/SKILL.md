@@ -19,10 +19,11 @@ will work.
    pi, gemini, aider, ...). ALWAYS pass `--no-interactive`: without it
    init auto-detects a real terminal and may start a blocking
    question-and-answer setup meant for humans typing at a keyboard.
-2. Inspect what the scan found. For each CLI you intend to use, probe
-   its options yourself (`<cli> --help`) to learn how to select model
-   variants (e.g. `claude --model haiku`, `codex -c model_reasoning_effort=high`,
-   pi's provider flags).
+2. Discover model variants: `python <skill-dir>/osw.py model variants <cli>`
+   queries the CLI itself (pi --list-models, claude --help aliases).
+   For CLIs it cannot discover (codex, gemini), probe `<cli> --help`
+   yourself to learn the model flags
+   (e.g. `codex -c model_reasoning_effort=high`).
 3. Assign tiers explicitly — strong for the most capable/expensive,
    medium for everyday tasks, weak for cheap bulk work:
 
@@ -42,7 +43,7 @@ will work.
 All commands operate on `.orca/osw/` in the current working directory.
 
 - `python <skill-dir>/osw.py init` — Initialize state + scan agent CLIs
-- `python <skill-dir>/osw.py model scan|list|add|remove` — Manage model tiers
+- `python <skill-dir>/osw.py model scan|variants|list|add|remove` — Manage model tiers
 - `python <skill-dir>/osw.py serve` — Run the foreground supervisor (required for other commands)
 - `python <skill-dir>/osw.py new "<prompt>" [--tier strong|medium|weak] [--model <name>]` — Create an agent with a task
 - `python <skill-dir>/osw.py use --terminal <handle> "<prompt>"` — Adopt an existing terminal

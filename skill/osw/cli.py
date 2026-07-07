@@ -11,7 +11,7 @@ import typer
 
 from osw.log import enable_file_logging, get_logger, setup_logging
 from osw.orca_cli import detect_current_terminal
-from osw.providers import preset_options, scan_agent_clis
+from osw.providers import probe_variants, scan_agent_clis
 from osw.server import run_server
 from osw.state import (
     init_state_dir,
@@ -117,56 +117,89 @@ def init(
         return
 
     typer.echo("")
-    typer.echo("Model tiers are EMPTY. Assign models before using `new`.")
-    suggestions = preset_options(found)
-    if suggestions:
-        typer.echo("Suggested entries (pick tiers yourself):")
-        for opt in suggestions:
-            typer.echo(
-                f'  python osw.py model add --tier <strong|medium|weak>'
-                f' --name {opt["name"]} --command "{opt["command"]}"'
-            )
-    typer.echo("Verify with: python osw.py model list")
+    typer.echo("Model tiers are EMPTY. Assign models before using `new`:")
+    typer.echo("  discover variants:  python osw.py model variants <cli>")
+    typer.echo('  assign a tier:      python osw.py model add --tier <strong|medium|weak>'
+               ' --name <name> --command "<command>"')
+    typer.echo("  verify:             python osw.py model list")
     typer.echo("(Humans: run `init -i` for a guided setup.)")
 
 
+def _pick_variant(cli: dict, variants: list[dict]) -> dict | None:
+    """Second-level pick: a discovered variant or a hand-typed command."""
+    if variants:
+        shown = variants
+        if len(variants) > 20:
+            keyword = typer.prompt("filter (optional)", default="").strip().lower()
+            if keyword:
+                shown = [v for v in variants if keyword in v["name"].lower()] or variants
+            shown = shown[:30]
+        typer.echo(f"variants for {cli['name']}:")
+        for i, opt in enumerate(shown, 1):
+            typer.echo(f"  {i}. {opt['name']:<28} {opt['command']}")
+        typer.echo("  0. custom command")
+        while True:
+            choice = typer.prompt("select", default="0").strip()
+            try:
+                index = int(choice)
+            except ValueError:
+                typer.echo("  invalid choice, try again")
+                continue
+            if index == 0:
+                break
+            if 1 <= index <= len(shown):
+                return dict(shown[index - 1])
+            typer.echo("  invalid choice, try again")
+    else:
+        typer.echo(f"no discoverable variants for {cli['name']};"
+                   " enter the command yourself")
+
+    command = typer.prompt("command", default=cli["name"]).strip()
+    if not command:
+        return None
+    name = typer.prompt("entry name", default=command.split()[0]).strip()
+    return {"name": name, "command": command} if name else None
+
+
 def _interactive_tier_setup(root: Path, found: list[dict]) -> None:
-    """Guided tier assignment: one pick per tier from the preset menu."""
+    """Guided tier assignment: pick an agent, then one of its variants."""
     state = read_state(root)
-    options = preset_options(found)
-    used_names = set()
+    used_names: set[str] = set()
+    variant_cache: dict[str, list[dict]] = {}
 
     for tier in TIERS:
         typer.echo("")
-        typer.echo(f"[{tier}] choose a model:")
-        for i, opt in enumerate(options, 1):
-            typer.echo(f"  {i}. {opt['name']:<18} {opt['command']}")
-        typer.echo("  c. custom command")
+        typer.echo(f"[{tier}] choose an agent:")
+        for i, cli in enumerate(found, 1):
+            typer.echo(f"  {i}. {cli['name']}")
         typer.echo("  s. skip this tier")
 
-        entry = None
-        while entry is None:
+        cli = None
+        while cli is None:
             choice = typer.prompt("select", default="s").strip().lower()
             if choice == "s":
                 break
-            if choice == "c":
-                name = typer.prompt("entry name").strip()
-                command = typer.prompt("command").strip()
-                if name and command:
-                    entry = {"name": name, "command": command}
-                continue
             try:
                 index = int(choice) - 1
-                if 0 <= index < len(options):
-                    entry = dict(options[index])
+                if 0 <= index < len(found):
+                    cli = found[index]
             except ValueError:
                 pass
-            if entry is None:
+            if cli is None:
                 typer.echo("  invalid choice, try again")
 
+        if cli is None:
+            typer.echo(f"  {tier}: skipped")
+            continue
+
+        if cli["name"] not in variant_cache:
+            typer.echo(f"  probing {cli['name']} for model variants...")
+            variant_cache[cli["name"]] = probe_variants(cli["name"], cli["path"])
+        entry = _pick_variant(cli, variant_cache[cli["name"]])
         if entry is None:
             typer.echo(f"  {tier}: skipped")
             continue
+
         if entry["name"] in used_names:
             entry["name"] = f"{entry['name']}-{tier}"
         used_names.add(entry["name"])
@@ -205,6 +238,24 @@ def model_scan(
     for entry in found:
         version = f"  ({entry['version']})" if entry["version"] else ""
         typer.echo(f"{entry['name']:<14} {entry['path']}{version}")
+
+
+@model_app.command("variants")
+def model_variants(
+    cli_name: str = typer.Argument(..., help="Agent CLI to query (e.g. pi, claude)"),
+    json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
+) -> None:
+    """Discover model variants by querying the CLI itself."""
+    variants = probe_variants(cli_name)
+    if json_output:
+        typer.echo(json.dumps(variants, indent=2))
+        return
+    if not variants:
+        typer.echo(f"No discoverable variants for '{cli_name}'."
+                   f" Check `{cli_name} --help` for its model flags.")
+        return
+    for opt in variants:
+        typer.echo(f"{opt['name']:<28} {opt['command']}")
 
 
 @model_app.command("list")

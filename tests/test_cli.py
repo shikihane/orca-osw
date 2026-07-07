@@ -55,23 +55,44 @@ def test_commands_require_serve(tmp_path, monkeypatch, args):
 def test_init_interactive_assigns_tiers(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     found = [
+        {"name": "claude", "path": "C:\\bin\\claude.EXE", "version": ""},
         {"name": "codex", "path": "C:\\bin\\codex.CMD", "version": ""},
-        {"name": "claude", "path": "C:\\bin\\claude.CMD", "version": ""},
     ]
-    # menu: 1-3 codex presets, 4-6 claude presets
-    # strong=1 (codex-high), medium=5 (claude-sonnet), weak=s (skip)
-    with patch("osw.cli.scan_agent_clis", return_value=found):
-        result = runner.invoke(app, ["init", "-i"], input="1\n5\ns\n")
+    claude_variants = [
+        {"name": "claude-opus", "command": "claude --model opus"},
+        {"name": "claude-sonnet", "command": "claude --model sonnet"},
+    ]
+
+    def fake_probe(name, path=None):
+        return claude_variants if name == "claude" else []
+
+    # strong: agent 1 (claude) -> variant 2 (sonnet)
+    # medium: agent 2 (codex, no variants) -> command + name typed
+    # weak:   skip
+    user_input = "1\n2\n2\ncodex -c model_reasoning_effort=medium\ncodex-mid\ns\n"
+    with patch("osw.cli.scan_agent_clis", return_value=found), \
+         patch("osw.cli.probe_variants", side_effect=fake_probe):
+        result = runner.invoke(app, ["init", "-i"], input=user_input)
 
     assert result.exit_code == 0
     models = state_mod.read_state(tmp_path)["models"]
     assert models["strong"] == [
-        {"name": "codex-high", "command": "codex -c model_reasoning_effort=high"}
-    ]
-    assert models["medium"] == [
         {"name": "claude-sonnet", "command": "claude --model sonnet"}
     ]
+    assert models["medium"] == [
+        {"name": "codex-mid", "command": "codex -c model_reasoning_effort=medium"}
+    ]
     assert models["weak"] == []
+
+
+def test_model_variants_command(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    variants = [{"name": "pi-gpt-5", "command": "pi --model openai/gpt-5"}]
+    with patch("osw.cli.probe_variants", return_value=variants):
+        result = runner.invoke(app, ["model", "variants", "pi"])
+
+    assert result.exit_code == 0
+    assert "pi --model openai/gpt-5" in result.output
 
 
 def test_init_non_interactive_never_prompts(tmp_path, monkeypatch):
