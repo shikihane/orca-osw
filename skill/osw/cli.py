@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import json
+import time
+import uuid
 from pathlib import Path
 
 import anyio
 import typer
 
-from osw.log import get_logger, setup_logging
+from osw.log import enable_file_logging, get_logger, setup_logging
+from osw.orca_cli import terminal_list
 from osw.server import run_server
 from osw.state import (
     init_state_dir,
     is_serve_running,
+    logs_dir,
     read_result,
     read_state,
     resolve_project_root,
@@ -39,6 +43,24 @@ def require_serve(root: Path) -> None:
         typer.echo("Start it with:")
         typer.echo("  python osw.py serve")
         raise typer.Exit(1)
+
+
+def _detect_caller_terminal() -> str | None:
+    """Print a unique marker, then find which terminal's preview contains it."""
+    marker = f"osw_trace_{uuid.uuid4().hex[:12]}"
+    log.info("caller detect  trace=%s", marker)
+    time.sleep(0.3)
+    try:
+        terminals = anyio.run(terminal_list)
+    except Exception:
+        return None
+    for term in terminals:
+        if marker in term.get("preview", ""):
+            handle = term.get("handle", "")
+            log.info("caller detected  terminal=%s", handle)
+            return handle or None
+    log.warning("caller detect failed, no terminal matched trace")
+    return None
 
 
 def _handle_result(result: dict | None, on_ok) -> None:
@@ -70,7 +92,9 @@ def init() -> None:
 def serve() -> None:
     """Run the foreground supervisor for the current directory."""
     root = resolve_project_root()
+    log_path = enable_file_logging(logs_dir(root))
     typer.echo(f"OSW supervisor starting for {root}")
+    typer.echo(f"Log file: {log_path}")
     typer.echo("Press Ctrl+C to stop.")
     try:
         anyio.run(run_server, root)
@@ -86,7 +110,11 @@ def new(
 ) -> None:
     """Create a new agent terminal and send it a task prompt."""
     root = resolve_project_root()
+    enable_file_logging(logs_dir(root))
     require_serve(root)
+
+    if not caller_terminal:
+        caller_terminal = _detect_caller_terminal()
 
     log.info("sending 'new' request  prompt=%s", prompt[:60])
     payload: dict = {"prompt": prompt}
@@ -96,10 +124,10 @@ def new(
     log.debug("request_id=%s, waiting for result...", request_id)
     result = read_result(root, request_id, timeout=RESULT_TIMEOUT)
 
-    def on_ok(result: dict) -> None:
-        agent_id = result.get("agent_id")
-        terminal = result.get("terminal")
-        log.info("agent created  %s → %s", agent_id, terminal)
+    def on_ok(r: dict) -> None:
+        agent_id = r.get("agent_id")
+        terminal = r.get("terminal")
+        log.info("agent created  %s -> %s", agent_id, terminal)
         typer.echo(f"Created {agent_id} on terminal {terminal}")
 
     _handle_result(result, on_ok)
@@ -113,7 +141,11 @@ def use(
 ) -> None:
     """Adopt an already-running terminal as a managed agent."""
     root = resolve_project_root()
+    enable_file_logging(logs_dir(root))
     require_serve(root)
+
+    if not caller_terminal:
+        caller_terminal = _detect_caller_terminal()
 
     log.info("sending 'use' request  terminal=%s", terminal)
     payload: dict = {"terminal": terminal, "prompt": prompt}
@@ -123,10 +155,10 @@ def use(
     log.debug("request_id=%s, waiting for result...", request_id)
     result = read_result(root, request_id, timeout=RESULT_TIMEOUT)
 
-    def on_ok(result: dict) -> None:
-        agent_id = result.get("agent_id")
-        term = result.get("terminal")
-        log.info("agent adopted  %s → %s", agent_id, term)
+    def on_ok(r: dict) -> None:
+        agent_id = r.get("agent_id")
+        term = r.get("terminal")
+        log.info("agent adopted  %s -> %s", agent_id, term)
         typer.echo(f"Adopted {agent_id} on terminal {term}")
 
     _handle_result(result, on_ok)
@@ -136,6 +168,7 @@ def use(
 def all_(message: str) -> None:
     """Broadcast a message to every managed agent."""
     root = resolve_project_root()
+    enable_file_logging(logs_dir(root))
     require_serve(root)
 
     log.info("sending 'all' request  msg=%s", message[:60])
@@ -162,6 +195,7 @@ def del_(
 ) -> None:
     """Remove an agent from management, optionally closing its terminal."""
     root = resolve_project_root()
+    enable_file_logging(logs_dir(root))
     require_serve(root)
 
     log.info("sending 'del' request  agent_id=%s  close=%s", agent_id, close)
@@ -182,6 +216,7 @@ def list_(
 ) -> None:
     """List managed agents."""
     root = resolve_project_root()
+    enable_file_logging(logs_dir(root))
     try:
         state = read_state(root)
     except FileNotFoundError:
@@ -214,6 +249,7 @@ def list_(
 def status() -> None:
     """Show supervisor status for the current directory."""
     root = resolve_project_root()
+    enable_file_logging(logs_dir(root))
     try:
         state = read_state(root)
     except FileNotFoundError:
