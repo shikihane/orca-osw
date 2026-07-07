@@ -10,6 +10,7 @@ import typer
 
 from osw.log import enable_file_logging, get_logger, setup_logging
 from osw.orca_cli import detect_current_terminal
+from osw.providers import scan_agent_clis
 from osw.server import run_server
 from osw.state import (
     init_state_dir,
@@ -20,13 +21,17 @@ from osw.state import (
     resolve_project_root,
     state_file,
     write_request,
+    write_state,
 )
 
 log = get_logger("cli")
 
 app = typer.Typer(help="OSW — Orca Agent Supervisor")
+model_app = typer.Typer(help="Manage the model tier configuration")
+app.add_typer(model_app, name="model")
 
 RESULT_TIMEOUT = 15.0
+TIERS = ("strong", "medium", "weak")
 
 
 @app.callback()
@@ -84,6 +89,118 @@ def init() -> None:
     init_state_dir(root)
     log.info("initialized state at %s", state_file(root))
     typer.echo(f"Initialized OSW state at {state_file(root)}")
+
+    typer.echo("")
+    typer.echo("Scanning for agent CLIs on PATH...")
+    found = scan_agent_clis()
+    if found:
+        for entry in found:
+            version = f"  ({entry['version']})" if entry["version"] else ""
+            typer.echo(f"  found: {entry['name']:<14} {entry['path']}{version}")
+    else:
+        typer.echo("  no known agent CLIs found on PATH")
+
+    typer.echo("")
+    typer.echo("Model tiers are EMPTY. Before using `new`, assign models, e.g.:")
+    typer.echo('  python osw.py model add --tier medium --name codex-mid'
+               ' --command "codex -c model_reasoning_effort=medium"')
+    typer.echo("Verify with: python osw.py model list")
+
+
+# ---------------------------------------------------------------------------
+# model subcommands
+# ---------------------------------------------------------------------------
+
+def _read_state_or_exit(root):
+    try:
+        return read_state(root)
+    except FileNotFoundError:
+        typer.echo("Not initialized. Run `python osw.py init` first.")
+        raise typer.Exit(1)
+
+
+@model_app.command("scan")
+def model_scan(
+    json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
+) -> None:
+    """Scan PATH for known agent CLIs."""
+    found = scan_agent_clis()
+    if json_output:
+        typer.echo(json.dumps(found, indent=2))
+        return
+    if not found:
+        typer.echo("No known agent CLIs found on PATH.")
+        return
+    for entry in found:
+        version = f"  ({entry['version']})" if entry["version"] else ""
+        typer.echo(f"{entry['name']:<14} {entry['path']}{version}")
+
+
+@model_app.command("list")
+def model_list(
+    json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
+) -> None:
+    """Show the configured model tiers."""
+    root = resolve_project_root()
+    state = _read_state_or_exit(root)
+    models = state.get("models", {})
+    if json_output:
+        typer.echo(json.dumps(models, indent=2))
+        return
+    empty = True
+    for tier in TIERS:
+        for entry in models.get(tier) or []:
+            empty = False
+            typer.echo(f"{tier:<8} {entry.get('name', '?'):<20} {entry.get('command', '')}")
+    if empty:
+        typer.echo("No models configured. Add one with `model add`.")
+
+
+@model_app.command("add")
+def model_add(
+    tier: str = typer.Option(..., "--tier", "-t", help="Tier: strong, medium, or weak"),
+    name: str = typer.Option(..., "--name", "-n", help="Unique entry name"),
+    command: str = typer.Option(..., "--command", "-c", help="Command line to launch the agent"),
+) -> None:
+    """Add a model entry to a tier."""
+    if tier not in TIERS:
+        typer.echo(f"Error: unknown tier '{tier}' (expected strong, medium, or weak)")
+        raise typer.Exit(1)
+
+    root = resolve_project_root()
+    state = _read_state_or_exit(root)
+    models = state.setdefault("models", {})
+    for t in TIERS:
+        for entry in models.get(t) or []:
+            if entry.get("name") == name:
+                typer.echo(f"Error: model '{name}' already exists in tier '{t}'")
+                raise typer.Exit(1)
+
+    models.setdefault(tier, []).append({"name": name, "command": command})
+    write_state(root, state)
+    log.info("model added  tier=%s name=%s command=%s", tier, name, command)
+    typer.echo(f"Added {name} to {tier}: {command}")
+
+
+@model_app.command("remove")
+def model_remove(
+    name: str = typer.Argument(..., help="Model entry name to remove"),
+) -> None:
+    """Remove a model entry by name."""
+    root = resolve_project_root()
+    state = _read_state_or_exit(root)
+    models = state.get("models", {})
+    for tier in TIERS:
+        entries = models.get(tier) or []
+        for entry in entries:
+            if entry.get("name") == name:
+                entries.remove(entry)
+                write_state(root, state)
+                log.info("model removed  tier=%s name=%s", tier, name)
+                typer.echo(f"Removed {name} from {tier}")
+                return
+    typer.echo(f"Error: model '{name}' not found")
+    raise typer.Exit(1)
 
 
 @app.command()

@@ -63,6 +63,20 @@ async def _wait_for_result(
     return None
 
 
+_TEST_MODELS = {
+    "strong": [{"name": "strong-test", "command": "codex"}],
+    "medium": [{"name": "medium-test", "command": "pi"}],
+    "weak": [],
+}
+
+
+def _configure_models(root: Path) -> None:
+    """Model tiers start empty after init; tests populate them explicitly."""
+    state = state_mod.read_state(root)
+    state["models"] = json.loads(json.dumps(_TEST_MODELS))
+    state_mod.write_state(root, state)
+
+
 async def run_server_briefly(root: Path, duration: float = 2.0) -> None:
     """Run the server for a limited time, then cancel it.
 
@@ -83,6 +97,7 @@ async def run_server_briefly(root: Path, duration: float = 2.0) -> None:
 
 def test_full_new_agent_flow(tmp_path):
     state_mod.init_state_dir(tmp_path)
+    _configure_models(tmp_path)
 
     async def scenario() -> None:
         mock_create = AsyncMock(
@@ -219,6 +234,7 @@ def test_use_accepts_correct_directory(tmp_path):
 
 def test_all_broadcasts_to_managed_agents(tmp_path):
     state_mod.init_state_dir(tmp_path)
+    _configure_models(tmp_path)
 
     async def scenario() -> None:
         mock_create = AsyncMock(

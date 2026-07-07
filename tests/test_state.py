@@ -43,9 +43,8 @@ def test_init_creates_valid_state(tmp_path):
     assert data["agents"] == {}
     assert data["errors"] == []
 
-    assert data["models"]["strong"] == [{"name": "strong-default", "command": "codex"}]
-    assert data["models"]["medium"] == [{"name": "medium-default", "command": "pi"}]
-    assert data["models"]["weak"] == [{"name": "weak-default", "command": "pi"}]
+    # tiers start empty: models are configured per-machine, never hardcoded
+    assert data["models"] == {"strong": [], "medium": [], "weak": []}
 
 
 def test_read_write_roundtrip(tmp_path):

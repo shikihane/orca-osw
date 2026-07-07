@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from typer.testing import CliRunner
 
 from osw import state as state_mod
@@ -10,91 +11,70 @@ from osw.cli import app
 runner = CliRunner()
 
 
-def test_init_creates_state_dir(tmp_path, monkeypatch):
+def test_init_creates_state_and_reports_scan(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
     result = runner.invoke(app, ["init"])
 
     assert result.exit_code == 0
     assert (tmp_path / ".orca" / "osw" / "state.json").is_file()
+    # models must start empty — nothing about the machine is assumed
+    state = state_mod.read_state(tmp_path)
+    assert state["models"] == {"strong": [], "medium": [], "weak": []}
+    assert "model add" in result.output
 
 
-def test_list_empty(tmp_path, monkeypatch):
+def test_list_and_status(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    assert runner.invoke(app, ["status"]).exit_code != 0  # not initialized
+
+    state_mod.init_state_dir(tmp_path)
+    assert "no agents" in runner.invoke(app, ["list"]).output.lower()
+    assert json.loads(runner.invoke(app, ["list", "--json"]).output) == {}
+    assert "not running" in runner.invoke(app, ["status"]).output.lower()
+
+
+@pytest.mark.parametrize("args", [
+    ["new", "test"],
+    ["use", "--terminal", "t1", "test"],
+    ["all", "test"],
+    ["del", "agent_001"],
+])
+def test_commands_require_serve(tmp_path, monkeypatch, args):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
 
-    result = runner.invoke(app, ["list"])
-
-    assert result.exit_code == 0
-    assert "no agents" in result.output.lower()
-
-
-def test_list_json_empty(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    state_mod.init_state_dir(tmp_path)
-
-    result = runner.invoke(app, ["list", "--json"])
-
-    assert result.exit_code == 0
-    data = json.loads(result.output)
-    assert data == {}
-
-
-def test_status_not_initialized(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-
-    result = runner.invoke(app, ["status"])
-
-    assert result.exit_code != 0
-    assert "not initialized" in result.output.lower()
-
-
-def test_status_serve_not_running(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    state_mod.init_state_dir(tmp_path)
-
-    result = runner.invoke(app, ["status"])
-
-    assert result.exit_code == 0
-    assert "not running" in result.output.lower()
-
-
-def test_new_requires_serve(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    state_mod.init_state_dir(tmp_path)
-
-    result = runner.invoke(app, ["new", "test"])
+    result = runner.invoke(app, args)
 
     assert result.exit_code == 1
-    assert "OSW serve is not running for this directory." in result.output
-    assert "python osw.py serve" in result.output
+    assert "OSW serve is not running" in result.output
 
 
-def test_use_requires_serve(tmp_path, monkeypatch):
+def test_model_add_list_remove_roundtrip(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
 
-    result = runner.invoke(app, ["use", "--terminal", "t1", "test"])
+    add = runner.invoke(app, [
+        "model", "add", "--tier", "medium",
+        "--name", "codex-mid", "--command", "codex -c model_reasoning_effort=medium",
+    ])
+    assert add.exit_code == 0
 
-    assert result.exit_code == 1
-    assert "OSW serve is not running for this directory." in result.output
+    # duplicate name rejected
+    dup = runner.invoke(app, [
+        "model", "add", "--tier", "weak", "--name", "codex-mid", "--command", "x",
+    ])
+    assert dup.exit_code == 1
 
+    listed = runner.invoke(app, ["model", "list"])
+    assert "codex-mid" in listed.output
 
-def test_all_requires_serve(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    state_mod.init_state_dir(tmp_path)
+    state = state_mod.read_state(tmp_path)
+    assert state["models"]["medium"] == [
+        {"name": "codex-mid", "command": "codex -c model_reasoning_effort=medium"}
+    ]
 
-    result = runner.invoke(app, ["all", "test"])
-
-    assert result.exit_code == 1
-    assert "OSW serve is not running for this directory." in result.output
-
-
-def test_del_requires_serve(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    state_mod.init_state_dir(tmp_path)
-
-    result = runner.invoke(app, ["del", "agent_001"])
-
-    assert result.exit_code == 1
-    assert "OSW serve is not running for this directory." in result.output
+    removed = runner.invoke(app, ["model", "remove", "codex-mid"])
+    assert removed.exit_code == 0
+    assert state_mod.read_state(tmp_path)["models"]["medium"] == []

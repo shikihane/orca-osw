@@ -8,14 +8,40 @@ description: Manage Orca-backed agent sessions from the current directory
 Manage Orca agent terminals from the current project directory.
 Scripts live alongside this file — `osw.py` and the `osw/` package are in the same directory as this SKILL.md.
 
+## First-time setup (REQUIRED — you, the operating agent, do this)
+
+OSW ships with ZERO model configuration. Nothing about the machine is
+assumed; you must detect the environment and configure it before `new`
+will work.
+
+1. `python <skill-dir>/osw.py init` — creates `.orca/osw/` and scans
+   PATH for known agent CLIs (claude, codex, pi, gemini, aider, ...).
+2. Inspect what the scan found. For each CLI you intend to use, probe
+   its options yourself (`<cli> --help`) to learn how to select model
+   variants (e.g. `claude --model haiku`, `codex -c model_reasoning_effort=high`,
+   pi's provider flags).
+3. Assign tiers explicitly — strong for the most capable/expensive,
+   medium for everyday tasks, weak for cheap bulk work:
+
+   ```
+   python <skill-dir>/osw.py model add --tier strong --name codex-high --command "codex -c model_reasoning_effort=high"
+   python <skill-dir>/osw.py model add --tier medium --name claude-sonnet --command "claude --model sonnet"
+   python <skill-dir>/osw.py model add --tier weak   --name claude-haiku  --command "claude --model haiku"
+   ```
+
+4. Verify: `python <skill-dir>/osw.py model list`
+
+`new` uses the medium tier by default; override with `--tier` or
+`--model <name>`.
+
 ## Commands
 
 All commands operate on `.orca/osw/` in the current working directory.
-Run from the skill directory, or use the full path to `osw.py`.
 
-- `python <skill-dir>/osw.py init` — Initialize OSW state
+- `python <skill-dir>/osw.py init` — Initialize state + scan agent CLIs
+- `python <skill-dir>/osw.py model scan|list|add|remove` — Manage model tiers
 - `python <skill-dir>/osw.py serve` — Run the foreground supervisor (required for other commands)
-- `python <skill-dir>/osw.py new "<prompt>"` — Create a new agent terminal with a task
+- `python <skill-dir>/osw.py new "<prompt>" [--tier strong|medium|weak] [--model <name>]` — Create an agent with a task
 - `python <skill-dir>/osw.py use --terminal <handle> "<prompt>"` — Adopt an existing terminal
 - `python <skill-dir>/osw.py all "<message>"` — Broadcast to all managed agents
 - `python <skill-dir>/osw.py del <agent_id> [--close]` — Remove agent from management
@@ -24,15 +50,25 @@ Run from the skill directory, or use the full path to `osw.py`.
 
 Where `<skill-dir>` is the directory containing this SKILL.md.
 
+## How completion works
+
+`serve` registers itself as the Orca orchestration coordinator. `new`
+dispatches tasks through Orca's official protocol (task-create +
+dispatch), so the worker self-reports a structured `worker_done`
+(summary, files modified). The supervisor then writes a JSON report to
+`.orca/osw/reports/` and pushes a single-line notification to the
+caller terminal:
+
+```
+# [osw] task-finished agent=agent_001 terminal=term_xxx report=<path> summary=...
+```
+
+Read the report file for full context. If a worker never reports,
+a 60s stable-idle fallback marks it done (`completion_source` in the
+report tells you which path fired).
+
 ## Directory Isolation
 
-Each directory is an independent OSW management scope. Agents in one directory
-cannot see or affect agents in another, even if they share the same git repo.
-
-## Workflow
-
-1. `python <skill-dir>/osw.py init` in your project root
-2. Start the supervisor: `python <skill-dir>/osw.py serve` (keep running)
-3. In another terminal: `python <skill-dir>/osw.py new "Fix the failing tests"`
-4. Monitor: `python <skill-dir>/osw.py list`
-5. The supervisor auto-detects task completion and generates handoff files
+Each directory is an independent OSW management scope. Agents in one
+directory cannot see or affect agents in another, even if they share
+the same git repo.

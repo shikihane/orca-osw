@@ -51,14 +51,17 @@ def init_state_dir(root: Path) -> None:
     logs_dir(root).mkdir(parents=True, exist_ok=True)
     reports_dir(root).mkdir(parents=True, exist_ok=True)
 
+    # Model tiers start EMPTY on purpose: nothing about the user's
+    # machine is assumed. The operator (LLM or human) scans the
+    # environment and assigns tiers explicitly (`osw.py model scan/add`).
     default_state = {
         "version": 1,
         "project_root": str(root),
         "serve": None,
         "models": {
-            "strong": [{"name": "strong-default", "command": "codex"}],
-            "medium": [{"name": "medium-default", "command": "pi"}],
-            "weak": [{"name": "weak-default", "command": "pi"}],
+            "strong": [],
+            "medium": [],
+            "weak": [],
         },
         "agents": {},
         "errors": [],
