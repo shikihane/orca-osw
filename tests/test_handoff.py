@@ -35,13 +35,22 @@ def test_extract_first_of_multiple():
 
 
 def test_completion_report_format():
-    report = handoff.format_completion_report("agent_001", "term-1", "HANDOFF_fix_tests.md")
-    assert report == (
-        "子任务完成。\n"
-        "agent: agent_001\n"
-        "terminal: term-1\n"
-        "handoff: HANDOFF_fix_tests.md"
+    report = handoff.format_completion_report(
+        "agent_001", "term-1", "D:\\proj\\.orca\\osw\\reports\\agent_001_x.json"
     )
+    assert report == (
+        "# [osw] task-finished agent=agent_001 terminal=term-1"
+        " report=D:\\proj\\.orca\\osw\\reports\\agent_001_x.json"
+    )
+    assert report.startswith("#")
+    assert "\n" not in report
+
+
+def test_completion_report_no_report_file():
+    report = handoff.format_completion_report("agent_001", "term-1", "")
+    assert report == "# [osw] task-finished agent=agent_001 terminal=term-1"
+    assert report.startswith("#")
+    assert "\n" not in report
 
 
 def test_handoff_failed_message():

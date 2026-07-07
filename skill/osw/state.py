@@ -38,12 +38,18 @@ def logs_dir(root: Path) -> Path:
     return state_dir(root) / "logs"
 
 
+def reports_dir(root: Path) -> Path:
+    """Return the path to the completion reports directory."""
+    return state_dir(root) / "reports"
+
+
 def init_state_dir(root: Path) -> None:
     """Create the OSW state directory structure and write the default state.json."""
     state_dir(root).mkdir(parents=True, exist_ok=True)
     inbox_dir(root).mkdir(parents=True, exist_ok=True)
     results_dir(root).mkdir(parents=True, exist_ok=True)
     logs_dir(root).mkdir(parents=True, exist_ok=True)
+    reports_dir(root).mkdir(parents=True, exist_ok=True)
 
     default_state = {
         "version": 1,
@@ -131,6 +137,18 @@ def read_result(root: Path, request_id: str, timeout: float = 15.0) -> dict | No
             return data
         time.sleep(0.3)
     return None
+
+
+def write_report(root: Path, agent_id: str, payload: dict) -> Path:
+    """Write a completion report JSON file and return its path."""
+    reports_dir(root).mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = reports_dir(root) / f"{agent_id}_{ts}.json"
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, path)
+    return path
 
 
 def write_result(root: Path, request_id: str, payload: dict) -> None:

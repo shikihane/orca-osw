@@ -24,14 +24,21 @@ def extract_handoff_filename(text: str) -> str | None:
     return match.group(0)
 
 
-def format_completion_report(agent_id: str, terminal: str, handoff_file: str) -> str:
-    """Format the standard subtask completion report."""
-    return (
-        f"子任务完成。\n"
-        f"agent: {agent_id}\n"
-        f"terminal: {terminal}\n"
-        f"handoff: {handoff_file}"
-    )
+def format_completion_report(agent_id: str, terminal: str, report_file: str) -> str:
+    """Format the single-line completion notification.
+
+    Must stay single-line: newlines get mangled when passed through
+    orca.CMD as a --text argument on Windows. Full structured data
+    lives in the JSON report file; the notification only points to it.
+
+    Leading '#' keeps the line inert when the caller terminal is a
+    shell (PowerShell/bash treat it as a comment instead of executing
+    it); agent TUIs just see it as plain text.
+    """
+    message = f"# [osw] task-finished agent={agent_id} terminal={terminal}"
+    if report_file:
+        message += f" report={report_file}"
+    return message
 
 
 def format_handoff_failed_message() -> str:
