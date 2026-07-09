@@ -132,6 +132,14 @@ def _terminal_worktree_path(terminal: dict) -> str:
     return str(terminal.get("cwd") or "")
 
 
+def _resolve_terminal_arg(root: Path, value: str) -> str:
+    try:
+        agent = read_agent(root, value)
+    except FileNotFoundError:
+        return value
+    return str(agent.get("terminal") or value)
+
+
 def _script_path() -> Path:
     return Path(__file__).resolve().parents[1] / "osw.py"
 
@@ -431,14 +439,15 @@ def new(
 
 @app.command()
 def use(
-    prompt: str,
-    terminal: str = typer.Option(..., "--terminal", help="Terminal handle to adopt"),
+    target: str = typer.Argument(..., help="OSW agent id or Orca terminal handle to adopt"),
+    prompt: str = typer.Argument(..., help="Prompt to send to the terminal"),
     caller_terminal: str = typer.Option(None, "--caller-terminal", help="Terminal handle to receive completion reports"),
 ) -> None:
     """Adopt an already-running terminal as a managed agent."""
     root = resolve_project_root()
     enable_file_logging(logs_dir(root))
     _read_state_or_exit(root)
+    terminal = _resolve_terminal_arg(root, target)
     emit_event(
         logs_dir(root),
         component="cli",

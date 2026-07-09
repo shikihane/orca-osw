@@ -81,8 +81,8 @@ def test_logs_command_tails_events_and_filters_agent(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("args", [
-    ["new", "test"],
-    ["use", "--terminal", "t1", "test"],
+    ["new", "claude", "test"],
+    ["use", "t1", "test"],
 ])
 def test_commands_require_initialized_state(tmp_path, monkeypatch, args):
     monkeypatch.chdir(tmp_path)
@@ -190,7 +190,7 @@ def test_use_adopts_terminal_with_terminal_show_result_unwrap(tmp_path, monkeypa
     with patch("osw.cli.terminal_show", show), \
          patch("osw.cli._spawn_watcher", spawn):
         result = runner.invoke(
-            app, ["use", "--terminal", "term-existing", "continue this"]
+            app, ["use", "term-existing", "continue this"]
         )
 
     assert result.exit_code == 0
@@ -203,6 +203,46 @@ def test_use_adopts_terminal_with_terminal_show_result_unwrap(tmp_path, monkeypa
     assert agent["watcher_pid"] == 9876
 
 
+def test_use_accepts_existing_agent_id(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-existing",
+        "worktree_path": str(tmp_path),
+        "provider": "claude",
+        "provider_command": "claude",
+        "model_name": "",
+        "thinking": "",
+        "task_started_on_launch": True,
+        "state": "assigned",
+        "phase": "",
+        "caller_terminal": None,
+        "prompt": "old task",
+        "created_at": "2026-07-09T00:00:00+00:00",
+        "updated_at": "2026-07-09T00:00:00+00:00",
+    })
+
+    show = AsyncMock(return_value={
+        "result": {
+            "terminal": {
+                "handle": "term-existing",
+                "worktreePath": str(tmp_path),
+            }
+        }
+    })
+    send = AsyncMock(return_value={})
+    spawn = Mock(return_value=9876)
+    with patch("osw.cli.terminal_show", show), \
+         patch("osw.cli.terminal_send", send), \
+         patch("osw.cli._spawn_watcher", spawn):
+        result = runner.invoke(app, ["use", "agent_001", "continue this"])
+
+    assert result.exit_code == 0
+    show.assert_awaited_once_with("term-existing")
+    spawn.assert_called_once_with(tmp_path, "agent_002")
+
+
 def test_use_rejects_wrong_worktree(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
@@ -213,7 +253,7 @@ def test_use_rejects_wrong_worktree(tmp_path, monkeypatch):
         "result": {"terminal": {"handle": "term-x", "worktreePath": str(other)}}
     })
     with patch("osw.cli.terminal_show", show):
-        result = runner.invoke(app, ["use", "--terminal", "term-x", "task"])
+        result = runner.invoke(app, ["use", "term-x", "task"])
 
     assert result.exit_code == 1
     assert "does not match project root" in result.output
