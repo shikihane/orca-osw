@@ -33,7 +33,13 @@ from osw.orca_cli import (
     worktree_ps,
 )
 from osw.process import hidden_subprocess_kwargs
-from osw.providers import probe_variants, scan_agent_clis
+from osw.providers import (
+    ProviderError,
+    build_launch_command,
+    build_provider_command,
+    probe_variants,
+    scan_agent_clis,
+)
 from osw.state import (
     alloc_agent_id,
     delete_agent,
@@ -156,14 +162,6 @@ def _script_path() -> Path:
     return Path(__file__).resolve().parents[1] / "osw.py"
 
 
-def _quote_command_arg(value: str) -> str:
-    return subprocess.list2cmdline([value])
-
-
-def _append_prompt(command: str, prompt: str) -> str:
-    return f"{command} {_quote_command_arg(prompt)}"
-
-
 def _spawn_watcher(root: Path, agent_id: str) -> int:
     cmd = [sys.executable, str(_script_path()), "watch", str(root), agent_id]
     kwargs = {
@@ -202,8 +200,10 @@ def _base_agent(
     terminal: str,
     prompt: str,
     caller_terminal: str | None,
+    provider: str = "",
     provider_command: str = "",
     model_name: str = "",
+    thinking: str = "",
     task_started_on_launch: bool = False,
 ) -> dict:
     now = now_iso()
@@ -211,8 +211,10 @@ def _base_agent(
         "agent_id": agent_id,
         "terminal": terminal,
         "worktree_path": str(root),
+        "provider": provider,
         "provider_command": provider_command,
         "model_name": model_name,
+        "thinking": thinking,
         "task_started_on_launch": task_started_on_launch,
         "state": "assigned",
         "phase": "",
@@ -534,30 +536,31 @@ def model_remove(
 
 @app.command()
 def new(
+    provider: str,
     prompt: str,
-    tier: str = typer.Option("medium", "--tier", "-t", help="Model tier: strong, medium, or weak"),
-    model: str = typer.Option(None, "--model", "-m", help="Specific model entry name (overrides --tier)"),
+    model: str = typer.Option(None, "--model", "-m", help="Provider model value passed through unchanged"),
+    thinking: str = typer.Option(None, "--thinking", help="Provider thinking/effort value passed through unchanged"),
     caller_terminal: str = typer.Option(None, "--caller-terminal", help="Terminal handle to receive completion reports"),
 ) -> None:
-    """Create a new agent terminal and return after starting its watcher."""
+    """Create a new provider agent terminal and return after starting its watcher."""
     root = resolve_project_root()
     enable_file_logging(logs_dir(root))
-    state = _read_state_or_exit(root)
+    _read_state_or_exit(root)
     emit_event(
         logs_dir(root),
         component="cli",
         event="new_started",
         message="creating agent terminal",
-        data={"tier": tier, "model": model or ""},
+        data={"provider": provider, "model": model or "", "thinking": thinking or ""},
     )
 
-    entry, error = _resolve_model(state, tier, model)
-    if entry is None:
-        typer.echo(f"Error: {error}")
+    try:
+        launch_command = build_launch_command(provider, prompt, model, thinking)
+        provider_command = build_provider_command(provider, model, thinking)
+    except ProviderError as exc:
+        typer.echo(f"Error: {exc}")
         raise typer.Exit(1)
 
-    command = entry.get("command", "")
-    launch_command = _append_prompt(command, prompt)
     try:
         result = anyio.run(terminal_create, launch_command)
     except OrcaError as exc:
@@ -591,8 +594,10 @@ def new(
         handle,
         prompt,
         _maybe_detect_caller(caller_terminal),
-        provider_command=command,
-        model_name=entry.get("name", ""),
+        provider=provider,
+        provider_command=provider_command,
+        model_name=model or "",
+        thinking=thinking or "",
         task_started_on_launch=True,
     )
 
@@ -604,7 +609,7 @@ def new(
 
     typer.echo(
         f"Created {agent_id} on terminal {handle} "
-        f"(model: {entry.get('name', '?')})"
+        f"(provider: {provider})"
     )
     emit_event(
         logs_dir(root),

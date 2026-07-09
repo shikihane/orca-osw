@@ -93,22 +93,35 @@ def test_commands_require_initialized_state(tmp_path, monkeypatch, args):
     assert "Not initialized" in result.output
 
 
-def test_new_creates_terminal_agent_file_and_detaches_watcher(tmp_path, monkeypatch):
+def test_new_creates_provider_terminal_agent_file_and_detaches_watcher(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
-    _configure_models(tmp_path)
 
     create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
     spawn = Mock(return_value=4567)
     with patch("osw.cli.terminal_create", create), \
          patch("osw.cli._spawn_watcher", spawn):
         result = runner.invoke(
-            app, ["new", "--caller-terminal", "caller-1", "do the task"]
+            app,
+            [
+                "new",
+                "claude",
+                "--model",
+                "sonnet",
+                "--thinking",
+                "high",
+                "--caller-terminal",
+                "caller-1",
+                "do the task",
+            ],
         )
 
     assert result.exit_code == 0
     assert "Created agent_001" in result.output
-    create.assert_awaited_once_with('codex "do the task"')
+    assert "(provider: claude)" in result.output
+    create.assert_awaited_once_with(
+        'claude --model sonnet --effort high "do the task"'
+    )
     spawn.assert_called_once_with(tmp_path, "agent_001")
 
     agent = state_mod.read_agent(tmp_path, "agent_001")
@@ -116,7 +129,10 @@ def test_new_creates_terminal_agent_file_and_detaches_watcher(tmp_path, monkeypa
     assert agent["prompt"] == "do the task"
     assert agent["task_started_on_launch"] is True
     assert agent["caller_terminal"] == "caller-1"
-    assert agent["model_name"] == "codex-mid"
+    assert agent["provider"] == "claude"
+    assert agent["model_name"] == "sonnet"
+    assert agent["thinking"] == "high"
+    assert agent["provider_command"] == "claude --model sonnet --effort high"
     assert agent["watcher_pid"] == 4567
     assert agent["state"] == "assigned"
 
@@ -148,14 +164,14 @@ def test_spawn_watcher_hides_detached_process_on_windows(tmp_path):
         assert kwargs["creationflags"] & new_group
 
 
-def test_new_rejects_empty_models_config(tmp_path, monkeypatch):
+def test_new_rejects_unknown_provider(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
 
-    result = runner.invoke(app, ["new", "do the task"])
+    result = runner.invoke(app, ["new", "gemini", "do the task"])
 
     assert result.exit_code == 1
-    assert "models config is empty" in result.output
+    assert "unsupported provider 'gemini'" in result.output
 
 
 def test_use_adopts_terminal_with_terminal_show_result_unwrap(tmp_path, monkeypatch):
