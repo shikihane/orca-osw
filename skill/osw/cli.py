@@ -1,37 +1,61 @@
 from __future__ import annotations
 
+from collections import deque
 import json
+import os
+import signal
+import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import anyio
 import typer
 
-from osw.log import enable_file_logging, get_logger, setup_logging
-from osw.orca_cli import detect_current_terminal
+from osw.log import (
+    emit_event,
+    enable_file_logging,
+    events_file,
+    format_event_line,
+    get_logger,
+    read_events,
+    setup_logging,
+)
+from osw.orca_cli import (
+    OrcaError,
+    detect_current_terminal,
+    terminal_close,
+    terminal_create,
+    terminal_send,
+    terminal_show,
+    worktree_ps,
+)
+from osw.process import hidden_subprocess_kwargs
 from osw.providers import probe_variants, scan_agent_clis
-from osw.server import run_server
 from osw.state import (
+    alloc_agent_id,
+    delete_agent,
     init_state_dir,
-    is_serve_running,
+    list_agents,
     logs_dir,
-    read_result,
+    pid_is_running,
+    read_agent,
     read_state,
     resolve_project_root,
     state_file,
-    write_request,
+    write_agent,
     write_state,
 )
+from osw.watcher import main as watcher_main
 
 log = get_logger("cli")
 
-app = typer.Typer(help="OSW — Orca Agent Supervisor")
+app = typer.Typer(help="OSW - Orca Agent Supervisor")
 model_app = typer.Typer(help="Manage the model tier configuration")
 app.add_typer(model_app, name="model")
 
-RESULT_TIMEOUT = 15.0
 TIERS = ("strong", "medium", "weak")
 
 
@@ -42,12 +66,15 @@ def main(
     setup_logging(verbose=verbose)
 
 
-def require_serve(root: Path) -> None:
-    if not is_serve_running(root):
-        log.error("supervisor is not running for %s", root)
-        typer.echo("OSW serve is not running for this directory.")
-        typer.echo("Start it with:")
-        typer.echo("  python osw.py serve")
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _read_state_or_exit(root: Path) -> dict:
+    try:
+        return read_state(root)
+    except FileNotFoundError:
+        typer.echo("Not initialized. Run `python osw.py init` first.")
         raise typer.Exit(1)
 
 
@@ -67,20 +94,225 @@ def _detect_caller_terminal() -> str | None:
     return None
 
 
-def _handle_result(result: dict | None, on_ok) -> None:
-    if result is None:
-        log.error("supervisor did not respond within %.0fs", RESULT_TIMEOUT)
-        typer.echo("OSW serve did not return a result within 15 seconds.")
-        typer.echo("Check python osw.py status.")
-        raise typer.Exit(1)
+def _maybe_detect_caller(caller_terminal: str | None) -> str | None:
+    if caller_terminal:
+        return caller_terminal
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return _detect_caller_terminal()
+    return None
 
-    if result.get("ok"):
-        on_ok(result)
+
+def _resolve_model(
+    state: dict, tier: str, model_name: str | None
+) -> tuple[dict | None, str]:
+    models = state.get("models", {})
+    if model_name:
+        for t in TIERS:
+            for entry in models.get(t) or []:
+                if entry.get("name") == model_name:
+                    return entry, ""
+        return None, f"model '{model_name}' not found in models config"
+
+    if tier not in TIERS:
+        return None, f"unknown tier '{tier}' (expected strong, medium, or weak)"
+
+    search_order = [tier] + [t for t in TIERS if t != tier]
+    for t in search_order:
+        entries = models.get(t) or []
+        if entries:
+            return entries[0], ""
+    return None, "models config is empty"
+
+
+def _unwrap_terminal(data: dict) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    result = data.get("result")
+    if isinstance(result, dict):
+        terminal = result.get("terminal")
+        if isinstance(terminal, dict):
+            return terminal
+    terminal = data.get("terminal")
+    if isinstance(terminal, dict):
+        return terminal
+    return data
+
+
+def _terminal_handle(data: dict, fallback: str = "") -> str:
+    terminal = _unwrap_terminal(data)
+    return terminal.get("handle") or terminal.get("terminal") or fallback
+
+
+def _terminal_worktree_path(terminal: dict) -> str:
+    if terminal.get("worktreePath"):
+        return str(terminal["worktreePath"])
+    worktree = terminal.get("worktree")
+    if isinstance(worktree, dict):
+        return str(worktree.get("path") or "")
+    return str(terminal.get("cwd") or "")
+
+
+def _script_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "osw.py"
+
+
+def _quote_command_arg(value: str) -> str:
+    return subprocess.list2cmdline([value])
+
+
+def _append_prompt(command: str, prompt: str) -> str:
+    return f"{command} {_quote_command_arg(prompt)}"
+
+
+def _spawn_watcher(root: Path, agent_id: str) -> int:
+    cmd = [sys.executable, str(_script_path()), "watch", str(root), agent_id]
+    kwargs = {
+        "cwd": str(root),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+        **hidden_subprocess_kwargs(),
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
     else:
-        error_msg = result.get("error") or "unknown error"
-        log.error("command failed: %s", error_msg)
-        typer.echo(f"Error: {error_msg}")
-        raise typer.Exit(1)
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(cmd, **kwargs)
+    return int(proc.pid)
+
+
+def _terminate_pid(pid: int) -> None:
+    if not pid or not pid_is_running(pid):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError as exc:
+        log.warning("failed to terminate watcher pid=%s: %s", pid, exc)
+
+
+def _base_agent(
+    root: Path,
+    agent_id: str,
+    terminal: str,
+    prompt: str,
+    caller_terminal: str | None,
+    provider_command: str = "",
+    model_name: str = "",
+    task_started_on_launch: bool = False,
+) -> dict:
+    now = now_iso()
+    return {
+        "agent_id": agent_id,
+        "terminal": terminal,
+        "worktree_path": str(root),
+        "provider_command": provider_command,
+        "model_name": model_name,
+        "task_started_on_launch": task_started_on_launch,
+        "state": "assigned",
+        "phase": "",
+        "caller_terminal": caller_terminal,
+        "prompt": prompt,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _start_watcher(root: Path, agent: dict) -> None:
+    write_agent(root, agent)
+    emit_event(
+        logs_dir(root),
+        component="cli",
+        event="agent_registered",
+        agent_id=agent["agent_id"],
+        terminal=agent.get("terminal", ""),
+        message="agent record written",
+        data={
+            "model": agent.get("model_name", ""),
+            "provider_command": agent.get("provider_command", ""),
+        },
+    )
+    try:
+        pid = _spawn_watcher(root, agent["agent_id"])
+    except OSError as exc:
+        agent["state"] = "error"
+        agent["completion_source"] = "watcher_spawn_failed"
+        agent["error"] = str(exc)
+        agent["updated_at"] = now_iso()
+        write_agent(root, agent)
+        emit_event(
+            logs_dir(root),
+            component="cli",
+            event="watcher_spawn_failed",
+            level="ERROR",
+            agent_id=agent["agent_id"],
+            terminal=agent.get("terminal", ""),
+            message=str(exc),
+        )
+        raise
+    agent["watcher_pid"] = pid
+    agent["updated_at"] = now_iso()
+    write_agent(root, agent)
+    emit_event(
+        logs_dir(root),
+        component="cli",
+        event="watcher_spawned",
+        agent_id=agent["agent_id"],
+        terminal=agent.get("terminal", ""),
+        message="watcher process started",
+        data={"pid": pid},
+    )
+
+
+def _ps_by_pane(worktrees: list[dict]) -> dict[str, dict]:
+    result: dict[str, dict] = {}
+    for worktree in worktrees:
+        for entry in worktree.get("agents") or []:
+            pane = entry.get("paneKey")
+            if pane:
+                result[pane] = entry
+    return result
+
+
+def _agent_rows(root: Path) -> dict[str, dict]:
+    agents = list_agents(root)
+    try:
+        ps_entries = _ps_by_pane(anyio.run(worktree_ps))
+    except Exception as exc:
+        log.warning("worktree ps failed: %s", exc)
+        ps_entries = {}
+
+    rows: dict[str, dict] = {}
+    for agent_id, agent in agents.items():
+        row = dict(agent)
+        pid = int(row.get("watcher_pid") or 0)
+        row["watcher_running"] = pid_is_running(pid) if pid else False
+        pane = row.get("pane_key") or row.get("paneKey")
+        ps_entry = ps_entries.get(pane) if pane else None
+        if ps_entry:
+            row["orca_state"] = ps_entry.get("state", "")
+            row["orca_prompt"] = ps_entry.get("prompt", "")
+            row["tool_name"] = ps_entry.get("toolName", "")
+            row["last_assistant_message"] = ps_entry.get("lastAssistantMessage", "")
+        else:
+            row.setdefault("orca_state", "")
+        rows[agent_id] = row
+    return rows
+
+
+def _tail_text(path: Path, lines: int) -> list[str]:
+    if lines <= 0:
+        return []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            return [line.rstrip("\n") for line in deque(f, maxlen=lines)]
+    except OSError:
+        return []
 
 
 @app.command()
@@ -108,8 +340,6 @@ def init(
         typer.echo("  no known agent CLIs found on PATH")
 
     if interactive is None:
-        # A human at a keyboard has a real terminal on both ends; agent
-        # harnesses run commands with piped stdio.
         interactive = sys.stdin.isatty() and sys.stdout.isatty()
 
     if interactive and found:
@@ -199,18 +429,6 @@ def _interactive_tier_setup(root: Path, found: list[dict]) -> None:
     write_state(root, state)
     typer.echo("")
     typer.echo("Saved. Review with: python osw.py model list")
-
-
-# ---------------------------------------------------------------------------
-# model subcommands
-# ---------------------------------------------------------------------------
-
-def _read_state_or_exit(root):
-    try:
-        return read_state(root)
-    except FileNotFoundError:
-        typer.echo("Not initialized. Run `python osw.py init` first.")
-        raise typer.Exit(1)
 
 
 @model_app.command("scan")
@@ -316,56 +534,87 @@ def model_remove(
 
 
 @app.command()
-def serve() -> None:
-    """Run the foreground supervisor for the current directory."""
-    root = resolve_project_root()
-    log_path = enable_file_logging(logs_dir(root))
-    typer.echo(f"OSW supervisor starting for {root}")
-    typer.echo(f"Log file: {log_path}")
-    typer.echo("Press Ctrl+C to stop.")
-    try:
-        anyio.run(run_server, root)
-    except KeyboardInterrupt:
-        pass
-    typer.echo("OSW supervisor stopped.")
-
-
-@app.command()
 def new(
     prompt: str,
     tier: str = typer.Option("medium", "--tier", "-t", help="Model tier: strong, medium, or weak"),
     model: str = typer.Option(None, "--model", "-m", help="Specific model entry name (overrides --tier)"),
     caller_terminal: str = typer.Option(None, "--caller-terminal", help="Terminal handle to receive completion reports"),
 ) -> None:
-    """Create a new agent terminal and send it a task prompt."""
+    """Create a new agent terminal and return after starting its watcher."""
     root = resolve_project_root()
     enable_file_logging(logs_dir(root))
-    require_serve(root)
+    state = _read_state_or_exit(root)
+    emit_event(
+        logs_dir(root),
+        component="cli",
+        event="new_started",
+        message="creating agent terminal",
+        data={"tier": tier, "model": model or ""},
+    )
 
-    if tier not in ("strong", "medium", "weak"):
-        typer.echo(f"Error: unknown tier '{tier}' (expected strong, medium, or weak)")
+    entry, error = _resolve_model(state, tier, model)
+    if entry is None:
+        typer.echo(f"Error: {error}")
         raise typer.Exit(1)
 
-    if not caller_terminal:
-        caller_terminal = _detect_caller_terminal()
+    command = entry.get("command", "")
+    launch_command = _append_prompt(command, prompt)
+    try:
+        result = anyio.run(terminal_create, launch_command)
+    except OrcaError as exc:
+        emit_event(
+            logs_dir(root),
+            component="cli",
+            event="terminal_create_failed",
+            level="ERROR",
+            message=exc.message,
+            data={"command": launch_command},
+        )
+        typer.echo(f"Error: {exc.message}")
+        raise typer.Exit(1)
 
-    log.info("sending 'new' request  tier=%s model=%s prompt=%s", tier, model or "-", prompt[:60])
-    payload: dict = {"prompt": prompt, "tier": tier}
-    if model:
-        payload["model"] = model
-    if caller_terminal:
-        payload["caller_terminal"] = caller_terminal
-    request_id = write_request(root, "new", payload)
-    log.debug("request_id=%s, waiting for result...", request_id)
-    result = read_result(root, request_id, timeout=RESULT_TIMEOUT)
+    handle = _terminal_handle(result)
+    if not handle:
+        emit_event(
+            logs_dir(root),
+            component="cli",
+            event="terminal_create_missing_handle",
+            level="ERROR",
+            data={"result": result},
+        )
+        typer.echo("Error: terminal create returned no handle")
+        raise typer.Exit(1)
 
-    def on_ok(r: dict) -> None:
-        agent_id = r.get("agent_id")
-        terminal = r.get("terminal")
-        log.info("agent created  %s -> %s  model=%s", agent_id, terminal, r.get("model", ""))
-        typer.echo(f"Created {agent_id} on terminal {terminal} (model: {r.get('model', '?')})")
+    agent_id = alloc_agent_id(root)
+    agent = _base_agent(
+        root,
+        agent_id,
+        handle,
+        prompt,
+        _maybe_detect_caller(caller_terminal),
+        provider_command=command,
+        model_name=entry.get("name", ""),
+        task_started_on_launch=True,
+    )
 
-    _handle_result(result, on_ok)
+    try:
+        _start_watcher(root, agent)
+    except OSError as exc:
+        typer.echo(f"Error: failed to start watcher: {exc}")
+        raise typer.Exit(1)
+
+    typer.echo(
+        f"Created {agent_id} on terminal {handle} "
+        f"(model: {entry.get('name', '?')})"
+    )
+    emit_event(
+        logs_dir(root),
+        component="cli",
+        event="new_finished",
+        agent_id=agent_id,
+        terminal=handle,
+        message="agent created",
+    )
 
 
 @app.command()
@@ -377,50 +626,122 @@ def use(
     """Adopt an already-running terminal as a managed agent."""
     root = resolve_project_root()
     enable_file_logging(logs_dir(root))
-    require_serve(root)
+    _read_state_or_exit(root)
+    emit_event(
+        logs_dir(root),
+        component="cli",
+        event="use_started",
+        terminal=terminal,
+        message="adopting terminal",
+    )
 
-    if not caller_terminal:
-        caller_terminal = _detect_caller_terminal()
+    try:
+        data = anyio.run(terminal_show, terminal)
+    except OrcaError as exc:
+        emit_event(
+            logs_dir(root),
+            component="cli",
+            event="terminal_show_failed",
+            level="ERROR",
+            terminal=terminal,
+            message=exc.message,
+        )
+        typer.echo(f"Error: {exc.message}")
+        raise typer.Exit(1)
 
-    log.info("sending 'use' request  terminal=%s", terminal)
-    payload: dict = {"terminal": terminal, "prompt": prompt}
-    if caller_terminal:
-        payload["caller_terminal"] = caller_terminal
-    request_id = write_request(root, "use", payload)
-    log.debug("request_id=%s, waiting for result...", request_id)
-    result = read_result(root, request_id, timeout=RESULT_TIMEOUT)
+    terminal_obj = _unwrap_terminal(data)
+    worktree_path = _terminal_worktree_path(terminal_obj)
+    if worktree_path and Path(worktree_path).resolve() != root:
+        emit_event(
+            logs_dir(root),
+            component="cli",
+            event="terminal_worktree_mismatch",
+            level="ERROR",
+            terminal=terminal,
+            data={"terminal_worktree": worktree_path, "root": str(root)},
+        )
+        typer.echo(
+            f"Error: terminal worktree '{worktree_path}' does not match project root '{root}'"
+        )
+        raise typer.Exit(1)
 
-    def on_ok(r: dict) -> None:
-        agent_id = r.get("agent_id")
-        term = r.get("terminal")
-        log.info("agent adopted  %s -> %s", agent_id, term)
-        typer.echo(f"Adopted {agent_id} on terminal {term}")
+    handle = _terminal_handle(data, fallback=terminal)
+    agent_id = alloc_agent_id(root)
+    agent = _base_agent(
+        root,
+        agent_id,
+        handle,
+        prompt,
+        _maybe_detect_caller(caller_terminal),
+    )
 
-    _handle_result(result, on_ok)
+    try:
+        _start_watcher(root, agent)
+    except OSError as exc:
+        typer.echo(f"Error: failed to start watcher: {exc}")
+        raise typer.Exit(1)
+
+    typer.echo(f"Adopted {agent_id} on terminal {handle}")
+    emit_event(
+        logs_dir(root),
+        component="cli",
+        event="use_finished",
+        agent_id=agent_id,
+        terminal=handle,
+        message="agent adopted",
+    )
 
 
 @app.command(name="all")
 def all_(message: str) -> None:
-    """Broadcast a message to every managed agent."""
+    """Broadcast a message to every currently managed, unfinished agent."""
     root = resolve_project_root()
     enable_file_logging(logs_dir(root))
-    require_serve(root)
+    _read_state_or_exit(root)
+    emit_event(
+        logs_dir(root),
+        component="cli",
+        event="broadcast_started",
+        message="broadcasting to unfinished agents",
+        data={"chars": len(message)},
+    )
 
-    log.info("sending 'all' request  msg=%s", message[:60])
-    request_id = write_request(root, "all", {"message": message})
-    result = read_result(root, request_id, timeout=RESULT_TIMEOUT)
+    sent: list[str] = []
+    errors: list[dict] = []
+    for agent_id, agent in list_agents(root).items():
+        if agent.get("state") in ("done", "error", "lost"):
+            continue
+        try:
+            anyio.run(terminal_send, agent["terminal"], message)
+            sent.append(agent_id)
+            emit_event(
+                logs_dir(root),
+                component="cli",
+                event="broadcast_sent",
+                agent_id=agent_id,
+                terminal=agent["terminal"],
+            )
+        except OrcaError as exc:
+            errors.append({"agent_id": agent_id, "error": exc.message})
+            emit_event(
+                logs_dir(root),
+                component="cli",
+                event="broadcast_failed",
+                level="ERROR",
+                agent_id=agent_id,
+                terminal=agent.get("terminal", ""),
+                message=exc.message,
+            )
 
-    def on_ok(result: dict) -> None:
-        sent = result.get("sent", [])
-        errors = result.get("errors", [])
-        log.info("broadcast complete  sent=%d  errors=%d", len(sent), len(errors))
-        typer.echo(f"Sent to {len(sent)} agent(s): {', '.join(sent)}")
-        if errors:
-            for err in errors:
-                log.warning("broadcast error: %s", err)
-            typer.echo(f"Errors: {errors}")
-
-    _handle_result(result, on_ok)
+    typer.echo(f"Sent to {len(sent)} agent(s): {', '.join(sent)}")
+    if errors:
+        typer.echo(f"Errors: {errors}")
+    emit_event(
+        logs_dir(root),
+        component="cli",
+        event="broadcast_finished",
+        data={"sent": sent, "errors": errors},
+    )
 
 
 @app.command(name="del")
@@ -431,18 +752,48 @@ def del_(
     """Remove an agent from management, optionally closing its terminal."""
     root = resolve_project_root()
     enable_file_logging(logs_dir(root))
-    require_serve(root)
+    _read_state_or_exit(root)
 
-    log.info("sending 'del' request  agent_id=%s  close=%s", agent_id, close)
-    request_id = write_request(root, "del", {"agent_id": agent_id, "close": close})
-    result = read_result(root, request_id, timeout=RESULT_TIMEOUT)
+    try:
+        agent = read_agent(root, agent_id)
+    except FileNotFoundError:
+        emit_event(
+            logs_dir(root),
+            component="cli",
+            event="delete_missing_agent",
+            level="ERROR",
+            agent_id=agent_id,
+        )
+        typer.echo(f"Error: agent '{agent_id}' not found")
+        raise typer.Exit(1)
 
-    def on_ok(result: dict) -> None:
-        aid = result.get("agent_id")
-        log.info("agent removed: %s", aid)
-        typer.echo(f"Removed {aid}")
+    emit_event(
+        logs_dir(root),
+        component="cli",
+        event="delete_started",
+        agent_id=agent_id,
+        terminal=agent.get("terminal", ""),
+        data={"close": close, "watcher_pid": agent.get("watcher_pid", 0)},
+    )
+    pid = int(agent.get("watcher_pid") or 0)
+    if pid:
+        _terminate_pid(pid)
 
-    _handle_result(result, on_ok)
+    if close:
+        try:
+            anyio.run(terminal_close, agent["terminal"])
+        except OrcaError as exc:
+            typer.echo(f"Warning: failed to close terminal: {exc.message}")
+
+    delete_agent(root, agent_id)
+    typer.echo(f"Removed {agent_id}")
+    emit_event(
+        logs_dir(root),
+        component="cli",
+        event="delete_finished",
+        agent_id=agent_id,
+        terminal=agent.get("terminal", ""),
+    )
 
 
 @app.command(name="list")
@@ -452,14 +803,9 @@ def list_(
     """List managed agents."""
     root = resolve_project_root()
     enable_file_logging(logs_dir(root))
-    try:
-        state = read_state(root)
-    except FileNotFoundError:
-        typer.echo("Not initialized. Run `python osw.py init` first.")
-        raise typer.Exit(1)
+    _read_state_or_exit(root)
 
-    agents = state.get("agents", {})
-
+    agents = _agent_rows(root)
     if json_output:
         typer.echo(json.dumps(agents, indent=2))
         return
@@ -468,52 +814,85 @@ def list_(
         typer.echo("No agents.")
         return
 
-    typer.echo(f"{'AGENT_ID':<12} {'STATE':<16} {'TERMINAL':<14} {'CALLER':<14} LAST_PROMPT")
+    typer.echo(f"{'AGENT_ID':<12} {'STATE':<12} {'ORCA':<10} {'WATCHER':<8} {'TERMINAL':<14} PROMPT")
     for agent_id, agent in agents.items():
-        last_prompt = agent.get("last_prompt") or ""
-        if len(last_prompt) > 40:
-            last_prompt = last_prompt[:37] + "..."
+        prompt = agent.get("prompt") or ""
+        if len(prompt) > 40:
+            prompt = prompt[:37] + "..."
+        watcher = "yes" if agent.get("watcher_running") else "no"
         typer.echo(
-            f"{agent_id:<12} {agent.get('state', ''):<16} "
-            f"{agent.get('terminal', ''):<14} {agent.get('caller_terminal') or '-':<14} "
-            f"{last_prompt}"
+            f"{agent_id:<12} {agent.get('state', ''):<12} "
+            f"{agent.get('orca_state', '') or '-':<10} {watcher:<8} "
+            f"{agent.get('terminal', ''):<14} {prompt}"
         )
 
 
 @app.command()
+def logs(
+    agent_id: str = typer.Option(None, "--agent", help="Only show logs for one agent id"),
+    tail: int = typer.Option(50, "--tail", "-n", min=0, help="Lines/events to show"),
+) -> None:
+    """Show OSW log files and recent structured events."""
+    root = resolve_project_root()
+    _read_state_or_exit(root)
+    directory = logs_dir(root)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    typer.echo(f"Log dir: {directory}")
+    typer.echo(f"Events: {events_file(directory)}")
+
+    pattern = f"{agent_id}_*.log*" if agent_id else "*.log*"
+    files = sorted(directory.glob(pattern), key=lambda p: p.stat().st_mtime)
+    typer.echo("Files:")
+    if files:
+        for path in files:
+            typer.echo(f"  {path}")
+    else:
+        typer.echo("  none")
+
+    events = read_events(directory, agent_id=agent_id, tail=tail)
+    typer.echo("Recent events:")
+    if events:
+        for event in events:
+            typer.echo(f"  {format_event_line(event)}")
+    else:
+        typer.echo("  none")
+
+    if files and tail:
+        latest = files[-1]
+        typer.echo(f"Tail: {latest}")
+        for line in _tail_text(latest, tail):
+            typer.echo(f"  {line}")
+
+
+@app.command()
 def status() -> None:
-    """Show supervisor status for the current directory."""
+    """Show OSW state for the current directory."""
     root = resolve_project_root()
     enable_file_logging(logs_dir(root))
-    try:
-        state = read_state(root)
-    except FileNotFoundError:
-        typer.echo("Not initialized. Run `python osw.py init` first.")
-        raise typer.Exit(1)
+    _read_state_or_exit(root)
 
-    running = is_serve_running(root)
-    typer.echo(f"Serve: {'running' if running else 'not running'}")
     typer.echo(f"State file: {state_file(root)}")
-
-    serve_info = state.get("serve")
-    if serve_info:
-        typer.echo(f"PID: {serve_info.get('pid')}")
-        typer.echo(f"Started: {serve_info.get('started_at')}")
+    agents = _agent_rows(root)
+    if not agents:
+        typer.echo("Agents: none")
+        return
 
     counts: dict[str, int] = {}
-    for agent in state.get("agents", {}).values():
+    running_watchers = 0
+    for agent in agents.values():
         agent_state = agent.get("state", "unknown")
         counts[agent_state] = counts.get(agent_state, 0) + 1
+        if agent.get("watcher_running"):
+            running_watchers += 1
 
-    if counts:
-        typer.echo("Agents:")
-        for agent_state, count in sorted(counts.items()):
-            typer.echo(f"  {agent_state}: {count}")
-    else:
-        typer.echo("Agents: none")
+    typer.echo("Agents:")
+    for agent_state, count in sorted(counts.items()):
+        typer.echo(f"  {agent_state}: {count}")
+    typer.echo(f"Watchers running: {running_watchers}")
 
-    errors = state.get("errors", [])
-    if errors:
-        typer.echo("Recent errors:")
-        for error in errors[-5:]:
-            typer.echo(f"  {error}")
+
+@app.command(hidden=True)
+def watch(root: Path, agent_id: str) -> None:
+    """Internal entry point for a detached per-agent watcher."""
+    watcher_main(root.resolve(), agent_id)

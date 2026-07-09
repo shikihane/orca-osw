@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import time
-import uuid
 from pathlib import Path
 
 
@@ -19,18 +17,19 @@ def state_dir(root: Path) -> Path:
 
 
 def state_file(root: Path) -> Path:
-    """Return the path to the state.json file."""
+    """Return the path to state.json (models config only)."""
     return state_dir(root) / "state.json"
 
 
-def inbox_dir(root: Path) -> Path:
-    """Return the path to the inbox directory (request files)."""
-    return state_dir(root) / "inbox"
+def agents_dir(root: Path) -> Path:
+    """Return the per-agent record directory. One JSON file per agent;
+    the agent's watcher process is the only writer after creation."""
+    return state_dir(root) / "agents"
 
 
-def results_dir(root: Path) -> Path:
-    """Return the path to the results directory (result files)."""
-    return state_dir(root) / "results"
+def handoffs_dir(root: Path) -> Path:
+    """Return the directory where workers write their handoff markdown."""
+    return state_dir(root) / "handoffs"
 
 
 def logs_dir(root: Path) -> Path:
@@ -44,27 +43,22 @@ def reports_dir(root: Path) -> Path:
 
 
 def init_state_dir(root: Path) -> None:
-    """Create the OSW state directory structure and write the default state.json."""
-    state_dir(root).mkdir(parents=True, exist_ok=True)
-    inbox_dir(root).mkdir(parents=True, exist_ok=True)
-    results_dir(root).mkdir(parents=True, exist_ok=True)
-    logs_dir(root).mkdir(parents=True, exist_ok=True)
-    reports_dir(root).mkdir(parents=True, exist_ok=True)
+    """Create the OSW state directory structure and the default state.json."""
+    for d in (state_dir(root), agents_dir(root), handoffs_dir(root),
+              logs_dir(root), reports_dir(root)):
+        d.mkdir(parents=True, exist_ok=True)
 
     # Model tiers start EMPTY on purpose: nothing about the user's
     # machine is assumed. The operator (LLM or human) scans the
     # environment and assigns tiers explicitly (`osw.py model scan/add`).
     default_state = {
-        "version": 1,
+        "version": 2,
         "project_root": str(root),
-        "serve": None,
         "models": {
             "strong": [],
             "medium": [],
             "weak": [],
         },
-        "agents": {},
-        "errors": [],
     }
     write_state(root, default_state)
 
@@ -80,66 +74,88 @@ def read_state(root: Path) -> dict:
 
 def write_state(root: Path, state: dict) -> None:
     """Atomically write the state dict to state.json."""
-    path = state_file(root)
+    _atomic_write_json(state_file(root), state)
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+        json.dump(payload, f, indent=2, ensure_ascii=False)
     os.replace(tmp_path, path)
 
 
-_AGENT_ID_RE = re.compile(r"^agent_(\d+)$")
+# ---------------------------------------------------------------------------
+# Per-agent records
+# ---------------------------------------------------------------------------
+
+def agent_file(root: Path, agent_id: str) -> Path:
+    return agents_dir(root) / f"{agent_id}.json"
 
 
-def next_agent_id(state: dict) -> str:
-    """Return the next sequential agent id based on existing agents in state."""
-    agents = state.get("agents", {}) or {}
-    max_n = 0
-    for key in agents:
-        match = _AGENT_ID_RE.match(key)
-        if match:
-            n = int(match.group(1))
-            if n > max_n:
-                max_n = n
-    return f"agent_{max_n + 1:03d}"
+def alloc_agent_id(root: Path) -> str:
+    """Claim the next free agent id atomically.
 
-
-def write_request(root: Path, command: str, payload: dict) -> str:
-    """Write a request to the inbox directory and return its request_id."""
-    request_id = uuid.uuid4().hex[:12]
-    inbox_dir(root).mkdir(parents=True, exist_ok=True)
-    request = {"request_id": request_id, "command": command, **payload}
-    path = inbox_dir(root) / f"{request_id}.json"
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(request, f, indent=2)
-    os.replace(tmp_path, path)
-    return request_id
-
-
-def read_result(root: Path, request_id: str, timeout: float = 15.0) -> dict | None:
-    """Poll the results directory for a matching result file.
-
-    Returns the parsed JSON payload if the file appears within the timeout,
-    deleting the file after reading. Returns None if the timeout expires.
+    The agent record file itself is the lock: `open(..., "x")` fails if
+    a concurrent `osw new` already claimed that id, in which case we
+    move on to the next number.
     """
-    path = results_dir(root) / f"{request_id}.json"
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if path.exists():
-            try:
-                with path.open("r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                time.sleep(0.3)
-                continue
-            try:
-                path.unlink()
-            except OSError:
-                pass
-            return data
-        time.sleep(0.3)
-    return None
+    agents_dir(root).mkdir(parents=True, exist_ok=True)
+    n = 1
+    for path in agents_dir(root).glob("agent_*.json"):
+        stem = path.stem
+        try:
+            n = max(n, int(stem.split("_")[1]) + 1)
+        except (IndexError, ValueError):
+            continue
+    while True:
+        agent_id = f"agent_{n:03d}"
+        try:
+            with agent_file(root, agent_id).open("x", encoding="utf-8") as f:
+                f.write("{}")
+            return agent_id
+        except FileExistsError:
+            n += 1
+
+
+def read_agent(root: Path, agent_id: str) -> dict:
+    """Read one agent record. Raises FileNotFoundError if absent."""
+    path = agent_file(root, agent_id)
+    if not path.exists():
+        raise FileNotFoundError(f"Agent record not found: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_agent(root: Path, agent: dict) -> None:
+    """Atomically write one agent record."""
+    _atomic_write_json(agent_file(root, agent["agent_id"]), agent)
+
+
+def delete_agent(root: Path, agent_id: str) -> bool:
+    """Remove an agent record. Returns True if a file was deleted."""
+    try:
+        agent_file(root, agent_id).unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def list_agents(root: Path) -> dict[str, dict]:
+    """Read every agent record, keyed by agent id, sorted by id."""
+    agents: dict[str, dict] = {}
+    directory = agents_dir(root)
+    if not directory.exists():
+        return agents
+    for path in sorted(directory.glob("agent_*.json")):
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("agent_id"):
+            agents[data["agent_id"]] = data
+    return agents
 
 
 def write_report(root: Path, agent_id: str, payload: dict) -> Path:
@@ -147,24 +163,18 @@ def write_report(root: Path, agent_id: str, payload: dict) -> Path:
     reports_dir(root).mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
     path = reports_dir(root) / f"{agent_id}_{ts}.json"
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    os.replace(tmp_path, path)
+    _atomic_write_json(path, payload)
     return path
 
 
-def write_result(root: Path, request_id: str, payload: dict) -> None:
-    """Write a result payload to the results directory."""
-    results_dir(root).mkdir(parents=True, exist_ok=True)
-    path = results_dir(root) / f"{request_id}.json"
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-    os.replace(tmp_path, path)
+def new_handoff_path(root: Path, agent_id: str) -> Path:
+    """Pre-allocate the handoff markdown path for one task run."""
+    handoffs_dir(root).mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    return handoffs_dir(root) / f"{agent_id}_{ts}.md"
 
 
-def _pid_is_running(pid: int) -> bool:
+def pid_is_running(pid: int) -> bool:
     """Check whether a process with the given PID is currently running."""
     if pid <= 0:
         return False
@@ -198,21 +208,3 @@ def _pid_is_running(pid: int) -> bool:
         except OSError:
             return False
         return True
-
-
-def is_serve_running(root: Path) -> bool:
-    """Return True if state.json records a live serve process."""
-    try:
-        state = read_state(root)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return False
-
-    serve = state.get("serve")
-    if not serve:
-        return False
-
-    pid = serve.get("pid")
-    if pid is None:
-        return False
-
-    return _pid_is_running(int(pid))

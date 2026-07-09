@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 
 import anyio
 
 from osw.log import get_logger
+from osw.process import hidden_subprocess_kwargs
 
 log = get_logger("orca")
 
@@ -36,7 +38,12 @@ async def run_orca(*args: str) -> dict:
     log.debug("exec: %s", " ".join(cmd))
 
     try:
-        result = await anyio.run_process(cmd, check=False)
+        started = time.monotonic()
+        result = await anyio.run_process(
+            cmd,
+            check=False,
+            **hidden_subprocess_kwargs(),
+        )
     except FileNotFoundError:
         raise OrcaError(
             "Orca CLI not found. Make sure 'orca' is installed and on PATH.",
@@ -44,13 +51,15 @@ async def run_orca(*args: str) -> dict:
         )
     except OSError as exc:
         raise OrcaError(f"Failed to run orca: {exc}", 1)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
 
     if result.returncode != 0:
         stderr_text = result.stderr.decode().strip()
         stdout_text = result.stdout.decode().strip()
         log.debug(
-            "orca exited %d  stderr=%s  stdout=%s",
+            "orca exited %d in %dms  stderr=%s  stdout=%s",
             result.returncode,
+            elapsed_ms,
             stderr_text[:200] if stderr_text else "(empty)",
             stdout_text[:200] if stdout_text else "(empty)",
         )
@@ -66,8 +75,9 @@ async def run_orca(*args: str) -> dict:
         )
 
     log.debug(
-        "orca ok  args=%s  keys=%s",
+        "orca ok  args=%s  elapsed_ms=%d  keys=%s",
         args[:2],
+        elapsed_ms,
         list(data.keys()) if isinstance(data, dict) else type(data).__name__,
     )
     return data
@@ -143,10 +153,6 @@ async def terminal_show(handle: str | None = None) -> dict:
     return await run_orca(*args)
 
 
-async def terminal_info(handle: str) -> dict:
-    return await run_orca("terminal", "info", "--terminal", handle)
-
-
 async def detect_current_terminal(marker: str) -> str | None:
     """Find the terminal whose preview contains *marker*.
 
@@ -161,44 +167,17 @@ async def detect_current_terminal(marker: str) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Orchestration (official inter-agent task protocol)
-# ---------------------------------------------------------------------------
+async def worktree_ps() -> list[dict]:
+    """Orchestration summary across worktrees.
 
-async def orchestration_task_create(spec: str, title: str | None = None) -> str:
-    """Create an orchestration task and return its task id."""
-    args = ["orchestration", "task-create", "--spec", spec]
-    if title:
-        args += ["--task-title", title]
-    data = await run_orca(*args)
-    task = data.get("result", {}).get("task", {}) if isinstance(data, dict) else {}
-    return task.get("id", "")
-
-
-async def orchestration_dispatch(
-    task_id: str,
-    to_handle: str,
-    from_handle: str | None = None,
-    inject: bool = True,
-) -> dict:
-    """Dispatch a task to a worker terminal (injects the official preamble)."""
-    args = ["orchestration", "dispatch", "--task", task_id, "--to", to_handle]
-    if from_handle:
-        args += ["--from", from_handle]
-    if inject:
-        args.append("--inject")
-    return await run_orca(*args)
-
-
-async def orchestration_check(terminal: str, types: str | None = None) -> list[dict]:
-    """Fetch unread orchestration messages for *terminal* (marks them read)."""
-    args = ["orchestration", "check", "--terminal", terminal, "--unread"]
-    if types:
-        args += ["--types", types]
-    data = await run_orca(*args)
+    Each worktree row carries an ``agents`` list: Orca's own structured
+    view of agent TUIs it recognizes (claude, codex) — state
+    (working/done), current prompt, toolName, lastAssistantMessage,
+    stateStartedAt/updatedAt, and paneKey ("<tabId>:<leafId>").
+    """
+    data = await run_orca("worktree", "ps")
     if isinstance(data, dict):
-        inner = data.get("result", data)
-        messages = inner.get("messages")
-        if isinstance(messages, list):
-            return messages
+        worktrees = data.get("result", {}).get("worktrees")
+        if isinstance(worktrees, list):
+            return worktrees
     return []

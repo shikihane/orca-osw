@@ -44,8 +44,6 @@ WRAPPER_CASES = [
      ["terminal", "list", "--worktree", "active"]),
     (lambda: orca_cli.terminal_create("codex"),
      ["terminal", "create", "--worktree", "active", "--command", "codex"]),
-    (lambda: orca_cli.terminal_send("t1", "hello world"),
-     ["terminal", "send", "--terminal", "t1", "--text", "hello world", "--enter"]),
     (lambda: orca_cli.terminal_wait("t1"),
      ["terminal", "wait", "--terminal", "t1", "--for", "tui-idle", "--timeout-ms", "300000"]),
     (lambda: orca_cli.terminal_wait("t1", event="exit", timeout_ms=5000),
@@ -60,14 +58,8 @@ WRAPPER_CASES = [
      ["terminal", "show"]),
     (lambda: orca_cli.terminal_show("t1"),
      ["terminal", "show", "--terminal", "t1"]),
-    (lambda: orca_cli.terminal_info("t1"),
-     ["terminal", "info", "--terminal", "t1"]),
-    (lambda: orca_cli.orchestration_task_create("do it", title="t"),
-     ["orchestration", "task-create", "--spec", "do it", "--task-title", "t"]),
-    (lambda: orca_cli.orchestration_dispatch("task_1", "t-w", from_handle="t-c"),
-     ["orchestration", "dispatch", "--task", "task_1", "--to", "t-w", "--from", "t-c", "--inject"]),
-    (lambda: orca_cli.orchestration_check("t-c"),
-     ["orchestration", "check", "--terminal", "t-c", "--unread"]),
+    (lambda: orca_cli.worktree_ps(),
+     ["worktree", "ps"]),
 ]
 
 
@@ -77,6 +69,21 @@ WRAPPER_CASES = [
 async def test_wrapper_builds_expected_command(factory, expected):
     _, cmd = await _run(factory)
     assert cmd == ["orca", *expected, "--json"]
+
+
+@pytest.mark.anyio
+async def test_terminal_send_writes_text_and_submit_in_one_call():
+    mock_run = AsyncMock(return_value=_completed(stdout=b"{}"))
+    with patch("osw.orca_cli.anyio.run_process", mock_run):
+        await orca_cli.terminal_send("t1", "hello world")
+
+    cmds = [call.args[0] for call in mock_run.call_args_list]
+    assert cmds == [
+        [
+            "orca", "terminal", "send", "--terminal", "t1",
+            "--text", "hello world", "--enter", "--json",
+        ],
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +99,19 @@ async def test_run_orca_parses_json_and_dedups_json_flag():
     )
     assert result == payload
     assert cmd.count("--json") == 1
+
+
+@pytest.mark.anyio
+async def test_run_orca_passes_hidden_process_kwargs():
+    startupinfo = object()
+    mock_run = AsyncMock(return_value=_completed(stdout=b"{}"))
+    with patch("osw.orca_cli.hidden_subprocess_kwargs",
+               return_value={"startupinfo": startupinfo, "creationflags": 123}), \
+         patch("osw.orca_cli.anyio.run_process", mock_run):
+        await orca_cli.run_orca("worktree", "ps")
+
+    assert mock_run.call_args.kwargs["startupinfo"] is startupinfo
+    assert mock_run.call_args.kwargs["creationflags"] == 123
 
 
 @pytest.mark.anyio
@@ -123,19 +143,22 @@ async def test_terminal_list_unwraps_nested_result():
 
 
 @pytest.mark.anyio
-async def test_orchestration_task_create_returns_id():
-    payload = {"result": {"task": {"id": "task_abc"}}}
-    result, _ = await _run(lambda: orca_cli.orchestration_task_create("spec"),
+async def test_worktree_ps_unwraps_worktrees():
+    payload = {
+        "result": {
+            "worktrees": [
+                {
+                    "id": "wt1",
+                    "agents": [
+                        {"paneKey": "tab:leaf", "state": "done"},
+                    ],
+                }
+            ]
+        }
+    }
+    result, _ = await _run(lambda: orca_cli.worktree_ps(),
                            stdout=json.dumps(payload).encode())
-    assert result == "task_abc"
-
-
-@pytest.mark.anyio
-async def test_orchestration_check_unwraps_messages():
-    payload = {"result": {"messages": [{"id": "m1", "type": "worker_done"}]}}
-    result, _ = await _run(lambda: orca_cli.orchestration_check("t-c"),
-                           stdout=json.dumps(payload).encode())
-    assert result == [{"id": "m1", "type": "worker_done"}]
+    assert result == payload["result"]["worktrees"]
 
 
 @pytest.mark.anyio

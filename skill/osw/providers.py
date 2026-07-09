@@ -6,6 +6,8 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+from osw.process import hidden_subprocess_kwargs
+
 # Candidate agent CLIs to probe for on PATH. This is a *scan list*,
 # not configuration — nothing ends up in state.json unless the
 # operator explicitly assigns it to a tier.
@@ -152,6 +154,7 @@ def _run_capture(args: list[str], timeout: int = _PROBE_TIMEOUT) -> str:
             text=True,
             encoding="utf-8",
             errors="replace",
+            **hidden_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
