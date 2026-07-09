@@ -19,7 +19,7 @@ def test_path_resolution(tmp_path):
     assert state.reports_dir(root) == root / ".orca" / "osw" / "reports"
 
 
-def test_init_creates_dirs_and_v2_state(tmp_path):
+def test_init_state_dir_creates_project_state(tmp_path):
     root = tmp_path
     state.init_state_dir(root)
 
@@ -33,11 +33,7 @@ def test_init_creates_dirs_and_v2_state(tmp_path):
     with state.state_file(root).open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    assert data == {
-        "version": 2,
-        "project_root": str(root),
-        "models": {"strong": [], "medium": [], "weak": []},
-    }
+    assert data == {"version": 3, "project_root": str(root)}
 
 
 def test_read_write_state_roundtrip(tmp_path):

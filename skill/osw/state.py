@@ -17,7 +17,7 @@ def state_dir(root: Path) -> Path:
 
 
 def state_file(root: Path) -> Path:
-    """Return the path to state.json (models config only)."""
+    """Return the path to OSW's project state file."""
     return state_dir(root) / "state.json"
 
 
@@ -48,17 +48,9 @@ def init_state_dir(root: Path) -> None:
               logs_dir(root), reports_dir(root)):
         d.mkdir(parents=True, exist_ok=True)
 
-    # Model tiers start EMPTY on purpose: nothing about the user's
-    # machine is assumed. The operator (LLM or human) scans the
-    # environment and assigns tiers explicitly (`osw.py model scan/add`).
     default_state = {
-        "version": 2,
+        "version": 3,
         "project_root": str(root),
-        "models": {
-            "strong": [],
-            "medium": [],
-            "weak": [],
-        },
     }
     write_state(root, default_state)
 

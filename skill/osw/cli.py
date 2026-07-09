@@ -346,13 +346,12 @@ def init(
         _interactive_tier_setup(root, found)
         return
 
-    typer.echo("")
-    typer.echo("Model tiers are EMPTY. Assign models before using `new`:")
-    typer.echo("  discover variants:  python osw.py model variants <cli>")
-    typer.echo('  assign a tier:      python osw.py model add --tier <strong|medium|weak>'
-               ' --name <name> --command "<command>"')
-    typer.echo("  verify:             python osw.py model list")
-    typer.echo("(Humans: run `init -i` for a guided setup.)")
+    if found:
+        typer.echo("")
+        typer.echo("Inspect provider models with:")
+        typer.echo("  python osw.py models claude")
+        typer.echo("  python osw.py models codex")
+        typer.echo("  python osw.py models pi")
 
 
 def _pick_variant(cli: dict, variants: list[dict]) -> dict | None:

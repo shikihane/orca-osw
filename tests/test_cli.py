@@ -20,10 +20,10 @@ def test_init_creates_state_and_reports_scan(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert (tmp_path / ".orca" / "osw" / "state.json").is_file()
-    # models must start empty — nothing about the machine is assumed
     state = state_mod.read_state(tmp_path)
-    assert state["models"] == {"strong": [], "medium": [], "weak": []}
-    assert "model add" in result.output
+    assert state == {"version": 3, "project_root": str(tmp_path)}
+    assert "Scanning for agent CLIs on PATH" in result.output
+    assert "model add" not in result.output
 
 
 def test_list_and_status(tmp_path, monkeypatch):
@@ -91,12 +91,6 @@ def test_commands_require_initialized_state(tmp_path, monkeypatch, args):
 
     assert result.exit_code == 1
     assert "Not initialized" in result.output
-
-
-def _configure_models(root):
-    state = state_mod.read_state(root)
-    state["models"]["medium"].append({"name": "codex-mid", "command": "codex"})
-    state_mod.write_state(root, state)
 
 
 def test_new_creates_terminal_agent_file_and_detaches_watcher(tmp_path, monkeypatch):
