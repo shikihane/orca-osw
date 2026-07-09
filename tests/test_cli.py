@@ -23,7 +23,7 @@ def test_init_creates_state_and_reports_scan(tmp_path, monkeypatch):
     state = state_mod.read_state(tmp_path)
     assert state == {"version": 3, "project_root": str(tmp_path)}
     assert "Scanning for agent CLIs on PATH" in result.output
-    assert "model add" not in result.output
+    assert "Inspect provider models with:" in result.output
 
 
 def test_list_and_status(tmp_path, monkeypatch):
