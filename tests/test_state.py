@@ -37,11 +37,7 @@ def test_init_state_dir_creates_project_state(tmp_path):
 
 
 def test_read_write_state_roundtrip(tmp_path):
-    payload = {
-        "version": 2,
-        "project_root": str(tmp_path),
-        "models": {"strong": [], "medium": [], "weak": []},
-    }
+    payload = {"version": 3, "project_root": str(tmp_path)}
 
     state.write_state(tmp_path, payload)
 
