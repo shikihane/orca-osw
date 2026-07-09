@@ -54,6 +54,7 @@ python skill/osw.py status
 - `new` 的 provider 支持 `claude`、`codex`、`pi`。
 - `--model` 原样传给 provider。
 - `--thinking` 按 provider 转换：`claude --effort`、`codex -c model_reasoning_effort=...`、`pi --thinking`。
+- OSW 默认添加 provider 的非阻塞/批准类启动参数：`claude --dangerously-skip-permissions`、`codex --dangerously-bypass-approvals-and-sandbox`、`pi --approve`。
 - `new` 和 `use` 支持 `--caller-terminal <句柄>`，指定接收完成报告的父终端。
 - `del --close` 同时让 Orca 关闭终端。
 - `list --json` 输出原始 JSON。

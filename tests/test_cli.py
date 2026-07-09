@@ -120,7 +120,7 @@ def test_new_creates_provider_terminal_agent_file_and_detaches_watcher(tmp_path,
     assert "Created agent_001" in result.output
     assert "(provider: claude)" in result.output
     create.assert_awaited_once_with(
-        'claude --model sonnet --effort high "do the task"'
+        'claude --dangerously-skip-permissions --model sonnet --effort high "do the task"'
     )
     spawn.assert_called_once_with(tmp_path, "agent_001")
 
@@ -132,7 +132,9 @@ def test_new_creates_provider_terminal_agent_file_and_detaches_watcher(tmp_path,
     assert agent["provider"] == "claude"
     assert agent["model_name"] == "sonnet"
     assert agent["thinking"] == "high"
-    assert agent["provider_command"] == "claude --model sonnet --effort high"
+    assert agent["provider_command"] == (
+        "claude --dangerously-skip-permissions --model sonnet --effort high"
+    )
     assert agent["watcher_pid"] == 4567
     assert agent["state"] == "assigned"
 

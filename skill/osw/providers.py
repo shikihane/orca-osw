@@ -32,6 +32,11 @@ def _quote_command_arg(value: str) -> str:
 
 
 SUPPORTED_PROVIDERS = ("claude", "codex", "pi")
+PROVIDER_AUTONOMY_FLAGS = {
+    "claude": ("--dangerously-skip-permissions",),
+    "codex": ("--dangerously-bypass-approvals-and-sandbox",),
+    "pi": ("--approve",),
+}
 
 
 class ProviderError(ValueError):
@@ -61,7 +66,7 @@ def build_provider_command(
             f"unsupported provider '{provider}' (expected one of: {expected})"
         )
 
-    args = [provider]
+    args = [provider, *PROVIDER_AUTONOMY_FLAGS[provider]]
     if provider == "codex":
         if thinking:
             args += ["-c", f"model_reasoning_effort={thinking}"]

@@ -26,6 +26,11 @@ in the same directory as this `SKILL.md`.
 The CLI does not write `CLAUDE.md`; the operator or LLM should record
 agent allocation there after the planning conversation.
 
+`new` automatically adds provider launch flags intended to keep worker
+sessions from blocking on permission prompts:
+`claude --dangerously-skip-permissions`,
+`codex --dangerously-bypass-approvals-and-sandbox`, and `pi --approve`.
+
 ## Commands
 
 All commands operate on `.orca/osw/` in the current working directory.

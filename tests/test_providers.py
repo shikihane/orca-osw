@@ -77,7 +77,10 @@ def test_build_launch_command_for_claude():
         thinking="high",
     )
 
-    assert command == 'claude --model sonnet --effort high "do the task"'
+    assert command == (
+        'claude --dangerously-skip-permissions --model sonnet --effort high '
+        '"do the task"'
+    )
 
 
 def test_build_provider_command_for_claude():
@@ -87,7 +90,7 @@ def test_build_provider_command_for_claude():
         thinking="high",
     )
 
-    assert command == "claude --model sonnet --effort high"
+    assert command == "claude --dangerously-skip-permissions --model sonnet --effort high"
 
 
 def test_build_launch_command_for_codex():
@@ -98,7 +101,10 @@ def test_build_launch_command_for_codex():
         thinking="medium",
     )
 
-    assert command == 'codex -c model_reasoning_effort=medium -m gpt-5 "do the task"'
+    assert command == (
+        "codex --dangerously-bypass-approvals-and-sandbox "
+        '-c model_reasoning_effort=medium -m gpt-5 "do the task"'
+    )
 
 
 def test_build_launch_command_for_pi():
@@ -109,13 +115,19 @@ def test_build_launch_command_for_pi():
         thinking="low",
     )
 
-    assert command == 'pi --model deepseek/deepseek-v4-pro --thinking low "do the task"'
+    assert command == (
+        'pi --approve --model deepseek/deepseek-v4-pro --thinking low "do the task"'
+    )
 
 
 def test_build_launch_command_omits_optional_flags():
-    assert build_launch_command("claude", "do the task") == 'claude "do the task"'
-    assert build_launch_command("codex", "do the task") == 'codex "do the task"'
-    assert build_launch_command("pi", "do the task") == 'pi "do the task"'
+    assert build_launch_command("claude", "do the task") == (
+        'claude --dangerously-skip-permissions "do the task"'
+    )
+    assert build_launch_command("codex", "do the task") == (
+        'codex --dangerously-bypass-approvals-and-sandbox "do the task"'
+    )
+    assert build_launch_command("pi", "do the task") == 'pi --approve "do the task"'
 
 
 def test_build_launch_command_rejects_unknown_provider():

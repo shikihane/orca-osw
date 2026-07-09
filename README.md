@@ -54,6 +54,7 @@ python skill/osw.py status
 - `new` accepts `claude`, `codex`, or `pi` as the provider.
 - `--model` is passed through unchanged.
 - `--thinking` is translated per provider: `claude --effort`, `codex -c model_reasoning_effort=...`, `pi --thinking`.
+- OSW adds the provider's non-blocking autonomy flag by default: `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`, `pi --approve`.
 - `new` and `use` accept `--caller-terminal <handle>` to receive completion reports on a parent terminal.
 - `del --close` also asks Orca to close the terminal.
 - `list --json` outputs raw JSON.
