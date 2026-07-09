@@ -59,10 +59,6 @@ from osw.watcher import main as watcher_main
 log = get_logger("cli")
 
 app = typer.Typer(help="OSW - Orca Agent Supervisor")
-model_app = typer.Typer(help="Manage the model tier configuration")
-app.add_typer(model_app, name="model")
-
-TIERS = ("strong", "medium", "weak")
 
 
 @app.callback()
@@ -106,28 +102,6 @@ def _maybe_detect_caller(caller_terminal: str | None) -> str | None:
     if sys.stdin.isatty() and sys.stdout.isatty():
         return _detect_caller_terminal()
     return None
-
-
-def _resolve_model(
-    state: dict, tier: str, model_name: str | None
-) -> tuple[dict | None, str]:
-    models = state.get("models", {})
-    if model_name:
-        for t in TIERS:
-            for entry in models.get(t) or []:
-                if entry.get("name") == model_name:
-                    return entry, ""
-        return None, f"model '{model_name}' not found in models config"
-
-    if tier not in TIERS:
-        return None, f"unknown tier '{tier}' (expected strong, medium, or weak)"
-
-    search_order = [tier] + [t for t in TIERS if t != tier]
-    for t in search_order:
-        entries = models.get(t) or []
-        if entries:
-            return entries[0], ""
-    return None, "models config is empty"
 
 
 def _unwrap_terminal(data: dict) -> dict:
@@ -321,8 +295,7 @@ def _tail_text(path: Path, lines: int) -> list[str]:
 def init(
     interactive: bool = typer.Option(
         None, "--interactive/--no-interactive", "-i",
-        help="Force the guided prompt setup on or off. Default: on when "
-             "run from a real terminal, off when stdio is piped (agents).",
+        help="Deprecated; kept for compatibility and ignored.",
     ),
 ) -> None:
     """Initialize OSW state for the current directory."""
@@ -341,13 +314,6 @@ def init(
     else:
         typer.echo("  no known agent CLIs found on PATH")
 
-    if interactive is None:
-        interactive = sys.stdin.isatty() and sys.stdout.isatty()
-
-    if interactive and found:
-        _interactive_tier_setup(root, found)
-        return
-
     if found:
         typer.echo("")
         typer.echo("Inspect provider models with:")
@@ -356,182 +322,24 @@ def init(
         typer.echo("  python osw.py models pi")
 
 
-def _pick_variant(cli: dict, variants: list[dict]) -> dict | None:
-    """Second-level pick from discovered variants (never free-typed)."""
-    shown = variants
-    if len(variants) > 20:
-        keyword = typer.prompt("filter (optional)", default="").strip().lower()
-        if keyword:
-            shown = [v for v in variants if keyword in v["name"].lower()] or variants
-        shown = shown[:30]
-    typer.echo(f"variants for {cli['name']}:")
-    for i, opt in enumerate(shown, 1):
-        typer.echo(f"  {i}. {opt['name']:<28} {opt['command']}")
-    typer.echo("  b. back (skip this tier)")
-    while True:
-        choice = typer.prompt("select", default="1").strip().lower()
-        if choice == "b":
-            return None
-        try:
-            index = int(choice)
-        except ValueError:
-            typer.echo("  invalid choice, try again")
-            continue
-        if 1 <= index <= len(shown):
-            return dict(shown[index - 1])
-        typer.echo("  invalid choice, try again")
-
-
-def _interactive_tier_setup(root: Path, found: list[dict]) -> None:
-    """Guided tier assignment: pick an agent, then one of its variants."""
-    state = read_state(root)
-    used_names: set[str] = set()
-    variant_cache: dict[str, list[dict]] = {}
-
-    for tier in TIERS:
-        typer.echo("")
-        typer.echo(f"[{tier}] choose an agent:")
-        for i, cli in enumerate(found, 1):
-            typer.echo(f"  {i}. {cli['name']}")
-        typer.echo("  s. skip this tier")
-
-        cli = None
-        while cli is None:
-            choice = typer.prompt("select", default="s").strip().lower()
-            if choice == "s":
-                break
-            try:
-                index = int(choice) - 1
-                if 0 <= index < len(found):
-                    cli = found[index]
-            except ValueError:
-                pass
-            if cli is None:
-                typer.echo("  invalid choice, try again")
-
-        if cli is None:
-            typer.echo(f"  {tier}: skipped")
-            continue
-
-        if cli["name"] not in variant_cache:
-            typer.echo(f"  probing {cli['name']} for model variants...")
-            variant_cache[cli["name"]] = probe_variants(cli["name"], cli["path"])
-        entry = _pick_variant(cli, variant_cache[cli["name"]])
-        if entry is None:
-            typer.echo(f"  {tier}: skipped")
-            continue
-
-        if entry["name"] in used_names:
-            entry["name"] = f"{entry['name']}-{tier}"
-        used_names.add(entry["name"])
-        state["models"][tier].append(entry)
-        typer.echo(f"  {tier}: {entry['name']} -> {entry['command']}")
-
-    write_state(root, state)
-    typer.echo("")
-    typer.echo("Saved. Review with: python osw.py model list")
-
-
-@model_app.command("scan")
-def model_scan(
+@app.command("models")
+def models(
+    provider: str = typer.Argument(..., help="Provider to query: claude, codex, or pi"),
     json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
 ) -> None:
-    """Scan PATH for known agent CLIs."""
-    found = scan_agent_clis()
-    if json_output:
-        typer.echo(json.dumps(found, indent=2))
-        return
-    if not found:
-        typer.echo("No known agent CLIs found on PATH.")
-        return
-    for entry in found:
-        version = f"  ({entry['version']})" if entry["version"] else ""
-        typer.echo(f"{entry['name']:<14} {entry['path']}{version}")
-
-
-@model_app.command("variants")
-def model_variants(
-    cli_name: str = typer.Argument(..., help="Agent CLI to query (e.g. pi, claude)"),
-    json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
-) -> None:
-    """Discover model variants by querying the CLI itself."""
-    variants = probe_variants(cli_name)
+    """Discover provider model options without writing OSW state."""
+    variants = probe_variants(provider)
     if json_output:
         typer.echo(json.dumps(variants, indent=2))
         return
     if not variants:
-        typer.echo(f"No discoverable variants for '{cli_name}'."
-                   f" Check `{cli_name} --help` for its model flags.")
+        typer.echo(
+            f"No discoverable models for '{provider}'. "
+            f"Check `{provider} --help` for its model flags."
+        )
         return
     for opt in variants:
         typer.echo(f"{opt['name']:<28} {opt['command']}")
-
-
-@model_app.command("list")
-def model_list(
-    json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
-) -> None:
-    """Show the configured model tiers."""
-    root = resolve_project_root()
-    state = _read_state_or_exit(root)
-    models = state.get("models", {})
-    if json_output:
-        typer.echo(json.dumps(models, indent=2))
-        return
-    empty = True
-    for tier in TIERS:
-        for entry in models.get(tier) or []:
-            empty = False
-            typer.echo(f"{tier:<8} {entry.get('name', '?'):<20} {entry.get('command', '')}")
-    if empty:
-        typer.echo("No models configured. Add one with `model add`.")
-
-
-@model_app.command("add")
-def model_add(
-    tier: str = typer.Option(..., "--tier", "-t", help="Tier: strong, medium, or weak"),
-    name: str = typer.Option(..., "--name", "-n", help="Unique entry name"),
-    command: str = typer.Option(..., "--command", "-c", help="Command line to launch the agent"),
-) -> None:
-    """Add a model entry to a tier."""
-    if tier not in TIERS:
-        typer.echo(f"Error: unknown tier '{tier}' (expected strong, medium, or weak)")
-        raise typer.Exit(1)
-
-    root = resolve_project_root()
-    state = _read_state_or_exit(root)
-    models = state.setdefault("models", {})
-    for t in TIERS:
-        for entry in models.get(t) or []:
-            if entry.get("name") == name:
-                typer.echo(f"Error: model '{name}' already exists in tier '{t}'")
-                raise typer.Exit(1)
-
-    models.setdefault(tier, []).append({"name": name, "command": command})
-    write_state(root, state)
-    log.info("model added  tier=%s name=%s command=%s", tier, name, command)
-    typer.echo(f"Added {name} to {tier}: {command}")
-
-
-@model_app.command("remove")
-def model_remove(
-    name: str = typer.Argument(..., help="Model entry name to remove"),
-) -> None:
-    """Remove a model entry by name."""
-    root = resolve_project_root()
-    state = _read_state_or_exit(root)
-    models = state.get("models", {})
-    for tier in TIERS:
-        entries = models.get(tier) or []
-        for entry in entries:
-            if entry.get("name") == name:
-                entries.remove(entry)
-                write_state(root, state)
-                log.info("model removed  tier=%s name=%s", tier, name)
-                typer.echo(f"Removed {name} from {tier}")
-                return
-    typer.echo(f"Error: model '{name}' not found")
-    raise typer.Exit(1)
 
 
 @app.command()

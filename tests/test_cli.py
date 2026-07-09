@@ -282,55 +282,30 @@ def test_list_merges_agent_files_with_worktree_ps_and_watcher_liveness(tmp_path,
     assert agents["agent_001"]["prompt"] == "Fix the bug"
 
 
-def test_init_interactive_assigns_tiers(tmp_path, monkeypatch):
+def test_models_command_is_read_only(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    found = [
-        {"name": "claude", "path": "C:\\bin\\claude.EXE", "version": ""},
-        {"name": "codex", "path": "C:\\bin\\codex.CMD", "version": ""},
-    ]
-    variants = {
-        "claude": [
-            {"name": "claude-opus", "command": "claude --model opus"},
-            {"name": "claude-sonnet", "command": "claude --model sonnet"},
-        ],
-        "codex": [
-            {"name": "codex-default", "command": "codex"},
-            {"name": "codex-gpt-5.5-medium",
-             "command": "codex -c model_reasoning_effort=medium -m gpt-5.5"},
-        ],
-    }
-
-    def fake_probe(name, path=None):
-        return variants[name]
-
-    # strong: agent 1 (claude) -> variant 2 (sonnet)
-    # medium: agent 2 (codex)  -> variant 2 (gpt-5.5-medium)
-    # weak:   skip
-    user_input = "1\n2\n2\n2\ns\n"
-    with patch("osw.cli.scan_agent_clis", return_value=found), \
-         patch("osw.cli.probe_variants", side_effect=fake_probe):
-        result = runner.invoke(app, ["init", "-i"], input=user_input)
-
-    assert result.exit_code == 0
-    models = state_mod.read_state(tmp_path)["models"]
-    assert models["strong"] == [
-        {"name": "claude-sonnet", "command": "claude --model sonnet"}
-    ]
-    assert models["medium"] == [
-        {"name": "codex-gpt-5.5-medium",
-         "command": "codex -c model_reasoning_effort=medium -m gpt-5.5"}
-    ]
-    assert models["weak"] == []
-
-
-def test_model_variants_command(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    before = state_mod.read_state(tmp_path)
     variants = [{"name": "pi-gpt-5", "command": "pi --model openai/gpt-5"}]
+
     with patch("osw.cli.probe_variants", return_value=variants):
-        result = runner.invoke(app, ["model", "variants", "pi"])
+        result = runner.invoke(app, ["models", "pi"])
 
     assert result.exit_code == 0
     assert "pi --model openai/gpt-5" in result.output
+    assert state_mod.read_state(tmp_path) == before
+
+
+def test_models_command_outputs_json(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    variants = [{"name": "pi-gpt-5", "command": "pi --model openai/gpt-5"}]
+
+    with patch("osw.cli.probe_variants", return_value=variants):
+        result = runner.invoke(app, ["models", "pi", "--json"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == variants
 
 
 def test_init_non_interactive_never_prompts(tmp_path, monkeypatch):
@@ -341,35 +316,4 @@ def test_init_non_interactive_never_prompts(tmp_path, monkeypatch):
         result = runner.invoke(app, ["init"])
 
     assert result.exit_code == 0
-    assert state_mod.read_state(tmp_path)["models"] == {
-        "strong": [], "medium": [], "weak": [],
-    }
-
-
-def test_model_add_list_remove_roundtrip(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    state_mod.init_state_dir(tmp_path)
-
-    add = runner.invoke(app, [
-        "model", "add", "--tier", "medium",
-        "--name", "codex-mid", "--command", "codex -c model_reasoning_effort=medium",
-    ])
-    assert add.exit_code == 0
-
-    # duplicate name rejected
-    dup = runner.invoke(app, [
-        "model", "add", "--tier", "weak", "--name", "codex-mid", "--command", "x",
-    ])
-    assert dup.exit_code == 1
-
-    listed = runner.invoke(app, ["model", "list"])
-    assert "codex-mid" in listed.output
-
-    state = state_mod.read_state(tmp_path)
-    assert state["models"]["medium"] == [
-        {"name": "codex-mid", "command": "codex -c model_reasoning_effort=medium"}
-    ]
-
-    removed = runner.invoke(app, ["model", "remove", "codex-mid"])
-    assert removed.exit_code == 0
-    assert state_mod.read_state(tmp_path)["models"]["medium"] == []
+    assert state_mod.read_state(tmp_path) == {"version": 3, "project_root": str(tmp_path)}
