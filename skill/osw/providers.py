@@ -27,6 +27,55 @@ KNOWN_AGENT_CLIS = [
 _PROBE_TIMEOUT = 15
 
 
+def _quote_command_arg(value: str) -> str:
+    return subprocess.list2cmdline([value])
+
+
+SUPPORTED_PROVIDERS = ("claude", "codex", "pi")
+
+
+class ProviderError(ValueError):
+    pass
+
+
+def build_launch_command(
+    provider: str,
+    prompt: str,
+    model: str | None = None,
+    thinking: str | None = None,
+) -> str:
+    """Build the provider CLI command OSW should run in an Orca terminal."""
+    return f"{build_provider_command(provider, model, thinking)} {_quote_command_arg(prompt)}"
+
+
+def build_provider_command(
+    provider: str,
+    model: str | None = None,
+    thinking: str | None = None,
+) -> str:
+    """Build the provider CLI command without the user prompt."""
+    provider = provider.strip()
+    if provider not in SUPPORTED_PROVIDERS:
+        expected = ", ".join(SUPPORTED_PROVIDERS)
+        raise ProviderError(
+            f"unsupported provider '{provider}' (expected one of: {expected})"
+        )
+
+    args = [provider]
+    if provider == "codex":
+        if thinking:
+            args += ["-c", f"model_reasoning_effort={thinking}"]
+        if model:
+            args += ["-m", model]
+    else:
+        if model:
+            args += ["--model", model]
+        if thinking:
+            flag = "--effort" if provider == "claude" else "--thinking"
+            args += [flag, thinking]
+    return " ".join(_quote_command_arg(arg) for arg in args)
+
+
 def scan_agent_clis(probe_version: bool = True) -> list[dict]:
     """Scan PATH for known agent CLIs.
 

@@ -1,6 +1,16 @@
 from __future__ import annotations
 
-from osw.providers import CODEX_EFFORTS, codex_variants, parse_claude_aliases, parse_pi_models
+import pytest
+
+from osw.providers import (
+    CODEX_EFFORTS,
+    ProviderError,
+    build_launch_command,
+    build_provider_command,
+    codex_variants,
+    parse_claude_aliases,
+    parse_pi_models,
+)
 
 # Real output shapes captured from the actual CLIs
 
@@ -57,3 +67,57 @@ def test_codex_variants_without_config():
     # still selectable: efforts against the CLI's own default model
     assert {"name": "codex-model-medium",
             "command": "codex -c model_reasoning_effort=medium"} in variants
+
+
+def test_build_launch_command_for_claude():
+    command = build_launch_command(
+        "claude",
+        "do the task",
+        model="sonnet",
+        thinking="high",
+    )
+
+    assert command == 'claude --model sonnet --effort high "do the task"'
+
+
+def test_build_provider_command_for_claude():
+    command = build_provider_command(
+        "claude",
+        model="sonnet",
+        thinking="high",
+    )
+
+    assert command == "claude --model sonnet --effort high"
+
+
+def test_build_launch_command_for_codex():
+    command = build_launch_command(
+        "codex",
+        "do the task",
+        model="gpt-5",
+        thinking="medium",
+    )
+
+    assert command == 'codex -c model_reasoning_effort=medium -m gpt-5 "do the task"'
+
+
+def test_build_launch_command_for_pi():
+    command = build_launch_command(
+        "pi",
+        "do the task",
+        model="deepseek/deepseek-v4-pro",
+        thinking="low",
+    )
+
+    assert command == 'pi --model deepseek/deepseek-v4-pro --thinking low "do the task"'
+
+
+def test_build_launch_command_omits_optional_flags():
+    assert build_launch_command("claude", "do the task") == 'claude "do the task"'
+    assert build_launch_command("codex", "do the task") == 'codex "do the task"'
+    assert build_launch_command("pi", "do the task") == 'pi "do the task"'
+
+
+def test_build_launch_command_rejects_unknown_provider():
+    with pytest.raises(ProviderError, match="unsupported provider 'gemini'"):
+        build_launch_command("gemini", "do the task")
