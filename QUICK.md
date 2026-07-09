@@ -17,26 +17,26 @@ python /path/to/orca-osw/skill/osw.py init
 
 This creates `.orca/osw/` with a default `state.json`.
 
-## 3. Start the supervisor
+## 3. Inspect provider models
 
 ```bash
-python /path/to/orca-osw/skill/osw.py serve
+python /path/to/orca-osw/skill/osw.py models claude
+python /path/to/orca-osw/skill/osw.py models codex
+python /path/to/orca-osw/skill/osw.py models pi
 ```
 
-Keep this running. All other commands talk to it.
+This is read-only and does not change `.orca/osw/state.json`.
 
 ## 4. Create an agent
 
-Open a second terminal in the same directory:
-
 ```bash
-python /path/to/orca-osw/skill/osw.py new "Fix the failing tests in src/auth.py"
+python /path/to/orca-osw/skill/osw.py new claude --model sonnet --thinking high "Fix the failing tests in src/auth.py"
 ```
 
 Output:
 
 ```
-Created agent_001 on terminal term_xxx
+Created agent_001 on terminal term_xxx (provider: claude)
 ```
 
 ## 5. Monitor
@@ -55,7 +55,6 @@ python /path/to/orca-osw/skill/osw.py status
 ```
 
 ```
-Serve: running
 State file: /your/project/.orca/osw/state.json
 Agents:
   assigned: 1
@@ -65,10 +64,10 @@ Agents:
 
 When the agent finishes its task and goes idle:
 
-1. The supervisor detects tui-idle
+1. The watcher detects tui-idle
 2. Sends a forced `/handoff` prompt
 3. The agent generates a `HANDOFF_*.md` file
-4. If `--caller-terminal` was set, the supervisor sends a completion report:
+4. If `--caller-terminal` was set, the watcher sends a completion report:
 
 ```
 子任务完成。
@@ -86,7 +85,8 @@ python /path/to/orca-osw/skill/osw.py all "请暂停当前工作，等待新指�
 ## 8. Adopt an existing terminal
 
 ```bash
-python /path/to/orca-osw/skill/osw.py use --terminal term_yyy "Review the PR changes"
+python /path/to/orca-osw/skill/osw.py use term_yyy "Review the PR changes"
+python /path/to/orca-osw/skill/osw.py use agent_001 "Continue the task"
 ```
 
 The terminal must belong to the current directory's worktree.
@@ -98,18 +98,15 @@ python /path/to/orca-osw/skill/osw.py del agent_001          # remove from manag
 python /path/to/orca-osw/skill/osw.py del agent_001 --close  # also close the terminal
 ```
 
-## 10. Configure model tiers
+## 10. State and model discovery
 
-Edit `.orca/osw/state.json` and change the `models` section:
+Project state is intentionally small:
 
 ```json
 {
-  "models": {
-    "strong": [{ "name": "my-strong", "command": "codex" }],
-    "medium": [{ "name": "my-medium", "command": "claude" }],
-    "weak":   [{ "name": "my-weak",   "command": "pi" }]
-  }
+  "version": 3,
+  "project_root": "/your/project"
 }
 ```
 
-`new` uses the first `strong` entry. Edit freely — OSW reads it on each request.
+Runtime agent records live under `.orca/osw/agents/`. Use `models <provider>` to inspect provider options; OSW does not write model configuration to state.

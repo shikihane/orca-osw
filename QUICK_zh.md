@@ -17,26 +17,26 @@ python /path/to/orca-osw/skill/osw.py init
 
 在当前目录创建 `.orca/osw/`，写入默认 `state.json`。
 
-## 3. 启动监督器
+## 3. 查看 provider 模型
 
 ```bash
-python /path/to/orca-osw/skill/osw.py serve
+python /path/to/orca-osw/skill/osw.py models claude
+python /path/to/orca-osw/skill/osw.py models codex
+python /path/to/orca-osw/skill/osw.py models pi
 ```
 
-保持运行。其他命令都通过它工作。
+这是只读操作，不会修改 `.orca/osw/state.json`。
 
 ## 4. 创建 agent
 
-在同目录打开第二个终端：
-
 ```bash
-python /path/to/orca-osw/skill/osw.py new "修复 src/auth.py 的失败测试"
+python /path/to/orca-osw/skill/osw.py new claude --model sonnet --thinking high "修复 src/auth.py 的失败测试"
 ```
 
 输出：
 
 ```
-Created agent_001 on terminal term_xxx
+Created agent_001 on terminal term_xxx (provider: claude)
 ```
 
 ## 5. 查看状态
@@ -55,7 +55,6 @@ python /path/to/orca-osw/skill/osw.py status
 ```
 
 ```
-Serve: running
 State file: /你的/项目/.orca/osw/state.json
 Agents:
   assigned: 1
@@ -65,10 +64,10 @@ Agents:
 
 当 agent 完成任务并进入空闲：
 
-1. 监督器检测到 tui-idle
+1. watcher 检测到 tui-idle
 2. 发送强制 `/handoff` 提示
 3. agent 生成 `HANDOFF_*.md` 文件
-4. 如果设置了 `--caller-terminal`，监督器发送完成报告：
+4. 如果设置了 `--caller-terminal`，watcher 发送完成报告：
 
 ```
 子任务完成。
@@ -86,7 +85,8 @@ python /path/to/orca-osw/skill/osw.py all "请暂停当前工作，等待新指�
 ## 8. 接管已有终端
 
 ```bash
-python /path/to/orca-osw/skill/osw.py use --terminal term_yyy "审查 PR 变更"
+python /path/to/orca-osw/skill/osw.py use term_yyy "审查 PR 变更"
+python /path/to/orca-osw/skill/osw.py use agent_001 "继续这个任务"
 ```
 
 终端必须属于当前目录的 worktree。
@@ -98,18 +98,15 @@ python /path/to/orca-osw/skill/osw.py del agent_001          # 仅从管理中�
 python /path/to/orca-osw/skill/osw.py del agent_001 --close  # 同时关闭终端
 ```
 
-## 10. 配置模型等级
+## 10. 状态与模型发现
 
-编辑 `.orca/osw/state.json` 的 `models` 部分：
+项目状态刻意保持很小：
 
 ```json
 {
-  "models": {
-    "strong": [{ "name": "my-strong", "command": "codex" }],
-    "medium": [{ "name": "my-medium", "command": "claude" }],
-    "weak":   [{ "name": "my-weak",   "command": "pi" }]
-  }
+  "version": 3,
+  "project_root": "/你的/项目"
 }
 ```
 
-`new` 使用第一个 `strong` 条目。可随意编辑，OSW 每次请求时重新读取。
+运行时 agent 记录位于 `.orca/osw/agents/`。使用 `models <provider>` 查看 provider 选项；OSW 不把模型配置写入 state。

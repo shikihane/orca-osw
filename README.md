@@ -2,12 +2,12 @@
 
 [中文版](README_zh.md)
 
-A lightweight Python tool for managing Orca-backed agent sessions from the current directory. OSW starts or adopts agent terminals, runs a foreground AnyIO supervisor, detects task completion through idle signals, forces a handoff pass, and reports the resulting handoff file back to the caller.
+A lightweight Python tool for managing Orca-backed agent sessions from the current directory. OSW starts or adopts agent terminals, launches detached watchers, detects task completion through idle signals, forces a handoff pass, and reports the resulting handoff file back to the caller.
 
 ## Features
 
 - **Directory-scoped** — each working directory is an independent management scope, even across git worktrees
-- **Async supervisor** — AnyIO-based concurrency; inbox polling, per-agent watchers, and reconciliation run without blocking each other
+- **Detached watchers** — each managed agent gets a watcher process that monitors completion without blocking the CLI
 - **Automatic handoff** — detects agent idle, triggers `/handoff`, extracts `HANDOFF_*.md`, notifies the caller terminal
 - **Minimal dependencies** — only `anyio`, `typer`, and optionally `rich` for colored logs
 
@@ -27,10 +27,10 @@ See [QUICK.md](QUICK.md) for a step-by-step walkthrough.
 
 ```bash
 python skill/osw.py init
-python skill/osw.py serve          # keep running in this terminal
+python skill/osw.py models pi
 
-# in another terminal, same directory:
-python skill/osw.py new "Fix the failing tests"
+python skill/osw.py new claude --model sonnet --thinking high "Fix the failing tests"
+python skill/osw.py new codex --model gpt-5 --thinking medium "Refactor the provider layer"
 python skill/osw.py list
 python skill/osw.py status
 ```
@@ -40,16 +40,20 @@ python skill/osw.py status
 | Command | Description |
 |---|---|
 | `init` | Initialize `.orca/osw/` state directory |
-| `serve` | Run the foreground supervisor (required by other commands) |
-| `new "<prompt>"` | Create a new agent terminal with a task |
-| `use --terminal <handle> "<prompt>"` | Adopt an existing Orca terminal |
+| `models <provider> [--json]` | Inspect provider model options without writing state |
+| `new <provider> [--model <model>] [--thinking <value>] "<prompt>"` | Create a new agent terminal with a task |
+| `use <agent-id-or-terminal> "<prompt>"` | Adopt an existing Orca terminal or continue from an OSW agent id |
 | `all "<message>"` | Broadcast a message to all managed agents |
 | `del <agent_id> [--close]` | Remove an agent from management |
 | `list [--json]` | List managed agents |
-| `status` | Show supervisor status and agent counts |
+| `logs [--agent <agent_id>] [--tail N]` | Show OSW logs and events |
+| `status` | Show OSW state and agent counts |
 
 ### Options
 
+- `new` accepts `claude`, `codex`, or `pi` as the provider.
+- `--model` is passed through unchanged.
+- `--thinking` is translated per provider: `claude --effort`, `codex -c model_reasoning_effort=...`, `pi --thinking`.
 - `new` and `use` accept `--caller-terminal <handle>` to receive completion reports on a parent terminal.
 - `del --close` also asks Orca to close the terminal.
 - `list --json` outputs raw JSON.
@@ -57,15 +61,14 @@ python skill/osw.py status
 ## Architecture
 
 ```
-serve (foreground)
-  ├── inbox_loop      — polls .orca/osw/inbox/ every 0.5s for CLI requests
-  ├── reconcile_loop  — verifies terminals still exist every 30s
-  ├── watcher(agent_001)  — per-agent, spawned dynamically
-  ├── watcher(agent_002)
-  └── ...
+new/use
+  ├── create or adopt Orca terminal
+  ├── write .orca/osw/agents/agent_NNN.json
+  ├── spawn detached watcher(agent_NNN)
+  └── return immediately
 ```
 
-Only `serve` writes `state.json`. CLI commands (`new`, `use`, `all`, `del`) communicate with `serve` by writing JSON request files to `inbox/` and polling `results/` for responses (15-second timeout).
+OSW owns orchestration only: state initialization, Orca terminal creation/adoption, detached watcher startup, logs, and completion reports. Provider command construction lives in `skill/osw/providers.py`.
 
 ### Watcher Lifecycle
 
@@ -92,7 +95,7 @@ orca-osw/
       deps.py         # dependency checker
       handoff.py      # handoff extraction and reporting
       orca_cli.py     # async Orca CLI wrapper
-      server.py       # AnyIO supervisor
+      watcher.py      # detached completion watcher
       state.py        # state model and file I/O
   tests/              # 62 tests (unit + integration)
   conftest.py         # sys.path setup for tests
@@ -106,30 +109,23 @@ Created in the working directory where you run `init`:
 <cwd>/
   .orca/
     osw/
-      state.json      # authoritative state (only serve writes it)
-      inbox/           # CLI → serve request files
-      results/         # serve → CLI response files
+      state.json      # OSW project state
+      agents/          # one JSON record per managed agent
+      handoffs/        # worker handoff markdown files
       logs/
+      reports/
 ```
 
 ## State Model
 
 ```json
 {
-  "version": 1,
-  "project_root": "D:\\project",
-  "serve": { "pid": 12345, "started_at": "..." },
-  "models": {
-    "strong":  [{ "name": "strong-default",  "command": "codex" }],
-    "medium":  [{ "name": "medium-default",  "command": "pi" }],
-    "weak":    [{ "name": "weak-default",    "command": "pi" }]
-  },
-  "agents": {},
-  "errors": []
+  "version": 3,
+  "project_root": "D:\\project"
 }
 ```
 
-Edit `models` in `state.json` to configure which provider command maps to each strength tier. OSW uses the first `strong` entry when creating new terminals.
+Runtime agent records live under `.orca/osw/agents/`. Model discovery is read-only; `models <provider>` never writes `state.json`.
 
 ## Testing
 
@@ -138,7 +134,7 @@ python -m pip install pytest
 python -m pytest -v
 ```
 
-62 tests covering unit tests for every module and integration tests with mocked Orca CLI.
+68 tests covering unit tests for every module and integration tests with mocked Orca CLI.
 
 ## License
 

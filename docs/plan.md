@@ -46,7 +46,7 @@ Create `osw/state.py` with:
 - `write_result(root: Path, request_id: str, payload: dict)` — write result JSON to results dir
 - `is_serve_running(root: Path) -> bool` — check if serve PID is alive
 
-Default state.json shape per spec (version, project_root, serve, models with strong/medium/weak, agents dict, errors list).
+Default state.json shape for the current provider-launch flow: `version` and `project_root` only. Runtime agent records live under `.orca/osw/agents/`.
 
 Tests in `tests/test_state.py`:
 - Path resolution
