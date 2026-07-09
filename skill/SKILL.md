@@ -18,10 +18,14 @@ in the same directory as this `SKILL.md`.
    `python <skill-dir>/osw.py models codex`
    `python <skill-dir>/osw.py models pi`
 3. Start workers directly:
-   `python <skill-dir>/osw.py new claude --model sonnet --thinking high "<task>"`
-   `python <skill-dir>/osw.py new pi --model deepseek/deepseek-v4-flash --thinking low "<task>"`
+   `python <skill-dir>/osw.py new claude --prefix code --model sonnet --thinking high "<task>"`
+   `python <skill-dir>/osw.py new pi --prefix research --model deepseek/deepseek-v4-flash --thinking low "<task>"`
 4. Continue existing work:
-   `python <skill-dir>/osw.py use <agent-id-or-terminal> "<prompt>"`
+   `python <skill-dir>/osw.py use <agent-id-or-terminal> --prefix debug "<prompt>"`
+
+Prefer semantic prefixes for agent ids: `research`, `code`, `test`,
+`debug`, `review`, or `misc`. Without `--prefix`, OSW uses the default
+`agent_NNN` sequence.
 
 The CLI does not write `CLAUDE.md`; the operator or LLM should record
 agent allocation there after the planning conversation.
@@ -38,8 +42,8 @@ There is no long-running `serve` daemon.
 
 - `python <skill-dir>/osw.py init` - initialize state and scan agent CLIs
 - `python <skill-dir>/osw.py models <provider> [--json]` - inspect provider model options without writing OSW state
-- `python <skill-dir>/osw.py new <provider> [--model <model>] [--thinking <value>] "<prompt>"` - create an agent terminal, register it, start one detached watcher, then return
-- `python <skill-dir>/osw.py use <agent-id-or-terminal> "<prompt>"` - adopt an existing terminal in the current worktree and start one detached watcher
+- `python <skill-dir>/osw.py new <provider> [--prefix <prefix>] [--model <model>] [--thinking <value>] "<prompt>"` - create an agent terminal, register it, start one detached watcher, then return
+- `python <skill-dir>/osw.py use <agent-id-or-terminal> [--prefix <prefix>] "<prompt>"` - adopt an existing terminal in the current worktree and start one detached watcher
 - `python <skill-dir>/osw.py all "<message>"` - send a one-line message to every unfinished managed agent
 - `python <skill-dir>/osw.py del <agent_id> [--close]` - stop the watcher record and optionally close the terminal
 - `python <skill-dir>/osw.py list [--json]` - list managed agents by reading `.orca/osw/agents/*.json` and one `orca worktree ps --json` snapshot

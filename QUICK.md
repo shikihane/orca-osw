@@ -30,13 +30,13 @@ This is read-only and does not change `.orca/osw/state.json`.
 ## 4. Create an agent
 
 ```bash
-python /path/to/orca-osw/skill/osw.py new claude --model sonnet --thinking high "Fix the failing tests in src/auth.py"
+python /path/to/orca-osw/skill/osw.py new claude --prefix code --model sonnet --thinking high "Fix the failing tests in src/auth.py"
 ```
 
 Output:
 
 ```
-Created agent_001 on terminal term_xxx (provider: claude)
+Created code_001 on terminal term_xxx (provider: claude)
 ```
 
 ## 5. Monitor
@@ -47,7 +47,7 @@ python /path/to/orca-osw/skill/osw.py list
 
 ```
 AGENT_ID     STATE            TERMINAL       CALLER         LAST_PROMPT
-agent_001    assigned         term_xxx       -              Fix the failing tests in sr...
+code_001     assigned         term_xxx       -              Fix the failing tests in sr...
 ```
 
 ```bash
@@ -86,7 +86,7 @@ python /path/to/orca-osw/skill/osw.py all "请暂停当前工作，等待新指�
 
 ```bash
 python /path/to/orca-osw/skill/osw.py use term_yyy "Review the PR changes"
-python /path/to/orca-osw/skill/osw.py use agent_001 "Continue the task"
+python /path/to/orca-osw/skill/osw.py use code_001 --prefix debug "Continue the task"
 ```
 
 The terminal must belong to the current directory's worktree.

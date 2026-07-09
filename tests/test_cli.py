@@ -112,19 +112,21 @@ def test_new_creates_provider_terminal_agent_file_and_detaches_watcher(tmp_path,
                 "high",
                 "--caller-terminal",
                 "caller-1",
+                "--prefix",
+                "research",
                 "do the task",
             ],
         )
 
     assert result.exit_code == 0
-    assert "Created agent_001" in result.output
+    assert "Created research_001" in result.output
     assert "(provider: claude)" in result.output
     create.assert_awaited_once_with(
         'claude --dangerously-skip-permissions --model sonnet --effort high "do the task"'
     )
-    spawn.assert_called_once_with(tmp_path, "agent_001")
+    spawn.assert_called_once_with(tmp_path, "research_001")
 
-    agent = state_mod.read_agent(tmp_path, "agent_001")
+    agent = state_mod.read_agent(tmp_path, "research_001")
     assert agent["terminal"] == "term-new"
     assert agent["prompt"] == "do the task"
     assert agent["task_started_on_launch"] is True
@@ -192,14 +194,14 @@ def test_use_adopts_terminal_with_terminal_show_result_unwrap(tmp_path, monkeypa
     with patch("osw.cli.terminal_show", show), \
          patch("osw.cli._spawn_watcher", spawn):
         result = runner.invoke(
-            app, ["use", "term-existing", "continue this"]
+            app, ["use", "term-existing", "--prefix", "debug", "continue this"]
         )
 
     assert result.exit_code == 0
-    assert "Adopted agent_001" in result.output
+    assert "Adopted debug_001" in result.output
     show.assert_awaited_once_with("term-existing")
-    spawn.assert_called_once_with(tmp_path, "agent_001")
-    agent = state_mod.read_agent(tmp_path, "agent_001")
+    spawn.assert_called_once_with(tmp_path, "debug_001")
+    agent = state_mod.read_agent(tmp_path, "debug_001")
     assert agent["terminal"] == "term-existing"
     assert agent["prompt"] == "continue this"
     assert agent["watcher_pid"] == 9876

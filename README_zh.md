@@ -29,8 +29,8 @@ python -m pip install anyio typer rich
 python skill/osw.py init
 python skill/osw.py models pi
 
-python skill/osw.py new claude --model sonnet --thinking high "修复失败的测试"
-python skill/osw.py new codex --model gpt-5 --thinking medium "重构 provider 层"
+python skill/osw.py new claude --prefix code --model sonnet --thinking high "修复失败的测试"
+python skill/osw.py new codex --prefix research --model gpt-5 --thinking medium "重构 provider 层"
 python skill/osw.py list
 python skill/osw.py status
 ```
@@ -41,8 +41,8 @@ python skill/osw.py status
 |---|---|
 | `init` | 初始化 `.orca/osw/` 状态目录 |
 | `models <provider> [--json]` | 只读查看 provider 模型选项 |
-| `new <provider> [--model <model>] [--thinking <值>] "<提示>"` | 创建新的 agent 终端并发送任务 |
-| `use <agent-id-or-terminal> "<提示>"` | 接管已有 Orca 终端，或通过 OSW agent id 继续 |
+| `new <provider> [--prefix <prefix>] [--model <model>] [--thinking <值>] "<提示>"` | 创建新的 agent 终端并发送任务 |
+| `use <agent-id-or-terminal> [--prefix <prefix>] "<提示>"` | 接管已有 Orca 终端，或通过 OSW agent id 继续 |
 | `all "<消息>"` | 向所有受管 agent 广播消息 |
 | `del <agent_id> [--close]` | 移除 agent |
 | `list [--json]` | 列出受管 agent |
@@ -52,6 +52,7 @@ python skill/osw.py status
 ### 选项
 
 - `new` 的 provider 支持 `claude`、`codex`、`pi`。
+- `--prefix` 生成语义化 agent id，例如 `research_001`、`code_001`、`test_001`、`debug_001`、`review_001`、`misc_001`；省略时使用 `agent_NNN`。
 - `--model` 原样传给 provider。
 - `--thinking` 按 provider 转换：`claude --effort`、`codex -c model_reasoning_effort=...`、`pi --thinking`。
 - OSW 默认添加 provider 的非阻塞/批准类启动参数：`claude --dangerously-skip-permissions`、`codex --dangerously-bypass-approvals-and-sandbox`、`pi --approve`。
@@ -135,7 +136,7 @@ python -m pip install pytest
 python -m pytest -v
 ```
 
-共 68 个测试，覆盖每个模块的单元测试和基于 mock Orca CLI 的集成测试。
+共 69 个测试，覆盖每个模块的单元测试和基于 mock Orca CLI 的集成测试。
 
 ## 许可
 

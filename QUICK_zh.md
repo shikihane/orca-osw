@@ -30,13 +30,13 @@ python /path/to/orca-osw/skill/osw.py models pi
 ## 4. 创建 agent
 
 ```bash
-python /path/to/orca-osw/skill/osw.py new claude --model sonnet --thinking high "修复 src/auth.py 的失败测试"
+python /path/to/orca-osw/skill/osw.py new claude --prefix code --model sonnet --thinking high "修复 src/auth.py 的失败测试"
 ```
 
 输出：
 
 ```
-Created agent_001 on terminal term_xxx (provider: claude)
+Created code_001 on terminal term_xxx (provider: claude)
 ```
 
 ## 5. 查看状态
@@ -47,7 +47,7 @@ python /path/to/orca-osw/skill/osw.py list
 
 ```
 AGENT_ID     STATE            TERMINAL       CALLER         LAST_PROMPT
-agent_001    assigned         term_xxx       -              修复 src/auth.py 的失败测...
+code_001     assigned         term_xxx       -              修复 src/auth.py 的失败测...
 ```
 
 ```bash
@@ -86,7 +86,7 @@ python /path/to/orca-osw/skill/osw.py all "请暂停当前工作，等待新指�
 
 ```bash
 python /path/to/orca-osw/skill/osw.py use term_yyy "审查 PR 变更"
-python /path/to/orca-osw/skill/osw.py use agent_001 "继续这个任务"
+python /path/to/orca-osw/skill/osw.py use code_001 --prefix debug "继续这个任务"
 ```
 
 终端必须属于当前目录的 worktree。

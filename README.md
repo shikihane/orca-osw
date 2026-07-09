@@ -29,8 +29,8 @@ See [QUICK.md](QUICK.md) for a step-by-step walkthrough.
 python skill/osw.py init
 python skill/osw.py models pi
 
-python skill/osw.py new claude --model sonnet --thinking high "Fix the failing tests"
-python skill/osw.py new codex --model gpt-5 --thinking medium "Refactor the provider layer"
+python skill/osw.py new claude --prefix code --model sonnet --thinking high "Fix the failing tests"
+python skill/osw.py new codex --prefix research --model gpt-5 --thinking medium "Refactor the provider layer"
 python skill/osw.py list
 python skill/osw.py status
 ```
@@ -41,8 +41,8 @@ python skill/osw.py status
 |---|---|
 | `init` | Initialize `.orca/osw/` state directory |
 | `models <provider> [--json]` | Inspect provider model options without writing state |
-| `new <provider> [--model <model>] [--thinking <value>] "<prompt>"` | Create a new agent terminal with a task |
-| `use <agent-id-or-terminal> "<prompt>"` | Adopt an existing Orca terminal or continue from an OSW agent id |
+| `new <provider> [--prefix <prefix>] [--model <model>] [--thinking <value>] "<prompt>"` | Create a new agent terminal with a task |
+| `use <agent-id-or-terminal> [--prefix <prefix>] "<prompt>"` | Adopt an existing Orca terminal or continue from an OSW agent id |
 | `all "<message>"` | Broadcast a message to all managed agents |
 | `del <agent_id> [--close]` | Remove an agent from management |
 | `list [--json]` | List managed agents |
@@ -52,6 +52,7 @@ python skill/osw.py status
 ### Options
 
 - `new` accepts `claude`, `codex`, or `pi` as the provider.
+- `--prefix` gives semantic agent ids such as `research_001`, `code_001`, `test_001`, `debug_001`, `review_001`, or `misc_001`; omit it for `agent_NNN`.
 - `--model` is passed through unchanged.
 - `--thinking` is translated per provider: `claude --effort`, `codex -c model_reasoning_effort=...`, `pi --thinking`.
 - OSW adds the provider's non-blocking autonomy flag by default: `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`, `pi --approve`.
@@ -98,7 +99,7 @@ orca-osw/
       orca_cli.py     # async Orca CLI wrapper
       watcher.py      # detached completion watcher
       state.py        # state model and file I/O
-  tests/              # 62 tests (unit + integration)
+  tests/              # 69 tests (unit + integration)
   conftest.py         # sys.path setup for tests
 ```
 
@@ -135,7 +136,7 @@ python -m pip install pytest
 python -m pytest -v
 ```
 
-68 tests covering unit tests for every module and integration tests with mocked Orca CLI.
+69 tests covering unit tests for every module and integration tests with mocked Orca CLI.
 
 ## License
 

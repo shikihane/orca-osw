@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import anyio
 import pytest
 
 from osw import state
-from osw.watcher import Watcher, format_completion_report, one_line, scrub_tail
+from osw.watcher import Watcher, format_completion_report, one_line
 
 
 @pytest.fixture
@@ -28,16 +30,6 @@ def test_one_line_and_completion_report_are_single_line():
     assert "handoff=C:\\handoff.md" in line
     assert "done clean" in line
     assert "\n" not in line
-
-
-def test_scrub_tail_drops_tui_redraw_noise():
-    assert scrub_tail([
-        "useful",
-        "esc to interrupt spinner junk",
-        "",
-        "",
-        "done",
-    ]) == ["useful", "", "done"]
 
 
 @pytest.mark.anyio
@@ -143,6 +135,25 @@ async def test_launch_started_task_is_not_sent_again(tmp_path):
         await Watcher(tmp_path, "agent_001").run()
 
     assert [phase for phase, _ in sent] == ["handoff"]
+
+
+@pytest.mark.anyio
+async def test_finalize_report_omits_terminal_tail(tmp_path):
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    await watcher._finalize("error", "ready_failed", error="timeout")
+
+    agent = state.read_agent(tmp_path, "agent_001")
+    payload = json.loads(Path(agent["report_file"]).read_text(encoding="utf-8"))
+    assert "output_tail" not in payload
+    assert "terminal_status" not in payload
 
 
 @pytest.mark.anyio

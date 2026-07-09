@@ -356,6 +356,7 @@ def new(
     prompt: str,
     model: str = typer.Option(None, "--model", "-m", help="Provider model value passed through unchanged"),
     thinking: str = typer.Option(None, "--thinking", help="Provider thinking/effort value passed through unchanged"),
+    prefix: str = typer.Option(None, "--prefix", help="Agent id prefix, e.g. research, code, test, debug, review, misc"),
     caller_terminal: str = typer.Option(None, "--caller-terminal", help="Terminal handle to receive completion reports"),
 ) -> None:
     """Create a new provider agent terminal and return after starting its watcher."""
@@ -403,7 +404,7 @@ def new(
         typer.echo("Error: terminal create returned no handle")
         raise typer.Exit(1)
 
-    agent_id = alloc_agent_id(root)
+    agent_id = alloc_agent_id(root, prefix=prefix)
     agent = _base_agent(
         root,
         agent_id,
@@ -441,6 +442,7 @@ def new(
 def use(
     target: str = typer.Argument(..., help="OSW agent id or Orca terminal handle to adopt"),
     prompt: str = typer.Argument(..., help="Prompt to send to the terminal"),
+    prefix: str = typer.Option(None, "--prefix", help="Agent id prefix, e.g. research, code, test, debug, review, misc"),
     caller_terminal: str = typer.Option(None, "--caller-terminal", help="Terminal handle to receive completion reports"),
 ) -> None:
     """Adopt an already-running terminal as a managed agent."""
@@ -487,7 +489,7 @@ def use(
         raise typer.Exit(1)
 
     handle = _terminal_handle(data, fallback=terminal)
-    agent_id = alloc_agent_id(root)
+    agent_id = alloc_agent_id(root, prefix=prefix)
     agent = _base_agent(
         root,
         agent_id,

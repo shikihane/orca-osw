@@ -27,7 +27,6 @@ import anyio
 from osw.log import emit_event, enable_file_logging, get_logger, setup_logging
 from osw.orca_cli import (
     OrcaError,
-    terminal_read,
     terminal_send,
     terminal_show,
     terminal_wait,
@@ -74,31 +73,6 @@ def one_line(text: str, max_len: int = 0) -> str:
     if max_len and len(flat) > max_len:
         flat = flat[: max_len - 3] + "..."
     return flat
-
-
-def scrub_tail(lines: list[str], limit: int = 40) -> list[str]:
-    """Drop TUI redraw garbage from a terminal tail.
-
-    Agent TUIs redraw their status bar every spinner frame; Orca's line
-    capture concatenates those frames into multi-KB junk lines, all
-    carrying the "esc to interrupt" hint. Content lines are re-emitted
-    clean once they scroll out of the active area, so dropping the
-    dirty ones loses nothing.
-    """
-    kept: list[str] = []
-    blank = False
-    for line in lines:
-        if "esc to interrupt" in line:
-            continue
-        stripped = line.rstrip()
-        if not stripped:
-            if blank:
-                continue
-            blank = True
-        else:
-            blank = False
-        kept.append(stripped)
-    return kept[-limit:]
 
 
 def format_completion_report(
@@ -418,21 +392,6 @@ class Watcher:
             except OrcaError:
                 pass
 
-        # The terminal tail is evidence, not content: only captured when
-        # something went wrong and there is no handoff to read instead.
-        output_tail: list[str] = []
-        terminal_status = ""
-        if final_state == "error" or source == "handoff_missing":
-            try:
-                data = await terminal_read(self.handle, limit=100)
-                term = data.get("result", {}).get("terminal", {})
-                output_tail = scrub_tail(term.get("tail") or [])
-                terminal_status = term.get("status", "")
-            except OrcaError as exc:
-                log.warning(
-                    "watcher(%s): failed to capture tail: %s", self.agent_id, exc,
-                )
-
         report_payload = {
             "version": 3,
             "event": "task_finished",
@@ -446,8 +405,6 @@ class Watcher:
             "handoff_path": self.agent.get("handoff_path") or "",
             "last_assistant_message": last_msg,
             "error": error,
-            "terminal_status": terminal_status,
-            "output_tail": output_tail,
         }
         report_path = write_report(self.root, self.agent_id, report_payload)
         log.info("watcher(%s): report written to %s", self.agent_id, report_path)

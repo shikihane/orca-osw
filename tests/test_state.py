@@ -57,20 +57,29 @@ def test_alloc_agent_id_claims_files_atomically(tmp_path):
     assert state.alloc_agent_id(tmp_path) == "agent_002"
 
 
+def test_alloc_agent_id_uses_sanitized_prefix(tmp_path):
+    state.init_state_dir(tmp_path)
+
+    assert state.alloc_agent_id(tmp_path, prefix="Research") == "research_001"
+    assert state.alloc_agent_id(tmp_path, prefix="code-review") == "code_review_001"
+    assert state.alloc_agent_id(tmp_path, prefix="code review") == "code_review_002"
+    assert state.alloc_agent_id(tmp_path, prefix="!!!") == "agent_001"
+
+
 def test_agent_record_roundtrip_list_and_delete(tmp_path):
     state.init_state_dir(tmp_path)
 
     agent = {
-        "agent_id": "agent_001",
+        "agent_id": "research_001",
         "terminal": "term-a",
         "state": "assigned",
     }
     state.write_agent(tmp_path, agent)
 
-    assert state.read_agent(tmp_path, "agent_001") == agent
-    assert state.list_agents(tmp_path) == {"agent_001": agent}
-    assert state.delete_agent(tmp_path, "agent_001") is True
-    assert state.delete_agent(tmp_path, "agent_001") is False
+    assert state.read_agent(tmp_path, "research_001") == agent
+    assert state.list_agents(tmp_path) == {"research_001": agent}
+    assert state.delete_agent(tmp_path, "research_001") is True
+    assert state.delete_agent(tmp_path, "research_001") is False
     assert state.list_agents(tmp_path) == {}
 
 

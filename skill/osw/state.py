@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -85,7 +86,12 @@ def agent_file(root: Path, agent_id: str) -> Path:
     return agents_dir(root) / f"{agent_id}.json"
 
 
-def alloc_agent_id(root: Path) -> str:
+def _sanitize_agent_prefix(prefix: str | None) -> str:
+    value = re.sub(r"[^a-z0-9]+", "_", (prefix or "agent").lower()).strip("_")
+    return value or "agent"
+
+
+def alloc_agent_id(root: Path, prefix: str | None = None) -> str:
     """Claim the next free agent id atomically.
 
     The agent record file itself is the lock: `open(..., "x")` fails if
@@ -93,15 +99,15 @@ def alloc_agent_id(root: Path) -> str:
     move on to the next number.
     """
     agents_dir(root).mkdir(parents=True, exist_ok=True)
+    prefix = _sanitize_agent_prefix(prefix)
+    pattern = re.compile(rf"^{re.escape(prefix)}_(\d+)$")
     n = 1
-    for path in agents_dir(root).glob("agent_*.json"):
-        stem = path.stem
-        try:
-            n = max(n, int(stem.split("_")[1]) + 1)
-        except (IndexError, ValueError):
-            continue
+    for path in agents_dir(root).glob(f"{prefix}_*.json"):
+        match = pattern.match(path.stem)
+        if match:
+            n = max(n, int(match.group(1)) + 1)
     while True:
-        agent_id = f"agent_{n:03d}"
+        agent_id = f"{prefix}_{n:03d}"
         try:
             with agent_file(root, agent_id).open("x", encoding="utf-8") as f:
                 f.write("{}")
@@ -139,7 +145,7 @@ def list_agents(root: Path) -> dict[str, dict]:
     directory = agents_dir(root)
     if not directory.exists():
         return agents
-    for path in sorted(directory.glob("agent_*.json")):
+    for path in sorted(directory.glob("*.json")):
         try:
             with path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
