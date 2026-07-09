@@ -85,8 +85,8 @@ python /path/to/orca-osw/skill/osw.py all "请暂停当前工作，等待新指�
 ## 8. Adopt an existing terminal
 
 ```bash
-python /path/to/orca-osw/skill/osw.py use term_yyy "Review the PR changes"
-python /path/to/orca-osw/skill/osw.py use code_001 --prefix debug "Continue the task"
+python /path/to/orca-osw/skill/osw.py use term_yyy --prefix debug "Review the PR changes"
+python /path/to/orca-osw/skill/osw.py use code_001 "Continue the task"
 ```
 
 The terminal must belong to the current directory's worktree.

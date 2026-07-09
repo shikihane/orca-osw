@@ -219,7 +219,7 @@ def test_use_accepts_existing_agent_id(tmp_path, monkeypatch):
         "model_name": "",
         "thinking": "",
         "task_started_on_launch": True,
-        "state": "assigned",
+        "state": "done",
         "phase": "",
         "caller_terminal": None,
         "prompt": "old task",
@@ -243,8 +243,96 @@ def test_use_accepts_existing_agent_id(tmp_path, monkeypatch):
         result = runner.invoke(app, ["use", "agent_001", "continue this"])
 
     assert result.exit_code == 0
+    assert "Reused agent_001" in result.output
     show.assert_awaited_once_with("term-existing")
-    spawn.assert_called_once_with(tmp_path, "agent_002")
+    spawn.assert_called_once_with(tmp_path, "agent_001")
+    agent = state_mod.read_agent(tmp_path, "agent_001")
+    assert agent["terminal"] == "term-existing"
+    assert agent["prompt"] == "continue this"
+    assert agent["provider"] == "claude"
+
+
+def test_use_existing_agent_id_reuses_same_id(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "research_099",
+        "terminal": "term-existing",
+        "worktree_path": str(tmp_path),
+        "state": "done",
+        "prompt": "old research",
+    })
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "research_100",
+        "terminal": "term-other",
+        "worktree_path": str(tmp_path),
+        "state": "done",
+        "prompt": "other research",
+    })
+
+    show = AsyncMock(return_value={
+        "result": {
+            "terminal": {
+                "handle": "term-existing",
+                "worktreePath": str(tmp_path),
+            }
+        }
+    })
+    spawn = Mock(return_value=9876)
+    with patch("osw.cli.terminal_show", show), \
+         patch("osw.cli._spawn_watcher", spawn):
+        result = runner.invoke(app, ["use", "research_099", "continue this"])
+
+    assert result.exit_code == 0
+    assert "Reused research_099" in result.output
+    show.assert_awaited_once_with("term-existing")
+    spawn.assert_called_once_with(tmp_path, "research_099")
+    agent = state_mod.read_agent(tmp_path, "research_099")
+    assert agent["terminal"] == "term-existing"
+    assert agent["prompt"] == "continue this"
+
+
+def test_use_existing_agent_id_rejects_prefix(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "research_001",
+        "terminal": "term-existing",
+        "worktree_path": str(tmp_path),
+        "state": "done",
+        "prompt": "old research",
+    })
+
+    show = AsyncMock(return_value={})
+    with patch("osw.cli.terminal_show", show):
+        result = runner.invoke(
+            app,
+            ["use", "research_001", "--prefix", "debug", "continue this"],
+        )
+
+    assert result.exit_code == 1
+    assert "--prefix is only valid when adopting a terminal handle" in result.output
+    show.assert_not_awaited()
+
+
+def test_use_existing_agent_id_rejects_unfinished_agent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "research_001",
+        "terminal": "term-existing",
+        "worktree_path": str(tmp_path),
+        "state": "working",
+        "prompt": "old research",
+    })
+
+    show = AsyncMock(return_value={})
+    with patch("osw.cli.terminal_show", show):
+        result = runner.invoke(app, ["use", "research_001", "continue this"])
+
+    assert result.exit_code == 1
+    assert "agent 'research_001' is not finished" in result.output
+    show.assert_not_awaited()
 
 
 def test_use_rejects_wrong_worktree(tmp_path, monkeypatch):

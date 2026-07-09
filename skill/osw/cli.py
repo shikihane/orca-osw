@@ -132,12 +132,12 @@ def _terminal_worktree_path(terminal: dict) -> str:
     return str(terminal.get("cwd") or "")
 
 
-def _resolve_terminal_arg(root: Path, value: str) -> str:
+def _resolve_terminal_arg(root: Path, value: str) -> tuple[str, dict | None]:
     try:
         agent = read_agent(root, value)
     except FileNotFoundError:
-        return value
-    return str(agent.get("terminal") or value)
+        return value, None
+    return str(agent.get("terminal") or value), agent
 
 
 def _script_path() -> Path:
@@ -449,7 +449,16 @@ def use(
     root = resolve_project_root()
     enable_file_logging(logs_dir(root))
     _read_state_or_exit(root)
-    terminal = _resolve_terminal_arg(root, target)
+    terminal, existing_agent = _resolve_terminal_arg(root, target)
+    if existing_agent and prefix:
+        typer.echo(
+            "Error: --prefix is only valid when adopting a terminal handle, "
+            "not an existing agent id"
+        )
+        raise typer.Exit(1)
+    if existing_agent and existing_agent.get("state") not in ("done", "error", "lost"):
+        typer.echo(f"Error: agent '{target}' is not finished")
+        raise typer.Exit(1)
     emit_event(
         logs_dir(root),
         component="cli",
@@ -489,13 +498,21 @@ def use(
         raise typer.Exit(1)
 
     handle = _terminal_handle(data, fallback=terminal)
-    agent_id = alloc_agent_id(root, prefix=prefix)
+    agent_id = (
+        str(existing_agent.get("agent_id"))
+        if existing_agent
+        else alloc_agent_id(root, prefix=prefix)
+    )
     agent = _base_agent(
         root,
         agent_id,
         handle,
         prompt,
         _maybe_detect_caller(caller_terminal),
+        provider=str((existing_agent or {}).get("provider") or ""),
+        provider_command=str((existing_agent or {}).get("provider_command") or ""),
+        model_name=str((existing_agent or {}).get("model_name") or ""),
+        thinking=str((existing_agent or {}).get("thinking") or ""),
     )
 
     try:
@@ -504,7 +521,8 @@ def use(
         typer.echo(f"Error: failed to start watcher: {exc}")
         raise typer.Exit(1)
 
-    typer.echo(f"Adopted {agent_id} on terminal {handle}")
+    verb = "Reused" if existing_agent else "Adopted"
+    typer.echo(f"{verb} {agent_id} on terminal {handle}")
     emit_event(
         logs_dir(root),
         component="cli",

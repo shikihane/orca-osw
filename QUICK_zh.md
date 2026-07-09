@@ -85,8 +85,8 @@ python /path/to/orca-osw/skill/osw.py all "请暂停当前工作，等待新指�
 ## 8. 接管已有终端
 
 ```bash
-python /path/to/orca-osw/skill/osw.py use term_yyy "审查 PR 变更"
-python /path/to/orca-osw/skill/osw.py use code_001 --prefix debug "继续这个任务"
+python /path/to/orca-osw/skill/osw.py use term_yyy --prefix debug "审查 PR 变更"
+python /path/to/orca-osw/skill/osw.py use code_001 "继续这个任务"
 ```
 
 终端必须属于当前目录的 worktree。

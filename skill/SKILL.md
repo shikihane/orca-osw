@@ -26,6 +26,9 @@ in the same directory as this `SKILL.md`.
 Prefer semantic prefixes for agent ids: `research`, `code`, `test`,
 `debug`, `review`, or `misc`. Without `--prefix`, OSW uses the default
 `agent_NNN` sequence.
+When `use` targets an existing OSW agent id, OSW reuses that same agent
+id and terminal context. In that mode, do not pass `--prefix`; it is only
+for `new` and for adopting a bare terminal handle.
 
 The CLI does not write `CLAUDE.md`; the operator or LLM should record
 agent allocation there after the planning conversation.
@@ -43,7 +46,7 @@ There is no long-running `serve` daemon.
 - `python <skill-dir>/osw.py init` - initialize state and scan agent CLIs
 - `python <skill-dir>/osw.py models <provider> [--json]` - inspect provider model options without writing OSW state
 - `python <skill-dir>/osw.py new <provider> [--prefix <prefix>] [--model <model>] [--thinking <value>] "<prompt>"` - create an agent terminal, register it, start one detached watcher, then return
-- `python <skill-dir>/osw.py use <agent-id-or-terminal> [--prefix <prefix>] "<prompt>"` - adopt an existing terminal in the current worktree and start one detached watcher
+- `python <skill-dir>/osw.py use <agent-id-or-terminal> [--prefix <prefix>] "<prompt>"` - reuse an existing agent id or adopt a terminal handle and start one detached watcher
 - `python <skill-dir>/osw.py all "<message>"` - send a one-line message to every unfinished managed agent
 - `python <skill-dir>/osw.py del <agent_id> [--close]` - stop the watcher record and optionally close the terminal
 - `python <skill-dir>/osw.py list [--json]` - list managed agents by reading `.orca/osw/agents/*.json` and one `orca worktree ps --json` snapshot

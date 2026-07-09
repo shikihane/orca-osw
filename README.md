@@ -53,6 +53,7 @@ python skill/osw.py status
 
 - `new` accepts `claude`, `codex`, or `pi` as the provider.
 - `--prefix` gives semantic agent ids such as `research_001`, `code_001`, `test_001`, `debug_001`, `review_001`, or `misc_001`; omit it for `agent_NNN`.
+- `use <agent-id>` reuses that exact agent id and terminal context; `--prefix` is only for `new` or `use <terminal-handle>`.
 - `--model` is passed through unchanged.
 - `--thinking` is translated per provider: `claude --effort`, `codex -c model_reasoning_effort=...`, `pi --thinking`.
 - OSW adds the provider's non-blocking autonomy flag by default: `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`, `pi --approve`.
@@ -99,7 +100,7 @@ orca-osw/
       orca_cli.py     # async Orca CLI wrapper
       watcher.py      # detached completion watcher
       state.py        # state model and file I/O
-  tests/              # 69 tests (unit + integration)
+  tests/              # 72 tests (unit + integration)
   conftest.py         # sys.path setup for tests
 ```
 
@@ -136,7 +137,7 @@ python -m pip install pytest
 python -m pytest -v
 ```
 
-69 tests covering unit tests for every module and integration tests with mocked Orca CLI.
+72 tests covering unit tests for every module and integration tests with mocked Orca CLI.
 
 ## License
 

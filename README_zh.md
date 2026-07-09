@@ -53,6 +53,7 @@ python skill/osw.py status
 
 - `new` 的 provider 支持 `claude`、`codex`、`pi`。
 - `--prefix` 生成语义化 agent id，例如 `research_001`、`code_001`、`test_001`、`debug_001`、`review_001`、`misc_001`；省略时使用 `agent_NNN`。
+- `use <agent-id>` 会复用这个确切的 agent id 和终端上下文；`--prefix` 只用于 `new` 或 `use <terminal-handle>`。
 - `--model` 原样传给 provider。
 - `--thinking` 按 provider 转换：`claude --effort`、`codex -c model_reasoning_effort=...`、`pi --thinking`。
 - OSW 默认添加 provider 的非阻塞/批准类启动参数：`claude --dangerously-skip-permissions`、`codex --dangerously-bypass-approvals-and-sandbox`、`pi --approve`。
@@ -136,7 +137,7 @@ python -m pip install pytest
 python -m pytest -v
 ```
 
-共 69 个测试，覆盖每个模块的单元测试和基于 mock Orca CLI 的集成测试。
+共 72 个测试，覆盖每个模块的单元测试和基于 mock Orca CLI 的集成测试。
 
 ## 许可
 
