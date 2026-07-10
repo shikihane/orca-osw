@@ -2,13 +2,13 @@
 
 [中文版](README_zh.md)
 
-A lightweight Python tool for managing Orca-backed agent sessions from the current directory. OSW starts or adopts agent terminals, launches detached watchers, detects task completion through idle signals, forces a handoff pass, and reports the resulting handoff file back to the caller.
+A lightweight Python tool for managing Orca-backed agent sessions from the current directory. OSW starts or adopts agent terminals, launches detached watchers, detects task completion through Orca's native agent state (with idle-signal fallback), forces a handoff pass, and reports the resulting handoff file back to the caller.
 
 ## Features
 
 - **Directory-scoped** — each working directory is an independent management scope, even across git worktrees
 - **Detached watchers** — each managed agent gets a watcher process that monitors completion without blocking the CLI
-- **Automatic handoff** — detects agent idle, triggers `/handoff`, extracts `HANDOFF_*.md`, notifies the caller terminal
+- **Automatic handoff** — detects task completion, sends a fixed wrap-up instruction with a pre-allocated handoff path, verifies the handoff markdown, notifies the caller terminal
 - **Minimal dependencies** — only `anyio`, `typer`, and optionally `rich` for colored logs
 
 ## Requirements
@@ -76,12 +76,11 @@ OSW owns orchestration only: state initialization, Orca terminal creation/adopti
 ### Watcher Lifecycle
 
 ```
-task prompt sent
- → wait for tui-idle (up to 10 min)
- → send forced /handoff prompt
- → wait for tui-idle again (up to 2 min)
- → extract HANDOFF_*.md filename from output
- → report to caller terminal
+task prompt sent (or passed on launch by `new`)
+ → wait until Orca reports the turn done (`worktree ps`; idle fallback for untracked CLIs)
+ → send the fixed wrap-up instruction with a pre-allocated handoff path
+ → wait again, verify .orca/osw/handoffs/<agent>_<ts>.md exists (one retry)
+ → write a JSON report and notify the caller terminal
 ```
 
 ## Directory Layout
@@ -91,16 +90,19 @@ task prompt sent
 ```
 orca-osw/
   skill/
-    SKILL.md          # Codex skill definition
+    SKILL.md          # skill definition
+    references/       # orchestration and operations guides
     osw.py            # entry point
     osw/
       cli.py          # typer CLI commands
       deps.py         # dependency checker
-      handoff.py      # handoff extraction and reporting
+      log.py          # structured events and file logging
       orca_cli.py     # async Orca CLI wrapper
-      watcher.py      # detached completion watcher
+      process.py      # hidden subprocess helpers (Windows)
+      providers.py    # provider commands and model discovery
       state.py        # state model and file I/O
-  tests/              # 72 tests (unit + integration)
+      watcher.py      # detached completion watcher
+  tests/              # 79 tests (unit + integration)
   conftest.py         # sys.path setup for tests
 ```
 
@@ -137,7 +139,7 @@ python -m pip install pytest
 python -m pytest -v
 ```
 
-72 tests covering unit tests for every module and integration tests with mocked Orca CLI.
+79 tests covering unit tests for every module and integration tests with mocked Orca CLI.
 
 ## License
 

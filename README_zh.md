@@ -2,13 +2,13 @@
 
 [English](README.md)
 
-轻量 Python 工具，用于在当前目录管理 Orca 支持的 agent 会话。OSW 启动或接管 agent 终端，启动 detached watcher，通过空闲信号检测任务完成，强制执行交接流程，并将生成的交接文件报告给调用方。
+轻量 Python 工具，用于在当前目录管理 Orca 支持的 agent 会话。OSW 启动或接管 agent 终端，启动 detached watcher，通过 Orca 原生 agent 状态检测任务完成（空闲信号作为回退），强制执行交接流程，并将生成的交接文件报告给调用方。
 
 ## 特性
 
 - **目录隔离** — 每个工作目录是独立的管理范围，即使跨 git worktree 也互不影响
 - **Detached watcher** — 每个受管 agent 都有独立 watcher 进程，监控完成状态且不阻塞 CLI
-- **自动交接** — 检测 agent 空闲后自动触发 `/handoff`，提取 `HANDOFF_*.md` 文件名，通知调用方终端
+- **自动交接** — 检测任务完成后发送固定的收尾指令（含预分配的交接文件路径），校验交接 markdown 已写入，通知调用方终端
 - **最少依赖** — 仅需 `anyio`、`typer`，可选 `rich` 获得彩色日志
 
 ## 环境要求
@@ -76,12 +76,11 @@ OSW 只负责编排：初始化状态、创建或接管 Orca 终端、启动 det
 ### 观察者生命周期
 
 ```
-发送任务提示
- → 等待 tui-idle（最长 10 分钟）
- → 发送强制 /handoff 提示
- → 再次等待 tui-idle（最长 2 分钟）
- → 从输出中提取 HANDOFF_*.md 文件名
- → 向调用方终端报告
+发送任务提示（`new` 则随启动命令直接带上）
+ → 等待 Orca 报告该轮完成（`worktree ps`；未识别 CLI 回退到空闲检测）
+ → 发送固定收尾指令，附带预分配的交接文件路径
+ → 再次等待，校验 .orca/osw/handoffs/<agent>_<ts>.md 已写入（重试一次）
+ → 写入 JSON 报告并通知调用方终端
 ```
 
 ## 目录布局
@@ -91,16 +90,19 @@ OSW 只负责编排：初始化状态、创建或接管 Orca 终端、启动 det
 ```
 orca-osw/
   skill/
-    SKILL.md          # Codex skill 定义
+    SKILL.md          # skill 定义
+    references/       # 编排与运维指南
     osw.py            # 入口
     osw/
       cli.py          # typer CLI 命令
       deps.py         # 依赖检查
-      handoff.py      # 交接提取与报告
+      log.py          # 结构化事件与文件日志
       orca_cli.py     # 异步 Orca CLI 包装
-      watcher.py      # detached 完成状态 watcher
+      process.py      # 隐藏子进程窗口辅助（Windows）
+      providers.py    # provider 命令构造与模型发现
       state.py        # 状态模型与文件 I/O
-  tests/              # 62 个测试（单元 + 集成）
+      watcher.py      # detached 完成状态 watcher
+  tests/              # 79 个测试（单元 + 集成）
   conftest.py         # 测试用 sys.path 配置
 ```
 
@@ -137,7 +139,7 @@ python -m pip install pytest
 python -m pytest -v
 ```
 
-共 72 个测试，覆盖每个模块的单元测试和基于 mock Orca CLI 的集成测试。
+共 79 个测试，覆盖每个模块的单元测试和基于 mock Orca CLI 的集成测试。
 
 ## 许可
 

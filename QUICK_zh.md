@@ -46,8 +46,8 @@ python /path/to/orca-osw/skill/osw.py list
 ```
 
 ```
-AGENT_ID     STATE            TERMINAL       CALLER         LAST_PROMPT
-code_001     assigned         term_xxx       -              修复 src/auth.py 的失败测...
+AGENT_ID     STATE        ORCA       WATCHER  TERMINAL       PROMPT
+code_001     working      working    yes      term_xxx       修复 src/auth.py 的失败测试
 ```
 
 ```bash
@@ -57,23 +57,21 @@ python /path/to/orca-osw/skill/osw.py status
 ```
 State file: /你的/项目/.orca/osw/state.json
 Agents:
-  assigned: 1
+  working: 1
+Watchers running: 1
 ```
 
 ## 6. 自动交接流程
 
-当 agent 完成任务并进入空闲：
+当 Orca 报告该轮完成时（`worktree ps`；未识别的 CLI 回退到空闲检测）：
 
-1. watcher 检测到 tui-idle
-2. 发送强制 `/handoff` 提示
-3. agent 生成 `HANDOFF_*.md` 文件
-4. 如果设置了 `--caller-terminal`，watcher 发送完成报告：
+1. watcher 发送固定的单行收尾指令，附带预分配的交接文件路径
+2. agent 把交接 markdown 写入 `.orca/osw/handoffs/<agent>_<ts>.md`（会校验，重试一次）
+3. watcher 把 JSON 报告写入 `.orca/osw/reports/`
+4. 调用方终端（TTY 下自动检测，或通过 `--caller-terminal` 指定）收到单行完成报告：
 
 ```
-子任务完成。
-agent: agent_001
-terminal: term_xxx
-handoff: HANDOFF_fix_auth_tests.md
+# [osw] task-finished agent=code_001 terminal=term_xxx report=... handoff=... summary=...
 ```
 
 ## 7. 广播消息

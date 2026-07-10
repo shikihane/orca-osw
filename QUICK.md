@@ -46,8 +46,8 @@ python /path/to/orca-osw/skill/osw.py list
 ```
 
 ```
-AGENT_ID     STATE            TERMINAL       CALLER         LAST_PROMPT
-code_001     assigned         term_xxx       -              Fix the failing tests in sr...
+AGENT_ID     STATE        ORCA       WATCHER  TERMINAL       PROMPT
+code_001     working      working    yes      term_xxx       Fix the failing tests in src/auth.py
 ```
 
 ```bash
@@ -57,23 +57,21 @@ python /path/to/orca-osw/skill/osw.py status
 ```
 State file: /your/project/.orca/osw/state.json
 Agents:
-  assigned: 1
+  working: 1
+Watchers running: 1
 ```
 
 ## 6. What happens automatically
 
-When the agent finishes its task and goes idle:
+When Orca reports the agent's turn as done (`worktree ps`; untracked CLIs fall back to idle detection):
 
-1. The watcher detects tui-idle
-2. Sends a forced `/handoff` prompt
-3. The agent generates a `HANDOFF_*.md` file
-4. If `--caller-terminal` was set, the watcher sends a completion report:
+1. The watcher sends a fixed single-line wrap-up instruction with a pre-allocated handoff path
+2. The agent writes the handoff markdown to `.orca/osw/handoffs/<agent>_<ts>.md` (verified, one retry)
+3. The watcher writes a JSON report to `.orca/osw/reports/`
+4. The caller terminal (auto-detected when run from a TTY, or set via `--caller-terminal`) receives a single-line report:
 
 ```
-子任务完成。
-agent: agent_001
-terminal: term_xxx
-handoff: HANDOFF_fix_auth_tests.md
+# [osw] task-finished agent=code_001 terminal=term_xxx report=... handoff=... summary=...
 ```
 
 ## 7. Broadcast to all agents
