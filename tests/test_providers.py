@@ -5,7 +5,6 @@ import pytest
 from osw.providers import (
     CODEX_EFFORTS,
     ProviderError,
-    build_launch_command,
     build_provider_command,
     codex_variants,
     parse_claude_aliases,
@@ -69,20 +68,6 @@ def test_codex_variants_without_config():
             "command": "codex -c model_reasoning_effort=medium"} in variants
 
 
-def test_build_launch_command_for_claude():
-    command = build_launch_command(
-        "claude",
-        "do the task",
-        model="sonnet",
-        thinking="high",
-    )
-
-    assert command == (
-        'claude --dangerously-skip-permissions --model sonnet --effort high '
-        '"do the task"'
-    )
-
-
 def test_build_provider_command_for_claude():
     command = build_provider_command(
         "claude",
@@ -93,43 +78,37 @@ def test_build_provider_command_for_claude():
     assert command == "claude --dangerously-skip-permissions --model sonnet --effort high"
 
 
-def test_build_launch_command_for_codex():
-    command = build_launch_command(
+def test_build_provider_command_for_codex():
+    command = build_provider_command(
         "codex",
-        "do the task",
         model="gpt-5",
         thinking="medium",
     )
 
     assert command == (
         "codex --dangerously-bypass-approvals-and-sandbox "
-        '-c model_reasoning_effort=medium -m gpt-5 "do the task"'
+        "-c model_reasoning_effort=medium -m gpt-5"
     )
 
 
-def test_build_launch_command_for_pi():
-    command = build_launch_command(
+def test_build_provider_command_for_pi():
+    command = build_provider_command(
         "pi",
-        "do the task",
         model="deepseek/deepseek-v4-pro",
         thinking="low",
     )
 
-    assert command == (
-        'pi --approve --model deepseek/deepseek-v4-pro --thinking low "do the task"'
+    assert command == "pi --approve --model deepseek/deepseek-v4-pro --thinking low"
+
+
+def test_build_provider_command_omits_optional_flags():
+    assert build_provider_command("claude") == "claude --dangerously-skip-permissions"
+    assert build_provider_command("codex") == (
+        "codex --dangerously-bypass-approvals-and-sandbox"
     )
+    assert build_provider_command("pi") == "pi --approve"
 
 
-def test_build_launch_command_omits_optional_flags():
-    assert build_launch_command("claude", "do the task") == (
-        'claude --dangerously-skip-permissions "do the task"'
-    )
-    assert build_launch_command("codex", "do the task") == (
-        'codex --dangerously-bypass-approvals-and-sandbox "do the task"'
-    )
-    assert build_launch_command("pi", "do the task") == 'pi --approve "do the task"'
-
-
-def test_build_launch_command_rejects_unknown_provider():
+def test_build_provider_command_rejects_unknown_provider():
     with pytest.raises(ProviderError, match="unsupported provider 'gemini'"):
-        build_launch_command("gemini", "do the task")
+        build_provider_command("gemini")

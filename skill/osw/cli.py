@@ -35,7 +35,6 @@ from osw.orca_cli import (
 from osw.process import hidden_subprocess_kwargs
 from osw.providers import (
     ProviderError,
-    build_launch_command,
     build_provider_command,
     probe_variants,
     scan_agent_clis,
@@ -186,7 +185,6 @@ def _base_agent(
     provider_command: str = "",
     model_name: str = "",
     thinking: str = "",
-    task_started_on_launch: bool = False,
 ) -> dict:
     now = now_iso()
     return {
@@ -197,7 +195,6 @@ def _base_agent(
         "provider_command": provider_command,
         "model_name": model_name,
         "thinking": thinking,
-        "task_started_on_launch": task_started_on_launch,
         "state": "assigned",
         "phase": "",
         "caller_terminal": caller_terminal,
@@ -372,14 +369,15 @@ def new(
     )
 
     try:
-        launch_command = build_launch_command(provider, prompt, model, thinking)
         provider_command = build_provider_command(provider, model, thinking)
     except ProviderError as exc:
         typer.echo(f"Error: {exc}")
         raise typer.Exit(1)
 
+    # The terminal starts the bare provider TUI only; the watcher sends
+    # the task prompt as its own observable turn once the TUI is ready.
     try:
-        result = anyio.run(terminal_create, launch_command)
+        result = anyio.run(terminal_create, provider_command)
     except OrcaError as exc:
         emit_event(
             logs_dir(root),
@@ -387,7 +385,7 @@ def new(
             event="terminal_create_failed",
             level="ERROR",
             message=exc.message,
-            data={"command": launch_command},
+            data={"command": provider_command},
         )
         typer.echo(f"Error: {exc.message}")
         raise typer.Exit(1)
@@ -415,7 +413,6 @@ def new(
         provider_command=provider_command,
         model_name=model or "",
         thinking=thinking or "",
-        task_started_on_launch=True,
     )
 
     try:

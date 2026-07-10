@@ -76,12 +76,16 @@ OSW 只负责编排：初始化状态、创建或接管 Orca 终端、启动 det
 ### 观察者生命周期
 
 ```
-发送任务提示（`new` 则随启动命令直接带上）
- → 等待 Orca 报告该轮完成（`worktree ps`；未识别 CLI 回退到空闲检测）
+等待面板就绪（`worktree ps` 报告 done；未识别 CLI 回退到 tui-idle）
+ → 发送任务提示
+ → 等待 Orca 报告该轮完成（`worktree ps`，与发送时间相关联；未识别 CLI 回退到空闲检测）
  → 发送固定收尾指令，附带预分配的交接文件路径
  → 再次等待，校验 .orca/osw/handoffs/<agent>_<ts>.md 已写入（重试一次）
  → 写入 JSON 报告并通知调用方终端
 ```
+
+`new` 只启动裸 provider TUI——任务提示始终由 watcher 作为独立一轮发送，
+因此启动瞬间的 TUI 空闲状态不可能被误判为任务完成。
 
 ## 目录布局
 

@@ -33,7 +33,7 @@ Agent ids use `<prefix>_NNN`, for example `agent_001`, `research_001`, or
 
 Tests use `pytest` and `typer.testing.CliRunner`. Add or update tests before
 changing behavior. Prefer focused tests near the affected module, such as
-`tests/test_providers.py` for launch command formatting and `tests/test_cli.py`
+`tests/test_providers.py` for provider command formatting and `tests/test_cli.py`
 for user-visible CLI behavior. Mock Orca calls with `AsyncMock`; do not require
 a live Orca instance for unit tests.
 

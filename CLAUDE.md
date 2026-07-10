@@ -43,20 +43,22 @@ python skill/osw.py logs --agent <agent_id>
 
 Module responsibilities (keep code in its lane):
 
-- `skill/osw/cli.py` — all typer commands. `new` builds the provider launch
-  command, creates an Orca terminal, allocates an agent id, writes the agent
-  record, spawns the watcher. `use` adopts an existing terminal after
-  `terminal_show` confirms it belongs to the current worktree; passing an
-  existing agent id reuses that id (only allowed once the agent is
-  done/error/lost). The hidden `watch` command is the watcher process entry
-  point.
+- `skill/osw/cli.py` — all typer commands. `new` creates an Orca terminal
+  running the bare provider TUI (never the task prompt — the watcher sends
+  it), allocates an agent id, writes the agent record, spawns the watcher.
+  `use` adopts an existing terminal after `terminal_show` confirms it belongs
+  to the current worktree; passing an existing agent id reuses that id (only
+  allowed once the agent is done/error/lost). The hidden `watch` command is
+  the watcher process entry point.
 - `skill/osw/watcher.py` — per-agent detached supervisor, one process per
-  dispatched task. Two-phase state machine: phase "task" (send prompt, wait
-  for the turn to finish) then phase "handoff" (send the fixed
-  `HANDOFF_TEMPLATE` instruction, verify the handoff markdown exists, retry
-  once). Finally writes a JSON report and notifies the caller terminal with a
-  single-line `# [osw] ...` message. Also notifies on `AskUserQuestion` waits
-  and 5-minute stalls.
+  dispatched task; `new` and `use` share this one state machine. Readiness
+  first (`worktree ps` "done" for tracked panes, `tui-idle` fallback for
+  untracked ones), then phase "task" (send prompt, wait for the turn to
+  finish) then phase "handoff" (send the fixed `HANDOFF_TEMPLATE`
+  instruction, verify the handoff markdown exists, retry once). Finally
+  writes a JSON report and notifies the caller terminal with a single-line
+  `# [osw] ...` message. Also notifies on `AskUserQuestion` waits and
+  5-minute stalls.
 - `skill/osw/orca_cli.py` — thin async wrapper around `orca ... --json` via
   `anyio.run_process`; raises `OrcaError`. Caller-terminal detection prints a
   UUID marker and finds which terminal's preview contains it (`terminal show`
@@ -75,9 +77,11 @@ Module responsibilities (keep code in its lane):
 
 Completion detection: the watcher maps the terminal to a `paneKey`
 (`tabId:leafId`) and polls `orca worktree ps --json` for that pane's agent
-entry (`state == "done"` with `stateStartedAt` after the prompt was sent).
-CLIs Orca does not recognize (e.g. `pi`) fall back to `lastOutputAt`
-stable-idle detection (60s of silence).
+entry (`state == "done"` with `stateStartedAt` after the prompt was sent and
+newer than the pane's pre-send "done" timestamp). An idle observation alone
+is never completion — a turn with no task-correlated evidence fails closed
+as `error`, not `done`. CLIs Orca does not recognize (e.g. `pi`) fall back
+to `lastOutputAt` stable-idle detection (60s of silence after new output).
 
 Ownership invariant: the CLI writes the agent record at creation; after the
 watcher starts, the watcher process is the only writer. `list`/`status` merge

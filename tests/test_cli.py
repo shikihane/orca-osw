@@ -121,15 +121,17 @@ def test_new_creates_provider_terminal_agent_file_and_detaches_watcher(tmp_path,
     assert result.exit_code == 0
     assert "Created research_001" in result.output
     assert "(provider: claude)" in result.output
+    # The launch command must not embed the task prompt: the watcher
+    # sends it as its own observable turn once the TUI is ready.
     create.assert_awaited_once_with(
-        'claude --dangerously-skip-permissions --model sonnet --effort high "do the task"'
+        "claude --dangerously-skip-permissions --model sonnet --effort high"
     )
     spawn.assert_called_once_with(tmp_path, "research_001")
 
     agent = state_mod.read_agent(tmp_path, "research_001")
     assert agent["terminal"] == "term-new"
     assert agent["prompt"] == "do the task"
-    assert agent["task_started_on_launch"] is True
+    assert "task_started_on_launch" not in agent
     assert agent["caller_terminal"] == "caller-1"
     assert agent["provider"] == "claude"
     assert agent["model_name"] == "sonnet"

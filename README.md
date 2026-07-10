@@ -76,12 +76,17 @@ OSW owns orchestration only: state initialization, Orca terminal creation/adopti
 ### Watcher Lifecycle
 
 ```
-task prompt sent (or passed on launch by `new`)
- → wait until Orca reports the turn done (`worktree ps`; idle fallback for untracked CLIs)
+wait until the pane is ready (`worktree ps` reports it done; tui-idle fallback for untracked CLIs)
+ → send the task prompt
+ → wait until Orca reports the turn done (`worktree ps`, correlated with the send time; idle fallback for untracked CLIs)
  → send the fixed wrap-up instruction with a pre-allocated handoff path
  → wait again, verify .orca/osw/handoffs/<agent>_<ts>.md exists (one retry)
  → write a JSON report and notify the caller terminal
 ```
+
+`new` starts the bare provider TUI only — the watcher always sends the task
+prompt as its own turn, so a briefly idle TUI at startup can never be
+mistaken for a completed task.
 
 ## Directory Layout
 

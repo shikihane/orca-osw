@@ -43,22 +43,16 @@ class ProviderError(ValueError):
     pass
 
 
-def build_launch_command(
-    provider: str,
-    prompt: str,
-    model: str | None = None,
-    thinking: str | None = None,
-) -> str:
-    """Build the provider CLI command OSW should run in an Orca terminal."""
-    return f"{build_provider_command(provider, model, thinking)} {_quote_command_arg(prompt)}"
-
-
 def build_provider_command(
     provider: str,
     model: str | None = None,
     thinking: str | None = None,
 ) -> str:
-    """Build the provider CLI command without the user prompt."""
+    """Build the provider CLI command OSW runs in an Orca terminal.
+
+    Never includes the task prompt: the watcher sends the prompt as a
+    separate, observable turn once the TUI is ready.
+    """
     provider = provider.strip()
     if provider not in SUPPORTED_PROVIDERS:
         expected = ", ".join(SUPPORTED_PROVIDERS)

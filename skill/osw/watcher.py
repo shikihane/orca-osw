@@ -3,13 +3,21 @@
 One watcher process per dispatched task, spawned detached by `osw new`
 / `osw use` and gone when the task is settled. No daemon: Orca itself
 is the source of truth (`worktree ps` reports each recognized agent
-TUI's state/prompt/tool), the watcher just polls it and drives a
-two-phase completion flow:
+TUI's state/prompt/tool), the watcher just polls it and drives one
+shared flow for `new` and `use`:
 
+  ready:            wait until the pane can accept a prompt
+                    (`worktree ps` "done" for tracked panes,
+                    `tui-idle` fallback otherwise)
   phase "task":     send the prompt, wait until Orca reports the
                     agent's turn is done
   phase "handoff":  send the fixed wrap-up instruction, wait again,
                     then verify the handoff markdown exists
+
+An idle observation is never proof that a turn completed: completion
+always requires task-correlated evidence (a "done" state that started
+after the prompt was sent and is newer than the pane's pre-send state,
+or new output followed by stable silence for untracked CLIs).
 
 CLIs Orca does not recognize (no `agents` entry in `worktree ps`)
 fall back to lastOutputAt idle detection.
@@ -231,30 +239,22 @@ class Watcher:
             self.agent_id, self.handle, os.getpid(),
         )
 
-        task_started_on_launch = bool(self.agent.get("task_started_on_launch"))
-        try:
-            self._event("ready_wait_started")
-            ready_timeout = (
-                HARD_TIMEOUT_SECS * 1000
-                if task_started_on_launch else READY_TIMEOUT_MS
-            )
-            await terminal_wait(self.handle, "tui-idle", timeout_ms=ready_timeout)
-            self._event("ready_wait_finished")
-        except OrcaError as exc:
-            log.error("watcher(%s): ready-wait failed: %s", self.agent_id, exc)
+        self._event("ready_wait_started")
+        ready_source = await self._wait_ready()
+        if ready_source is None:
+            log.error("watcher(%s): ready-wait timed out", self.agent_id)
             self._event(
                 "ready_wait_failed",
                 level="ERROR",
-                message=str(exc),
+                message="terminal never became ready",
             )
-            await self._finalize("error", "ready_failed", error=str(exc))
+            await self._finalize("error", "ready_failed", error="ready timeout")
             return
-
-        self.pane = await _pane_key(self.handle)
-        if self.pane:
-            self._update(pane_key=self.pane)
-            self._event("pane_detected", data={"pane_key": self.pane})
-        log.info("watcher(%s): pane=%s", self.agent_id, self.pane or "(unknown)")
+        self._event("ready_observed", data={"source": ready_source})
+        log.info(
+            "watcher(%s): ready (source=%s)  pane=%s",
+            self.agent_id, ready_source, self.pane or "(unknown)",
+        )
 
         prompt = one_line(self.agent.get("prompt") or "")
         if not prompt:
@@ -262,15 +262,7 @@ class Watcher:
             return
 
         # ---- Phase 1: the task itself ----
-        if task_started_on_launch:
-            source = "launch_tui_idle"
-            self._update(state="working", phase="task", tool_name="")
-            self._event(
-                "turn_finished",
-                data={"phase": "task", "source": source},
-            )
-        else:
-            source = await self._run_turn(prompt, phase="task")
+        source = await self._run_turn(prompt, phase="task")
         if source in ("timeout", "terminal_lost", "send_failed"):
             await self._finalize("error", source)
             return
@@ -298,6 +290,60 @@ class Watcher:
             self._update(handoff_path="")
             await self._finalize("done", "handoff_missing")
 
+    async def _wait_ready(self) -> str | None:
+        """Wait until the worker terminal can accept the next prompt.
+
+        Pane state comes first: a pane Orca tracks is ready when
+        `worktree ps` reports it "done" (such a pane can be ready even
+        while `terminal wait --for tui-idle` would hang, e.g. Claude's
+        agents-awaiting-input UI). `tui-idle` is only the fallback for
+        panes Orca does not track. Readiness is never treated as task
+        completion: the task prompt is always sent and observed as its
+        own turn afterwards.
+
+        Returns the readiness source ("ps_idle" / "tui_idle"), or None
+        on timeout.
+        """
+        deadline = time.monotonic() + READY_TIMEOUT_MS / 1000
+        while time.monotonic() < deadline:
+            if self.pane is None:
+                self.pane = await _pane_key(self.handle)
+                if self.pane:
+                    self._update(pane_key=self.pane)
+                    self._event("pane_detected", data={"pane_key": self.pane})
+            entry = None
+            if self.pane:
+                try:
+                    entry = await _ps_entry(self.pane)
+                except OrcaError:
+                    entry = None
+            if entry is not None:
+                # Tracked pane: "done" means ready; anything else (a
+                # turn still running on an adopted pane) means wait.
+                if entry.get("state") == "done":
+                    return "ps_idle"
+            elif await _tui_idle(self.handle):
+                return "tui_idle"
+            await anyio.sleep(POLL_SECS)
+        return None
+
+    async def _pane_done_state_started(self) -> int:
+        """stateStartedAt of the pane's current "done" entry, or 0.
+
+        Captured before a prompt is sent: a pre-existing "done" state
+        can fall inside CLOCK_SKEW_MS of the send and must never be
+        mistaken for completion of the turn that is about to start.
+        """
+        if self.pane is None:
+            return 0
+        try:
+            entry = await _ps_entry(self.pane)
+        except OrcaError:
+            return 0
+        if entry is not None and entry.get("state") == "done":
+            return int(entry.get("stateStartedAt") or 0)
+        return 0
+
     async def _run_turn(self, text: str, phase: str) -> str:
         """Send one prompt and wait for the turn to complete.
 
@@ -305,6 +351,7 @@ class Watcher:
         one of the failure modes "send_failed"/"timeout"/"terminal_lost".
         """
         sent_at_ms = time.time() * 1000
+        baseline_state_started = await self._pane_done_state_started()
         try:
             await terminal_send(self.handle, text)
         except OrcaError as exc:
@@ -321,14 +368,16 @@ class Watcher:
             "turn_sent",
             data={"phase": phase, "chars": len(text)},
         )
-        source = await self._wait_turn_done(sent_at_ms)
+        source = await self._wait_turn_done(sent_at_ms, baseline_state_started)
         self._event(
             "turn_finished",
             data={"phase": phase, "source": source},
         )
         return source
 
-    async def _wait_turn_done(self, sent_at_ms: float) -> str:
+    async def _wait_turn_done(
+        self, sent_at_ms: float, baseline_state_started: int = 0
+    ) -> str:
         try:
             baseline_out = await _last_output_at(self.handle)
         except OrcaError:
@@ -336,6 +385,7 @@ class Watcher:
         started = False
         tracked = self.pane is not None
         misses = 0
+        activity_observed = False
         ask_notified = False
         stall_notified = False
 
@@ -354,9 +404,22 @@ class Watcher:
                 misses = 0
                 state = entry.get("state")
                 state_started = int(entry.get("stateStartedAt") or 0)
-                if state == "done" and state_started >= sent_at_ms - CLOCK_SKEW_MS:
+                if (state == "done"
+                        and state_started >= sent_at_ms - CLOCK_SKEW_MS
+                        and state_started > baseline_state_started):
+                    self._event(
+                        "task_done_observed",
+                        data={"source": "ps_done",
+                              "state_started_at": state_started},
+                    )
                     return "ps_done"
                 if state == "working":
+                    if not activity_observed:
+                        activity_observed = True
+                        self._event(
+                            "task_activity_observed",
+                            data={"source": "ps_working"},
+                        )
                     tool = entry.get("toolName") or ""
                     self._update(tool_name=tool)
                     if tool == "AskUserQuestion" and not ask_notified:
@@ -398,7 +461,13 @@ class Watcher:
                     "watcher(%s): agent no longer tracked by Orca, "
                     "falling back to idle detection", self.agent_id,
                 )
-                if await _tui_idle(self.handle):
+                # A bare idle observation only counts once the turn
+                # demonstrably produced output; otherwise fail closed
+                # via the untracked idle heuristics below.
+                if started and await _tui_idle(self.handle):
+                    self._event(
+                        "task_done_observed", data={"source": "tui_idle"},
+                    )
                     return "tui_idle"
                 tracked = False
                 continue
@@ -410,7 +479,15 @@ class Watcher:
                 return "terminal_lost"
             if last > baseline_out:
                 started = True
+                if not activity_observed:
+                    activity_observed = True
+                    self._event(
+                        "task_activity_observed", data={"source": "output"},
+                    )
             if started and (time.time() * 1000 - last) >= FALLBACK_IDLE_STABLE_MS:
+                self._event(
+                    "task_done_observed", data={"source": "fallback_idle"},
+                )
                 return "fallback_idle"
 
         return "timeout"
