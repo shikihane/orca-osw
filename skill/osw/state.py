@@ -2,9 +2,26 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
+import tempfile
 import time
 from pathlib import Path
+
+
+REPLACE_RETRY_TIMEOUT_SECS = 1.0
+REPLACE_RETRY_INITIAL_SECS = 0.01
+REPLACE_RETRY_MAX_SECS = 0.1
+WINDOWS_REPLACE_RETRY_ERRORS = frozenset({5, 32})
+
+
+class StateWriteError(OSError):
+    """Raised when an atomic state-file replacement cannot complete."""
+
+    def __init__(self, path: Path, cause: OSError) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(f"Failed to persist state file {path}: {cause}")
 
 
 def resolve_project_root() -> Path:
@@ -72,10 +89,44 @@ def write_state(root: Path, state: dict) -> None:
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    os.replace(tmp_path, path)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = Path(f.name)
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        _replace_with_retry(tmp_path, path)
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _replace_with_retry(source: Path, target: Path) -> None:
+    deadline = time.monotonic() + REPLACE_RETRY_TIMEOUT_SECS
+    delay = REPLACE_RETRY_INITIAL_SECS
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except OSError as exc:
+            retryable = (
+                getattr(exc, "winerror", None) in WINDOWS_REPLACE_RETRY_ERRORS
+            )
+            remaining = deadline - time.monotonic()
+            if not retryable or remaining <= 0:
+                raise StateWriteError(target, exc) from exc
+            sleep_for = min(delay * random.uniform(1.0, 1.25), remaining)
+            time.sleep(sleep_for)
+            delay = min(delay * 2, REPLACE_RETRY_MAX_SECS)
 
 
 # ---------------------------------------------------------------------------

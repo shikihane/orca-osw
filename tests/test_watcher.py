@@ -9,7 +9,7 @@ import anyio
 import pytest
 
 from osw import state
-from osw.watcher import Watcher, format_completion_report, one_line
+from osw.watcher import Watcher, format_completion_report, main, one_line
 
 
 @pytest.fixture
@@ -30,6 +30,79 @@ def test_one_line_and_completion_report_are_single_line():
     assert "handoff=C:\\handoff.md" in line
     assert "done clean" in line
     assert "\n" not in line
+
+
+def test_watcher_retains_and_retries_state_after_storage_error(tmp_path):
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    real_write = state.write_agent
+    attempts = 0
+
+    def flaky_write(root, agent):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise state.StateWriteError(
+                state.agent_file(root, agent["agent_id"]),
+                PermissionError("locked"),
+            )
+        real_write(root, agent)
+
+    with patch("osw.watcher.write_agent", flaky_write):
+        watcher._update(state="working")
+        assert state.read_agent(tmp_path, "agent_001")["state"] == "assigned"
+
+        watcher._update(state="working")
+
+    assert state.read_agent(tmp_path, "agent_001")["state"] == "working"
+    events = [
+        json.loads(line)
+        for line in (state.logs_dir(tmp_path) / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [event["event"] for event in events] == [
+        "state_storage_error",
+        "state_storage_recovered",
+    ]
+
+
+def test_process_boundary_does_not_misclassify_state_storage_error(tmp_path):
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "state": "working",
+    })
+    failure = state.StateWriteError(
+        state.agent_file(tmp_path, "agent_001"),
+        PermissionError("locked"),
+    )
+
+    async def fail_watcher(root, agent_id):
+        raise failure
+
+    with patch("osw.watcher.setup_logging"), \
+         patch("osw.watcher.enable_file_logging"), \
+         patch("osw.watcher.run_watcher", fail_watcher), \
+         pytest.raises(state.StateWriteError):
+        main(tmp_path, "agent_001")
+
+    agent = state.read_agent(tmp_path, "agent_001")
+    assert agent["state"] == "working"
+    assert agent.get("completion_source") != "watcher_crash"
+    events = [
+        json.loads(line)
+        for line in (state.logs_dir(tmp_path) / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [event["event"] for event in events] == ["state_storage_error"]
 
 
 @pytest.mark.anyio
@@ -68,6 +141,42 @@ async def test_watcher_persists_pane_key_before_running_turns(tmp_path):
     assert agent["pane_key"] == "tab-a:leaf-b"
     assert agent["state"] == "done"
     assert agent["completion_source"] == "ps_done"
+
+
+@pytest.mark.anyio
+async def test_untracked_polling_retries_dirty_watcher_state(tmp_path):
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.deadline = time.monotonic() + 0.01
+    real_write = state.write_agent
+    attempts = 0
+
+    def flaky_write(root, agent):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise state.StateWriteError(
+                state.agent_file(root, agent["agent_id"]),
+                PermissionError("locked"),
+            )
+        real_write(root, agent)
+
+    show = AsyncMock(return_value={
+        "result": {"terminal": {"lastOutputAt": 0}},
+    })
+    with patch("osw.watcher.write_agent", flaky_write), \
+         patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.POLL_SECS", 0):
+        watcher._update(state="working")
+        result = await watcher._wait_turn_done(time.time() * 1000)
+
+    assert result == "timeout"
+    assert state.read_agent(tmp_path, "agent_001")["state"] == "working"
 
 
 @pytest.mark.anyio

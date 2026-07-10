@@ -33,6 +33,7 @@ from osw.orca_cli import (
     worktree_ps,
 )
 from osw.state import (
+    StateWriteError,
     logs_dir,
     new_handoff_path,
     read_agent,
@@ -147,6 +148,8 @@ class Watcher:
         self.handle = self.agent["terminal"]
         self.deadline = time.monotonic() + HARD_TIMEOUT_SECS
         self.pane: str | None = None
+        self._state_dirty = False
+        self._state_storage_error: StateWriteError | None = None
 
     def _update(self, **fields) -> None:
         changed = False
@@ -156,7 +159,40 @@ class Watcher:
                 changed = True
         if changed:
             self.agent["updated_at"] = now_iso()
+            self._state_dirty = True
+        self._flush_state()
+
+    def _flush_state(self) -> bool:
+        if not self._state_dirty:
+            return True
+        try:
             write_agent(self.root, self.agent)
+        except StateWriteError as exc:
+            if self._state_storage_error is None:
+                self._state_storage_error = exc
+                log.error(
+                    "watcher(%s): state storage failed: %s",
+                    self.agent_id,
+                    exc,
+                )
+                self._event(
+                    "state_storage_error",
+                    level="ERROR",
+                    message=str(exc),
+                    data={"path": str(exc.path)},
+                )
+            return False
+
+        self._state_dirty = False
+        if self._state_storage_error is not None:
+            previous = self._state_storage_error
+            self._state_storage_error = None
+            log.info("watcher(%s): state storage recovered", self.agent_id)
+            self._event(
+                "state_storage_recovered",
+                data={"path": str(previous.path)},
+            )
+        return True
 
     def _event(
         self,
@@ -305,6 +341,7 @@ class Watcher:
 
         while time.monotonic() < self.deadline:
             await anyio.sleep(POLL_SECS)
+            self._flush_state()
 
             entry = None
             if tracked:
@@ -465,6 +502,23 @@ def main(root: Path, agent_id: str) -> None:
     enable_file_logging(logs_dir(root), prefix=agent_id)
     try:
         anyio.run(run_watcher, root, agent_id)
+    except StateWriteError as exc:
+        log.exception("watcher(%s): state storage failed", agent_id)
+        try:
+            agent = read_agent(root, agent_id)
+            emit_event(
+                logs_dir(root),
+                component="watcher",
+                event="state_storage_error",
+                level="ERROR",
+                agent_id=agent_id,
+                terminal=str(agent.get("terminal") or ""),
+                message=str(exc),
+                data={"path": str(exc.path)},
+            )
+        except OSError:
+            pass
+        raise
     except Exception:
         log.exception("watcher(%s): crashed", agent_id)
         try:
