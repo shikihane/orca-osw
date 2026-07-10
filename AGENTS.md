@@ -53,17 +53,19 @@ or handoff files.
 
 ## Skill Installation Requirements
 
-Install or update OSW for Codex and Claude by physically copying the complete
-`skill/` directory into each tool's own skill directory. Each destination must
-be an independent, ordinary directory containing ordinary copied files.
+Install or update OSW with `python install.py`, which physically copies the
+complete `skill/` directory into each tool's own skill directory. Each
+destination must be an independent, ordinary directory containing ordinary
+copied files.
 
 - Codex destination: `C:\Users\shiki\.codex\skills\osw\`
+- Agents destination: `C:\Users\shiki\.agents\skills\osw\`
 - Claude destination: `C:\Users\shiki\.claude\skills\osw\`
 - Never use junctions, symbolic links, hard links, directory links, reparse
   points, or any other link-like mechanism for either the directory or its
   files.
-- Never configure either installed skill to execute from or resolve back to
+- Never configure an installed skill to execute from or resolve back to
   this repository's `skill/` directory.
-- Validate after every update that both destinations are real directories,
+- Validate after every update that all destinations are real directories,
   contain independent physical copies, and still work if the repository path
-  is unavailable.
+  is unavailable (`install.py` performs these checks automatically).

@@ -126,12 +126,18 @@ state.
 
 ## Skill Installation
 
-Installing/updating the OSW skill means physically copying the complete
-`skill/` directory to each destination — never junctions, symlinks, hard
-links, or any link-like mechanism, and never resolving back to this repo:
+Install or update the skill with `python install.py`. It physically copies
+the complete `skill/` directory to each destination — never junctions,
+symlinks, hard links, or any link-like mechanism, and never resolving back
+to this repo. Link-shaped installs are removed as links and replaced with
+real copies. Default destinations:
 
 - Codex: `C:\Users\shiki\.codex\skills\osw\`
+- Agents: `C:\Users\shiki\.agents\skills\osw\`
 - Claude: `C:\Users\shiki\.claude\skills\osw\`
 
-After every update, validate both destinations are independent physical
-copies that still work if this repository path is unavailable.
+The script validates every destination after copying: an independent
+physical copy (no links anywhere, nothing resolving into this repo),
+byte-identical to the source, and a working `osw.py --help` — so installs
+keep working even if this repository path is unavailable. Run it after
+every skill change.
