@@ -98,6 +98,14 @@ def _detect_caller_terminal() -> str | None:
 def _maybe_detect_caller(caller_terminal: str | None) -> str | None:
     if caller_terminal:
         return caller_terminal
+    # Orca exports the hosting terminal's handle into every terminal it
+    # creates; child processes inherit it, so this works even when osw
+    # runs deep inside an agent's tool pipeline where stdout is a pipe
+    # and the marker-in-preview trick below cannot work.
+    env_handle = os.environ.get("ORCA_TERMINAL_HANDLE", "").strip()
+    if env_handle:
+        log.info("caller from ORCA_TERMINAL_HANDLE  terminal=%s", env_handle)
+        return env_handle
     if sys.stdin.isatty() and sys.stdout.isatty():
         return _detect_caller_terminal()
     return None

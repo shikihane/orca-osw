@@ -143,6 +143,42 @@ def test_new_creates_provider_terminal_agent_file_and_detaches_watcher(tmp_path,
     assert agent["state"] == "assigned"
 
 
+def test_new_detects_caller_from_orca_env(tmp_path, monkeypatch):
+    """Orca exports ORCA_TERMINAL_HANDLE into every terminal it creates;
+    osw invoked through an agent's tool pipeline (stdout is a pipe, the
+    preview-marker trick cannot work) still finds its caller from it."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.setenv("ORCA_TERMINAL_HANDLE", "term-host")
+
+    create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
+    with patch("osw.cli.terminal_create", create), \
+         patch("osw.cli._spawn_watcher", Mock(return_value=4567)):
+        result = runner.invoke(app, ["new", "claude", "do the task"])
+
+    assert result.exit_code == 0
+    agent = state_mod.read_agent(tmp_path, "agent_001")
+    assert agent["caller_terminal"] == "term-host"
+
+
+def test_explicit_caller_terminal_beats_orca_env(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.setenv("ORCA_TERMINAL_HANDLE", "term-host")
+
+    create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
+    with patch("osw.cli.terminal_create", create), \
+         patch("osw.cli._spawn_watcher", Mock(return_value=4567)):
+        result = runner.invoke(
+            app,
+            ["new", "claude", "--caller-terminal", "caller-1", "do the task"],
+        )
+
+    assert result.exit_code == 0
+    agent = state_mod.read_agent(tmp_path, "agent_001")
+    assert agent["caller_terminal"] == "caller-1"
+
+
 def test_spawn_watcher_hides_detached_process_on_windows(tmp_path):
     hidden_flags = 0x100
     startupinfo = object()

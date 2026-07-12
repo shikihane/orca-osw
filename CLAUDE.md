@@ -80,8 +80,27 @@ Completion detection: the watcher maps the terminal to a `paneKey`
 entry (`state == "done"` with `stateStartedAt` after the prompt was sent and
 newer than the pane's pre-send "done" timestamp). An idle observation alone
 is never completion — a turn with no task-correlated evidence fails closed
-as `error`, not `done`. CLIs Orca does not recognize (e.g. `pi`) fall back
-to `lastOutputAt` stable-idle detection (60s of silence after new output).
+as `error`, not `done`. CLIs Orca does not track in `worktree ps` fall back
+to `lastOutputAt` stable-idle detection (60s of silence after new output);
+the prompt's own terminal echo never counts as output, and the quick
+tui-idle exit after tracking loss requires the pane to have been observed
+`working` this turn — a pane Orca never registered (e.g. one spawned
+moments ago, before ps catches up) rides the slow stable-silence path.
+Orca recognizes `claude`, `codex`, and `pi` TUIs (as of Orca 1.4.x).
+Tracked panes must additionally acknowledge each prompt within
+`RECEIPT_TIMEOUT_MS` (report `working`, finish the turn, or echo the
+prompt text in ps) — no acknowledgement means the input was swallowed by
+something other than the agent's composer (login screen, update dialog):
+the turn fails closed as `no_receipt` and the caller is notified.
+Startup trust dialogs do not occur in practice: the provider autonomy
+flags skip them (verified empirically on all three CLIs in an untrusted
+worktree).
+
+Caller notification: `new`/`use` resolve the dispatching terminal from
+`ORCA_TERMINAL_HANDLE` (exported by Orca into every terminal it creates and
+inherited through agent tool pipelines); explicit `--caller-terminal` wins,
+and the interactive preview-marker probe is the last-ditch fallback for
+tty sessions outside Orca-created terminals.
 
 Ownership invariant: the CLI writes the agent record at creation; after the
 watcher starts, the watcher process is the only writer. `list`/`status` merge

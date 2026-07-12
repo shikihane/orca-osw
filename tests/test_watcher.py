@@ -199,7 +199,9 @@ async def test_watcher_emits_trace_events(tmp_path):
         "state": "assigned",
     })
 
-    async def fake_wait_turn_done(self, sent_at_ms, baseline_state_started=0):
+    async def fake_wait_turn_done(
+        self, sent_at_ms, baseline_state_started=0, sent_text=""
+    ):
         return "ps_done"
 
     with patch("osw.watcher.terminal_wait", AsyncMock(return_value={})), \
@@ -464,7 +466,10 @@ async def test_tracking_loss_without_new_output_does_not_complete_as_idle(tmp_pa
 
 
 @pytest.mark.anyio
-async def test_tracking_loss_uses_tui_idle_before_slow_idle_fallback(tmp_path):
+async def test_tracking_loss_after_observed_work_uses_tui_idle(tmp_path):
+    """The quick tui-idle exit stays available for genuine tracking
+    loss: the pane was observed working this turn, then vanished from
+    ps (e.g. the TUI exited when done), and new output arrived."""
     state.init_state_dir(tmp_path)
     state.write_agent(tmp_path, {
         "agent_id": "agent_001",
@@ -477,12 +482,19 @@ async def test_tracking_loss_uses_tui_idle_before_slow_idle_fallback(tmp_path):
     watcher.deadline = time.monotonic() + 1
 
     now_ms = int(time.time() * 1000)
-    output_times = iter([now_ms, now_ms + 1])
+    # baseline read, echo absorption, then the post-loss output check
+    output_times = iter([now_ms, now_ms, now_ms + 5000])
 
     async def show(*args, **kwargs):
-        last_output = next(output_times, 2000)
+        last_output = next(output_times, now_ms + 5000)
         return {"result": {"terminal": {"lastOutputAt": last_output}}}
-    ps = AsyncMock(return_value=[{"agents": []}])
+    ps_results = iter([
+        _ps_result("tab-a:leaf-b", "working"),
+        [{"agents": []}],
+        [{"agents": []}],
+        [{"agents": []}],
+    ])
+    ps = AsyncMock(side_effect=lambda: next(ps_results, [{"agents": []}]))
     wait = AsyncMock(return_value={})
 
     with patch("osw.watcher.terminal_show", show), \
@@ -494,3 +506,224 @@ async def test_tracking_loss_uses_tui_idle_before_slow_idle_fallback(tmp_path):
 
     assert result == "tui_idle"
     wait.assert_awaited_once_with("term-a", "tui-idle", timeout_ms=1000)
+
+
+@pytest.mark.anyio
+async def test_never_tracked_pane_gets_no_tui_idle_shortcut(tmp_path):
+    """A pane Orca has not registered (yet) must never complete via the
+    quick tui-idle check — a fresh worker whose ps entry lags behind
+    would otherwise be marked done seconds after the prompt goes out."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 0.05
+
+    async def show(*args, **kwargs):
+        # output keeps flowing: the worker is visibly busy the whole time
+        return {"result": {"terminal": {"lastOutputAt": int(time.time() * 1000)}}}
+    ps = AsyncMock(return_value=[{"agents": []}])
+    wait = AsyncMock(return_value={})  # TUI would report idle if asked
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.POLL_SECS", 0):
+        result = await watcher._wait_turn_done(time.time() * 1000)
+
+    assert result == "timeout"
+    wait.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_never_tracked_pane_completes_after_stable_silence(tmp_path):
+    """Never-tracked panes still finish through the slow path: new
+    output after the send, then a stable-silence window."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 1
+
+    # baseline, echo absorption, then one output burst followed by silence
+    output_times = iter([1000, 1000])
+
+    async def show(*args, **kwargs):
+        return {"result": {"terminal": {"lastOutputAt": next(output_times, 2000)}}}
+    ps = AsyncMock(return_value=[{"agents": []}])
+    wait = AsyncMock(return_value={})
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.FALLBACK_IDLE_STABLE_MS", 0):
+        result = await watcher._wait_turn_done(time.time() * 1000)
+
+    assert result == "fallback_idle"
+    wait.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_prompt_echo_alone_is_not_agent_output(tmp_path):
+    """The terminal rendering the prompt we sent advances lastOutputAt;
+    that echo must re-baseline, not count as the agent starting work."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 0.05
+
+    # baseline read misses the echo; every later read sees it — and
+    # nothing else ever arrives
+    output_times = iter([1000])
+
+    async def show(*args, **kwargs):
+        return {"result": {"terminal": {"lastOutputAt": next(output_times, 5000)}}}
+    ps = AsyncMock(return_value=[{"agents": []}])
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.FALLBACK_IDLE_STABLE_MS", 0):
+        result = await watcher._wait_turn_done(time.time() * 1000)
+
+    assert result == "timeout"
+
+
+@pytest.mark.anyio
+async def test_swallowed_prompt_fails_closed_and_notifies_caller(tmp_path):
+    """A tracked pane that never acknowledges the prompt (no working
+    state, no fresh done, no prompt echo in ps) means the input was
+    swallowed by something else — a login screen, an update dialog:
+    fail closed quickly and tell the caller, don't idle for an hour."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "caller_terminal": "term-caller",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 1
+
+    stale = int(time.time() * 1000)
+    show = AsyncMock(return_value={
+        "result": {"terminal": {"lastOutputAt": 1000}},
+    })
+    ps = AsyncMock(return_value=_ps_result("tab-a:leaf-b", "done", stale))
+    send = AsyncMock(return_value={})
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.RECEIPT_TIMEOUT_MS", 0):
+        result = await watcher._wait_turn_done(
+            time.time() * 1000, baseline_state_started=stale,
+            sent_text="do the task",
+        )
+
+    assert result == "no_receipt"
+    send.assert_awaited_once()
+    assert send.await_args.args[0] == "term-caller"
+    assert "prompt-not-received" in send.await_args.args[1]
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert '"event": "prompt_receipt_missing"' in events
+
+
+@pytest.mark.anyio
+async def test_prompt_echoed_in_ps_counts_as_receipt(tmp_path):
+    """If ps reports our prompt text on the pane, the CLI took the
+    input — no receipt alarm even without a working observation."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 0.05
+
+    stale = int(time.time() * 1000)
+    entry = _ps_result("tab-a:leaf-b", "done", stale)
+    entry[0]["agents"][0]["prompt"] = "do the task"
+    show = AsyncMock(return_value={
+        "result": {"terminal": {"lastOutputAt": 1000}},
+    })
+    ps = AsyncMock(return_value=entry)
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.RECEIPT_TIMEOUT_MS", 0):
+        result = await watcher._wait_turn_done(
+            time.time() * 1000, baseline_state_started=stale,
+            sent_text="do the task",
+        )
+
+    assert result == "timeout"  # no false receipt alarm; still no completion
+
+
+@pytest.mark.anyio
+async def test_late_ps_registration_upgrades_to_ps_done(tmp_path):
+    """Orca registers a freshly spawned pane a few polls late: the
+    watcher keeps polling ps meanwhile and completes on real evidence
+    instead of idle heuristics."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 1
+
+    task_done = int(time.time() * 1000) + 10_000
+    ps_results = iter([
+        [{"agents": []}],                          # ps entry lags behind
+        [{"agents": []}],
+        _ps_result("tab-a:leaf-b", "working"),     # Orca catches up
+        _ps_result("tab-a:leaf-b", "done", task_done),
+    ])
+    ps = AsyncMock(
+        side_effect=lambda: next(
+            ps_results, _ps_result("tab-a:leaf-b", "done", task_done)
+        )
+    )
+
+    async def show(*args, **kwargs):
+        return {"result": {"terminal": {"lastOutputAt": int(time.time() * 1000)}}}
+    wait = AsyncMock(return_value={})
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.POLL_SECS", 0):
+        result = await watcher._wait_turn_done(time.time() * 1000)
+
+    assert result == "ps_done"
+    wait.assert_not_awaited()

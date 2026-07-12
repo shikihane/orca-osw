@@ -19,8 +19,20 @@ always requires task-correlated evidence (a "done" state that started
 after the prompt was sent and is newer than the pane's pre-send state,
 or new output followed by stable silence for untracked CLIs).
 
+A tracked pane must also acknowledge the prompt within a receipt
+window (report the turn "working", finish it, or echo the prompt text
+in ps); no acknowledgement means something other than the agent's
+composer swallowed the input (login screen, update dialog, crash
+remains) — the turn fails closed as "no_receipt" and the caller is
+notified, instead of idling to the hard timeout.
+
 CLIs Orca does not recognize (no `agents` entry in `worktree ps`)
-fall back to lastOutputAt idle detection.
+fall back to lastOutputAt idle detection. That fallback never counts
+the prompt's own terminal echo as output, and the quick tui-idle exit
+is reserved for panes that demonstrably worked on this turn before
+falling out of tracking — a pane Orca never tracked (e.g. one spawned
+so recently that ps has no entry yet) must wait out the slow
+stable-silence window instead.
 """
 
 from __future__ import annotations
@@ -58,6 +70,7 @@ HARD_TIMEOUT_SECS = 3600           # give up on the whole task after this
 STUCK_NOTIFY_SECS = 300            # tracked agent frozen this long -> tell caller
 CLOCK_SKEW_MS = 5_000              # tolerance comparing our clock vs Orca's
 TRACK_LOST_IDLE_WAIT_MS = 1_000    # quick TUI idle check before slow fallback
+RECEIPT_TIMEOUT_MS = 90_000        # tracked pane must acknowledge the prompt
 
 # Fixed, machine-generated wrap-up instruction (single line: multi-line
 # text gets truncated at newlines by orca.CMD --text on Windows). This
@@ -263,7 +276,7 @@ class Watcher:
 
         # ---- Phase 1: the task itself ----
         source = await self._run_turn(prompt, phase="task")
-        if source in ("timeout", "terminal_lost", "send_failed"):
+        if source in ("timeout", "terminal_lost", "send_failed", "no_receipt"):
             await self._finalize("error", source)
             return
         log.info("watcher(%s): task turn done (source=%s)", self.agent_id, source)
@@ -274,7 +287,9 @@ class Watcher:
         instruction = HANDOFF_TEMPLATE.format(path=handoff)
         for attempt in (1, 2):
             handoff_source = await self._run_turn(instruction, phase="handoff")
-            if handoff_source in ("timeout", "terminal_lost", "send_failed"):
+            if handoff_source in (
+                "timeout", "terminal_lost", "send_failed", "no_receipt",
+            ):
                 await self._finalize("error", handoff_source)
                 return
             if _handoff_ok(handoff):
@@ -347,8 +362,9 @@ class Watcher:
     async def _run_turn(self, text: str, phase: str) -> str:
         """Send one prompt and wait for the turn to complete.
 
-        Returns the completion source: "ps_done", "fallback_idle", or
-        one of the failure modes "send_failed"/"timeout"/"terminal_lost".
+        Returns the completion source: "ps_done", "tui_idle",
+        "fallback_idle", or one of the failure modes
+        "send_failed"/"timeout"/"terminal_lost"/"no_receipt".
         """
         sent_at_ms = time.time() * 1000
         baseline_state_started = await self._pane_done_state_started()
@@ -368,7 +384,9 @@ class Watcher:
             "turn_sent",
             data={"phase": phase, "chars": len(text)},
         )
-        source = await self._wait_turn_done(sent_at_ms, baseline_state_started)
+        source = await self._wait_turn_done(
+            sent_at_ms, baseline_state_started, sent_text=text
+        )
         self._event(
             "turn_finished",
             data={"phase": phase, "source": source},
@@ -376,14 +394,19 @@ class Watcher:
         return source
 
     async def _wait_turn_done(
-        self, sent_at_ms: float, baseline_state_started: int = 0
+        self, sent_at_ms: float, baseline_state_started: int = 0,
+        sent_text: str = "",
     ) -> str:
         try:
             baseline_out = await _last_output_at(self.handle)
         except OrcaError:
             baseline_out = 0
         started = False
-        tracked = self.pane is not None
+        entry_seen = False   # Orca showed a ps entry for this pane this turn
+        saw_working = False  # ...and reported it "working" at least once
+        receipt = False      # evidence the CLI actually took our prompt
+        sent_flat = one_line(sent_text)
+        echo_absorbed = False
         misses = 0
         activity_observed = False
         ask_notified = False
@@ -393,15 +416,63 @@ class Watcher:
             await anyio.sleep(POLL_SECS)
             self._flush_state()
 
+            # Receipt check: a pane Orca tracks must acknowledge the
+            # prompt (turn working, fresh done, or the prompt echoed in
+            # ps) within the receipt window — otherwise the input was
+            # swallowed by something that is not the agent's composer
+            # (login screen, update dialog, crash remains): fail closed
+            # now and tell the caller, instead of idling to the hard
+            # timeout.
+            if (entry_seen and not receipt
+                    and time.time() * 1000 - sent_at_ms > RECEIPT_TIMEOUT_MS):
+                log.error(
+                    "watcher(%s): prompt never acknowledged by the pane",
+                    self.agent_id,
+                )
+                self._event(
+                    "prompt_receipt_missing",
+                    level="ERROR",
+                    message="tracked pane never acknowledged the prompt",
+                )
+                await self._notify(
+                    f"# [osw] prompt-not-received agent={self.agent_id}"
+                    f" terminal={self.handle}"
+                    " (input may have been swallowed; check that terminal)"
+                )
+                return "no_receipt"
+
+            if not echo_absorbed:
+                # The prompt we just sent advances lastOutputAt all by
+                # itself when the terminal renders it; fold that echo
+                # into the baseline so it never counts as agent output.
+                echo_absorbed = True
+                try:
+                    baseline_out = max(
+                        baseline_out, await _last_output_at(self.handle)
+                    )
+                except OrcaError:
+                    pass
+
             entry = None
-            if tracked:
+            if self.pane is not None:
                 try:
                     entry = await _ps_entry(self.pane)
                 except OrcaError:
                     continue
 
             if entry is not None:
+                entry_seen = True
                 misses = 0
+                if not receipt and sent_flat:
+                    # Auxiliary receipt only: ps may mangle non-ASCII
+                    # prompt text on Windows, so a match counts but a
+                    # mismatch proves nothing.
+                    reported = one_line(entry.get("prompt") or "")
+                    if reported and (
+                        reported == sent_flat
+                        or reported.startswith(sent_flat[:32])
+                    ):
+                        receipt = True
                 state = entry.get("state")
                 state_started = int(entry.get("stateStartedAt") or 0)
                 if (state == "done"
@@ -414,6 +485,8 @@ class Watcher:
                     )
                     return "ps_done"
                 if state == "working":
+                    saw_working = True
+                    receipt = True
                     if not activity_observed:
                         activity_observed = True
                         self._event(
@@ -441,38 +514,24 @@ class Watcher:
                         )
                 continue
 
-            if tracked:
-                # Orca tracked this pane but the entry vanished: the
+            if entry_seen:
+                # Orca tracked this pane and the entry vanished: the
                 # terminal died, or the agent TUI exited to a shell.
+                # Give transient ps blips a grace period first.
                 misses += 1
                 if misses < 3:
                     continue
-                try:
-                    current_out = await _last_output_at(self.handle)
-                except OrcaError:
-                    return "terminal_lost"
-                if current_out > baseline_out:
-                    started = True
-                    baseline_out = current_out
-                else:
-                    started = False
-                    baseline_out = current_out
-                log.warning(
-                    "watcher(%s): agent no longer tracked by Orca, "
-                    "falling back to idle detection", self.agent_id,
-                )
-                # A bare idle observation only counts once the turn
-                # demonstrably produced output; otherwise fail closed
-                # via the untracked idle heuristics below.
-                if started and await _tui_idle(self.handle):
-                    self._event(
-                        "task_done_observed", data={"source": "tui_idle"},
+                if misses == 3:
+                    log.warning(
+                        "watcher(%s): agent no longer tracked by Orca, "
+                        "falling back to idle detection", self.agent_id,
                     )
-                    return "tui_idle"
-                tracked = False
-                continue
 
-            # Untracked CLI (e.g. pi): idle heuristics on lastOutputAt.
+            # No ps entry for this pane (never tracked, or tracking
+            # lost): idle heuristics on lastOutputAt. Keep polling ps
+            # above regardless — Orca may simply not have registered a
+            # freshly spawned pane yet, and real evidence beats these
+            # heuristics the moment it appears.
             try:
                 last = await _last_output_at(self.handle)
             except OrcaError:
@@ -484,6 +543,17 @@ class Watcher:
                     self._event(
                         "task_activity_observed", data={"source": "output"},
                     )
+            # The quick tui-idle exit needs task-correlated ps evidence:
+            # this pane demonstrably worked on this turn and then fell
+            # out of tracking (e.g. the TUI exited when done). A pane
+            # Orca never tracked gets no shortcut — it must ride the
+            # slow stable-silence path below.
+            if entry_seen and saw_working and started \
+                    and await _tui_idle(self.handle):
+                self._event(
+                    "task_done_observed", data={"source": "tui_idle"},
+                )
+                return "tui_idle"
             if started and (time.time() * 1000 - last) >= FALLBACK_IDLE_STABLE_MS:
                 self._event(
                     "task_done_observed", data={"source": "fallback_idle"},
