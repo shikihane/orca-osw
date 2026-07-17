@@ -15,6 +15,7 @@ KNOWN_AGENT_CLIS = [
     "claude",
     "codex",
     "pi",
+    "kimi",
     "gemini",
     "aider",
     "goose",
@@ -31,11 +32,12 @@ def _quote_command_arg(value: str) -> str:
     return subprocess.list2cmdline([value])
 
 
-SUPPORTED_PROVIDERS = ("claude", "codex", "pi")
+SUPPORTED_PROVIDERS = ("claude", "codex", "pi", "kimi")
 PROVIDER_AUTONOMY_FLAGS = {
     "claude": ("--dangerously-skip-permissions",),
     "codex": ("--dangerously-bypass-approvals-and-sandbox",),
     "pi": ("--approve",),
+    "kimi": ("--yolo",),
 }
 
 
@@ -54,6 +56,8 @@ def build_provider_command(
     separate, observable turn once the TUI is ready.
     """
     provider = provider.strip()
+    model = (model or "").strip() or None
+    thinking = (thinking or "").strip() or None
     if provider not in SUPPORTED_PROVIDERS:
         expected = ", ".join(SUPPORTED_PROVIDERS)
         raise ProviderError(
@@ -66,6 +70,16 @@ def build_provider_command(
             args += ["-c", f"model_reasoning_effort={thinking}"]
         if model:
             args += ["-m", model]
+    elif provider == "kimi":
+        # kimi has no thinking CLI flag: effort lives per-model in its
+        # config.toml, so a value here would be silently unusable.
+        if thinking:
+            raise ProviderError(
+                "provider 'kimi' does not accept --thinking; "
+                "effort is configured per model alias in kimi's config.toml"
+            )
+        if model:
+            args += ["--model", model]
     else:
         if model:
             args += ["--model", model]
@@ -102,8 +116,10 @@ def probe_variants(name: str, path: str | None = None) -> list[dict]:
     """Discover model variants by querying the CLI or its local config.
 
     Returns [{"name", "command"}], never empty for an installed CLI:
-    the CLI's bare command (its own defaults) is always a selectable
-    option, so the operator picks instead of typing.
+    when discovery finds nothing, the CLI's bare command (its own
+    defaults) is the selectable fallback, so the operator picks
+    instead of typing. codex always lists bare first because its
+    discovered variants pin a reasoning effort, never the defaults.
     """
     exe = path or shutil.which(name)
     if exe is None:
@@ -115,6 +131,8 @@ def probe_variants(name: str, path: str | None = None) -> list[dict]:
         return parse_claude_aliases(_run_capture([exe, "--help"])) or bare
     if name == "codex":
         return bare + codex_variants(_read_codex_config())
+    if name == "kimi":
+        return kimi_variants(_read_kimi_config()) or bare
     return bare
 
 
@@ -126,11 +144,11 @@ CODEX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 def _read_codex_config() -> dict:
     """Read the user's ~/.codex/config.toml (real per-machine data)."""
-    path = Path.home() / ".codex" / "config.toml"
     try:
+        path = Path.home() / ".codex" / "config.toml"
         with path.open("rb") as f:
             return tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError):
+    except (OSError, RuntimeError, tomllib.TOMLDecodeError):
         return {}
 
 
@@ -146,6 +164,41 @@ def codex_variants(config: dict) -> list[dict]:
         variants.append({
             "name": f"codex-{label}-{effort}",
             "command": command,
+        })
+    return variants
+
+
+def _read_kimi_config() -> dict:
+    """Read the user's ~/.kimi-code/config.toml (real per-machine data)."""
+    try:
+        path = Path.home() / ".kimi-code" / "config.toml"
+        with path.open("rb") as f:
+            return tomllib.load(f)
+    except (OSError, RuntimeError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def kimi_variants(config: dict) -> list[dict]:
+    """Build kimi entries from the model aliases in its config.toml.
+
+    Aliases look like "kimi-code/k3"; the command needs the full alias,
+    the display name only the tail segment — unless tails collide
+    across providers, in which case the full alias keeps names unique.
+    """
+    models = config.get("models")
+    if not isinstance(models, dict):
+        return []
+    aliases = [
+        alias for alias, spec in models.items()
+        if alias and isinstance(spec, dict)
+    ]
+    tails = [alias.split("/")[-1] for alias in aliases]
+    variants = []
+    for alias, tail in zip(aliases, tails):
+        label = tail if tails.count(tail) == 1 else alias.replace("/", "-")
+        variants.append({
+            "name": f"kimi-{label}",
+            "command": f"kimi --model {_quote_command_arg(alias)}",
         })
     return variants
 

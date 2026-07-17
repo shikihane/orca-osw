@@ -1,6 +1,6 @@
 ---
 name: osw
-description: Use when delegating, coordinating, resuming, monitoring, or recovering Orca-backed Claude, Codex, or Pi sessions in the current worktree
+description: Use when delegating, coordinating, resuming, monitoring, or recovering Orca-backed Claude, Codex, Pi, or Kimi sessions in the current worktree
 ---
 
 # OSW Agent Supervisor
@@ -32,7 +32,7 @@ cleanup, read [references/operations.md](references/operations.md).
 Inspect real model choices when the human needs options:
 
 ```text
-python <skill-dir>/osw.py models <claude|codex|pi>
+python <skill-dir>/osw.py models <claude|codex|pi|kimi>
 ```
 
 Create a fresh worker:

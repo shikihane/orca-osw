@@ -18,7 +18,10 @@ python <skill-dir>/osw.py init
 python <skill-dir>/osw.py models <provider> [--json]
 ```
 
-OSW supports `claude`, `codex`, and `pi` for `new`.
+OSW supports `claude`, `codex`, `pi`, and `kimi` for `new`. `kimi` takes
+`--model` (a config.toml alias such as `kimi-code/k3`) but rejects
+`--thinking`: its effort is configured per model alias, not on the command
+line.
 
 ## Dispatch and Continue
 
