@@ -357,6 +357,73 @@ async def test_ready_prefers_tracked_done_pane_over_tui_idle(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_untracked_pane_without_tui_idle_ready_on_output_silence(tmp_path):
+    """A TUI Orca neither tracks nor recognizes (e.g. kimi): tui-idle
+    never fires, so sustained output silence must make the pane ready."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    silent_since = int(time.time() * 1000) - 120_000  # quiet for 2 minutes
+    show = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tabId": "tab-a", "leafId": "leaf-b",
+            "lastOutputAt": silent_since,
+        }}
+    })
+    ps = AsyncMock(return_value=[{"agents": []}])  # pane never tracked
+    wait = AsyncMock(side_effect=OrcaError("timeout waiting for tui-idle", 1))
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.POLL_SECS", 0):
+        source = await watcher._wait_ready()
+
+    assert source == "output_idle"
+
+
+@pytest.mark.anyio
+async def test_untracked_pane_with_recent_output_is_not_ready(tmp_path):
+    """Output silence shorter than the stable window must keep waiting."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+
+    show = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tabId": "tab-a", "leafId": "leaf-b",
+            "lastOutputAt": int(time.time() * 1000),  # painting right now
+        }}
+    })
+    ps = AsyncMock(return_value=[{"agents": []}])
+    wait = AsyncMock(side_effect=OrcaError("timeout waiting for tui-idle", 1))
+    send = AsyncMock(return_value={})
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.READY_TIMEOUT_MS", 50):
+        await Watcher(tmp_path, "agent_001").run()
+
+    agent = state.read_agent(tmp_path, "agent_001")
+    assert agent["state"] == "error"
+    assert agent["completion_source"] == "ready_failed"
+    send.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_busy_tracked_pane_never_ready_fails_closed(tmp_path):
     state.init_state_dir(tmp_path)
     state.write_agent(tmp_path, {

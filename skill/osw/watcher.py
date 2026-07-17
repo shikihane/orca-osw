@@ -8,7 +8,8 @@ shared flow for `new` and `use`:
 
   ready:            wait until the pane can accept a prompt
                     (`worktree ps` "done" for tracked panes,
-                    `tui-idle` fallback otherwise)
+                    `tui-idle` otherwise, stable output silence for
+                    TUIs Orca never reports idle)
   phase "task":     send the prompt, wait until Orca reports the
                     agent's turn is done
   phase "handoff":  send the fixed wrap-up instruction, wait again,
@@ -311,13 +312,16 @@ class Watcher:
         Pane state comes first: a pane Orca tracks is ready when
         `worktree ps` reports it "done" (such a pane can be ready even
         while `terminal wait --for tui-idle` would hang, e.g. Claude's
-        agents-awaiting-input UI). `tui-idle` is only the fallback for
-        panes Orca does not track. Readiness is never treated as task
-        completion: the task prompt is always sent and observed as its
-        own turn afterwards.
+        agents-awaiting-input UI). `tui-idle` is the fallback for panes
+        Orca does not track — but Orca only emits tui-idle for TUIs it
+        recognizes, so a TUI it neither tracks nor recognizes (e.g.
+        kimi) is ready once its output has been silent for the same
+        stable window the completion fallback uses. Readiness is never
+        treated as task completion: the task prompt is always sent and
+        observed as its own turn afterwards.
 
-        Returns the readiness source ("ps_idle" / "tui_idle"), or None
-        on timeout.
+        Returns the readiness source ("ps_idle" / "tui_idle" /
+        "output_idle"), or None on timeout.
         """
         deadline = time.monotonic() + READY_TIMEOUT_MS / 1000
         while time.monotonic() < deadline:
@@ -337,8 +341,15 @@ class Watcher:
                 # turn still running on an adopted pane) means wait.
                 if entry.get("state") == "done":
                     return "ps_idle"
-            elif await _tui_idle(self.handle):
-                return "tui_idle"
+            else:
+                if await _tui_idle(self.handle):
+                    return "tui_idle"
+                try:
+                    last = await _last_output_at(self.handle)
+                except OrcaError:
+                    last = 0
+                if last and time.time() * 1000 - last >= FALLBACK_IDLE_STABLE_MS:
+                    return "output_idle"
             await anyio.sleep(POLL_SECS)
         return None
 
