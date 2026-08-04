@@ -25,6 +25,7 @@ from osw.log import (
 )
 from osw.orca_cli import (
     OrcaError,
+    compatibility_report,
     detect_current_terminal,
     terminal_close,
     terminal_create,
@@ -69,6 +70,52 @@ def main(
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+@app.command()
+def doctor(
+    json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
+) -> None:
+    """Check the live Orca contract required by OSW."""
+    try:
+        report = anyio.run(compatibility_report)
+    except OrcaError as exc:
+        failure = {
+            "ok": False,
+            "error": {
+                "code": exc.code or "orca_error",
+                "message": exc.message,
+            },
+        }
+        if json_output:
+            typer.echo(json.dumps(failure, indent=2))
+        else:
+            typer.echo(
+                f"OSW compatibility: FAILED "
+                f"[{failure['error']['code']}] {exc.message}"
+            )
+        raise typer.Exit(1)
+
+    if json_output:
+        typer.echo(json.dumps(report, indent=2))
+    else:
+        state = "OK" if report.get("ok") else "NOT READY"
+        typer.echo(f"OSW compatibility: {state}")
+        typer.echo(f"Orca: {report['orca']['version'] or 'unknown'}")
+        typer.echo(
+            f"Runtime: {report['runtime']['state']} "
+            f"(reachable={str(report['runtime']['reachable']).lower()})"
+        )
+        typer.echo(f"Graph: {report['graph']['state']}")
+        typer.echo(f"Worktree: {report['worktree']['path']}")
+        typer.echo(
+            f"Contract: terminal_list={report['contract']['terminal_list']} "
+            f"terminal_show={report['contract']['terminal_show']} "
+            f"worktree_ps={report['contract']['worktree_ps']} "
+            f"agent_status={report['contract']['agent_status']}"
+        )
+    if not report.get("ok"):
+        raise typer.Exit(1)
 
 
 def _read_state_or_exit(root: Path) -> dict:
@@ -193,9 +240,10 @@ def _base_agent(
     provider_command: str = "",
     model_name: str = "",
     thinking: str = "",
+    terminal_info: dict | None = None,
 ) -> dict:
     now = now_iso()
-    return {
+    agent = {
         "agent_id": agent_id,
         "terminal": terminal,
         "worktree_path": str(root),
@@ -210,6 +258,12 @@ def _base_agent(
         "created_at": now,
         "updated_at": now,
     }
+    terminal_info = terminal_info or {}
+    tab = terminal_info.get("tabId")
+    leaf = terminal_info.get("leafId")
+    if tab and leaf:
+        agent["pane_key"] = f"{tab}:{leaf}"
+    return agent
 
 
 def _start_watcher(root: Path, agent: dict) -> None:
@@ -399,6 +453,7 @@ def new(
         typer.echo(f"Error: {exc.message}")
         raise typer.Exit(1)
 
+    terminal_obj = _unwrap_terminal(result)
     handle = _terminal_handle(result)
     if not handle:
         emit_event(
@@ -422,6 +477,7 @@ def new(
         provider_command=provider_command,
         model_name=model or "",
         thinking=thinking or "",
+        terminal_info=terminal_obj,
     )
 
     try:
@@ -519,6 +575,7 @@ def use(
         provider_command=str((existing_agent or {}).get("provider_command") or ""),
         model_name=str((existing_agent or {}).get("model_name") or ""),
         thinking=str((existing_agent or {}).get("thinking") or ""),
+        terminal_info=terminal_obj,
     )
 
     try:

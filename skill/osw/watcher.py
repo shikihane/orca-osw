@@ -48,6 +48,7 @@ import anyio
 from osw.log import emit_event, enable_file_logging, get_logger, setup_logging
 from osw.orca_cli import (
     OrcaError,
+    terminal_list,
     terminal_send,
     terminal_show,
     terminal_wait,
@@ -122,12 +123,6 @@ def format_completion_report(
 # Orca observation helpers
 # ---------------------------------------------------------------------------
 
-async def _last_output_at(handle: str) -> int:
-    data = await terminal_show(handle)
-    term = data.get("result", {}).get("terminal", {})
-    return int(term.get("lastOutputAt") or 0)
-
-
 async def _pane_key(handle: str) -> str | None:
     """Map a terminal handle to worktree ps's agent paneKey (tabId:leafId)."""
     try:
@@ -139,14 +134,6 @@ async def _pane_key(handle: str) -> str | None:
     if tab and leaf:
         return f"{tab}:{leaf}"
     return None
-
-
-async def _tui_idle(handle: str, timeout_ms: int = TRACK_LOST_IDLE_WAIT_MS) -> bool:
-    try:
-        await terminal_wait(handle, "tui-idle", timeout_ms=timeout_ms)
-        return True
-    except OrcaError:
-        return False
 
 
 async def _ps_entry(pane_key: str) -> dict | None:
@@ -169,7 +156,7 @@ class Watcher:
         self.agent_id = agent_id
         self.handle = self.agent["terminal"]
         self.deadline = time.monotonic() + HARD_TIMEOUT_SECS
-        self.pane: str | None = None
+        self.pane: str | None = self.agent.get("pane_key") or None
         self._state_dirty = False
         self._state_storage_error: StateWriteError | None = None
 
@@ -244,6 +231,66 @@ class Watcher:
             await terminal_send(caller, line)
         except OrcaError as exc:
             log.warning("notify failed (caller=%s): %s", caller, exc)
+
+    async def _rebind_terminal(self) -> bool:
+        """Refresh a runtime-scoped handle using the pane's stable identity."""
+        if not self.pane:
+            return False
+        try:
+            terminals = await terminal_list(f"path:{self.root}")
+        except OrcaError:
+            return False
+        for terminal in terminals:
+            tab = terminal.get("tabId")
+            leaf = terminal.get("leafId")
+            handle = terminal.get("handle")
+            if handle and f"{tab}:{leaf}" == self.pane:
+                previous = self.handle
+                self.handle = str(handle)
+                self._update(terminal=self.handle)
+                self._event(
+                    "terminal_rebound",
+                    data={"previous": previous, "current": self.handle},
+                )
+                return True
+        return False
+
+    async def _wait_tui_idle(
+        self, timeout_ms: int = TRACK_LOST_IDLE_WAIT_MS
+    ) -> bool:
+        try:
+            await terminal_wait(self.handle, "tui-idle", timeout_ms=timeout_ms)
+            return True
+        except OrcaError as exc:
+            if exc.code != "terminal_handle_stale" \
+                    or not await self._rebind_terminal():
+                return False
+        try:
+            await terminal_wait(self.handle, "tui-idle", timeout_ms=timeout_ms)
+            return True
+        except OrcaError:
+            return False
+
+    async def _last_output_at(self) -> int:
+        try:
+            data = await terminal_show(self.handle)
+        except OrcaError as exc:
+            if exc.code != "terminal_handle_stale" \
+                    or not await self._rebind_terminal():
+                raise
+            data = await terminal_show(self.handle)
+        term = data.get("result", {}).get("terminal", {})
+        return int(term.get("lastOutputAt") or 0)
+
+    async def _send_terminal(self, text: str) -> None:
+        try:
+            await terminal_send(self.handle, text)
+            return
+        except OrcaError as exc:
+            if exc.code != "terminal_handle_stale" \
+                    or not await self._rebind_terminal():
+                raise
+        await terminal_send(self.handle, text)
 
     async def run(self) -> None:
         self._update(watcher_pid=os.getpid(), state="starting")
@@ -342,10 +389,10 @@ class Watcher:
                 if entry.get("state") == "done":
                     return "ps_idle"
             else:
-                if await _tui_idle(self.handle):
+                if await self._wait_tui_idle():
                     return "tui_idle"
                 try:
-                    last = await _last_output_at(self.handle)
+                    last = await self._last_output_at()
                 except OrcaError:
                     last = 0
                 if last and time.time() * 1000 - last >= FALLBACK_IDLE_STABLE_MS:
@@ -380,7 +427,7 @@ class Watcher:
         sent_at_ms = time.time() * 1000
         baseline_state_started = await self._pane_done_state_started()
         try:
-            await terminal_send(self.handle, text)
+            await self._send_terminal(text)
         except OrcaError as exc:
             log.error("watcher(%s): send failed: %s", self.agent_id, exc)
             self._event(
@@ -409,7 +456,7 @@ class Watcher:
         sent_text: str = "",
     ) -> str:
         try:
-            baseline_out = await _last_output_at(self.handle)
+            baseline_out = await self._last_output_at()
         except OrcaError:
             baseline_out = 0
         started = False
@@ -459,7 +506,7 @@ class Watcher:
                 echo_absorbed = True
                 try:
                     baseline_out = max(
-                        baseline_out, await _last_output_at(self.handle)
+                        baseline_out, await self._last_output_at()
                     )
                 except OrcaError:
                     pass
@@ -544,7 +591,7 @@ class Watcher:
             # freshly spawned pane yet, and real evidence beats these
             # heuristics the moment it appears.
             try:
-                last = await _last_output_at(self.handle)
+                last = await self._last_output_at()
             except OrcaError:
                 return "terminal_lost"
             if last > baseline_out:
@@ -560,7 +607,7 @@ class Watcher:
             # Orca never tracked gets no shortcut — it must ride the
             # slow stable-silence path below.
             if entry_seen and saw_working and started \
-                    and await _tui_idle(self.handle):
+                    and await self._wait_tui_idle():
                 self._event(
                     "task_done_observed", data={"source": "tui_idle"},
                 )

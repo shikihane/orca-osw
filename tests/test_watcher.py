@@ -154,6 +154,184 @@ async def test_watcher_persists_pane_key_before_running_turns(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_watcher_rebinds_stale_terminal_handle_by_pane(tmp_path):
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-old",
+        "pane_key": "tab-a:leaf-b",
+        "prompt": "",
+        "state": "assigned",
+    })
+    stale = OrcaError(
+        "Terminal handle belongs to an older runtime",
+        1,
+        code="terminal_handle_stale",
+    )
+    wait = AsyncMock(side_effect=[stale, {}])
+    terminals = AsyncMock(return_value=[{
+        "handle": "term-new",
+        "tabId": "tab-a",
+        "leafId": "leaf-b",
+    }])
+
+    with patch("osw.watcher.worktree_ps", AsyncMock(return_value=[])), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.terminal_list", terminals):
+        await Watcher(tmp_path, "agent_001").run()
+
+    agent = state.read_agent(tmp_path, "agent_001")
+    assert agent["terminal"] == "term-new"
+    assert agent["state"] == "done"
+    assert wait.await_args_list[0].args[0] == "term-old"
+    assert wait.await_args_list[1].args[0] == "term-new"
+
+
+@pytest.mark.anyio
+async def test_watcher_retries_prompt_after_stale_handle_rebind(tmp_path):
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-old",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    stale = OrcaError(
+        "Terminal handle belongs to an older runtime",
+        1,
+        code="terminal_handle_stale",
+    )
+    send = AsyncMock(side_effect=[stale, {}, {}])
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+        return "ps_done"
+
+    with patch("osw.watcher.terminal_show", AsyncMock(return_value={
+             "result": {"terminal": {
+                 "tabId": "tab-a", "leafId": "leaf-b", "lastOutputAt": 1,
+             }},
+         })), \
+         patch("osw.watcher.worktree_ps", AsyncMock(
+             return_value=_ps_result("tab-a:leaf-b", "done"),
+         )), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.terminal_list", AsyncMock(return_value=[{
+             "handle": "term-new", "tabId": "tab-a", "leafId": "leaf-b",
+         }])), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn), \
+         patch("osw.watcher._handoff_ok", return_value=True):
+        await Watcher(tmp_path, "agent_001").run()
+
+    agent = state.read_agent(tmp_path, "agent_001")
+    assert agent["terminal"] == "term-new"
+    assert agent["state"] == "done"
+    assert [call.args[0] for call in send.await_args_list] == [
+        "term-old", "term-new", "term-new",
+    ]
+
+
+@pytest.mark.anyio
+async def test_watcher_rebinds_stale_handle_during_output_polling(tmp_path):
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-old",
+        "pane_key": "tab-a:leaf-b",
+        "state": "working",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.deadline = time.monotonic() + 1
+    stale = OrcaError(
+        "Terminal handle belongs to an older runtime",
+        1,
+        code="terminal_handle_stale",
+    )
+    new_output = iter([1000, 1000, 2000])
+
+    async def show(handle):
+        if handle == "term-old":
+            raise stale
+        return {
+            "result": {
+                "terminal": {"lastOutputAt": next(new_output, 2000)},
+            }
+        }
+
+    with patch("osw.watcher.terminal_show", AsyncMock(side_effect=show)) as shown, \
+         patch("osw.watcher.terminal_list", AsyncMock(return_value=[{
+             "handle": "term-new", "tabId": "tab-a", "leafId": "leaf-b",
+         }])), \
+         patch("osw.watcher.worktree_ps", AsyncMock(return_value=[{"agents": []}])), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.FALLBACK_IDLE_STABLE_MS", 0):
+        result = await watcher._wait_turn_done(time.time() * 1000)
+
+    assert result == "fallback_idle"
+    assert [call.args[0] for call in shown.await_args_list[:2]] == [
+        "term-old", "term-new",
+    ]
+    assert state.read_agent(tmp_path, "agent_001")["terminal"] == "term-new"
+
+
+@pytest.mark.anyio
+async def test_tracking_loss_tui_idle_rebinds_stale_handle(tmp_path):
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-old",
+        "pane_key": "tab-a:leaf-b",
+        "state": "working",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.deadline = time.monotonic() + 1
+    now_ms = int(time.time() * 1000)
+    output_times = iter([now_ms, now_ms, now_ms + 5000])
+
+    async def show(_handle):
+        return {
+            "result": {
+                "terminal": {"lastOutputAt": next(output_times, now_ms + 5000)},
+            }
+        }
+
+    ps_results = iter([
+        _ps_result("tab-a:leaf-b", "working"),
+        [{"agents": []}],
+        [{"agents": []}],
+        [{"agents": []}],
+    ])
+    stale = OrcaError(
+        "Terminal handle belongs to an older runtime",
+        1,
+        code="terminal_handle_stale",
+    )
+
+    async def wait(handle, event, timeout_ms):
+        if handle == "term-old":
+            raise stale
+        return {}
+
+    waiting = AsyncMock(side_effect=wait)
+    with patch("osw.watcher.terminal_show", AsyncMock(side_effect=show)), \
+         patch("osw.watcher.worktree_ps", AsyncMock(
+             side_effect=lambda: next(ps_results, [{"agents": []}]),
+         )), \
+         patch("osw.watcher.terminal_wait", waiting), \
+         patch("osw.watcher.terminal_list", AsyncMock(return_value=[{
+             "handle": "term-new", "tabId": "tab-a", "leafId": "leaf-b",
+         }])), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.FALLBACK_IDLE_STABLE_MS", 60_000):
+        result = await watcher._wait_turn_done(time.time() * 1000)
+
+    assert result == "tui_idle"
+    assert [call.args[0] for call in waiting.await_args_list] == [
+        "term-old", "term-new",
+    ]
+    assert state.read_agent(tmp_path, "agent_001")["terminal"] == "term-new"
+
+
+@pytest.mark.anyio
 async def test_untracked_polling_retries_dirty_watcher_state(tmp_path):
     state.init_state_dir(tmp_path)
     state.write_agent(tmp_path, {

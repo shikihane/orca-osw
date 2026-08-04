@@ -15,10 +15,12 @@ directory containing this file.
 2. Ask the human for each undecided choice and record the answer in the current
    project instructions before dispatch. Do not infer a default or search for
    other instruction files.
-3. Initialize the current worktree once with `python <skill-dir>/osw.py init`.
-4. Decompose work, dispatch dependency-ready tasks, and keep integrating while
+3. After installing or upgrading Orca, validate its live contract with
+   `python <skill-dir>/osw.py doctor` before dispatching.
+4. Initialize the current worktree once with `python <skill-dir>/osw.py init`.
+5. Decompose work, dispatch dependency-ready tasks, and keep integrating while
    detached watchers supervise workers.
-5. Accept results only after checking the handoff and actual workspace state.
+6. Accept results only after checking the handoff and actual workspace state.
 
 For multiple workers, dependencies, shared-worktree coordination, or model
 selection, read [references/orchestration.md](references/orchestration.md)

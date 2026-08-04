@@ -5,7 +5,9 @@
 Require Python 3.10+, `anyio`, `typer`, and an `orca` CLI connected to a running
 Orca runtime. Install missing Python packages with
 `python -m pip install anyio typer`; `rich` is optional. Check runtime readiness
-with `orca status` and start it with `orca open` when needed.
+and OSW's required response contract with `python <skill-dir>/osw.py doctor`.
+Use `--json` for a machine-readable report. Start Orca with `orca open` when
+needed.
 
 ## Setup and Discovery
 
@@ -22,6 +24,25 @@ OSW supports `claude`, `codex`, `pi`, and `kimi` for `new`. `kimi` takes
 `--model` (a config.toml alias such as `kimi-code/k3`) but rejects
 `--thinking`: its effort is configured per model alias, not on the command
 line.
+
+## Compatibility and Recovery
+
+Run `doctor` after every Orca upgrade and before dispatching the first worker.
+It probes `status`, `worktree current`, `terminal list`, `terminal show`, and
+`worktree ps` without writing OSW state. A non-zero result means do not
+dispatch: `orca_contract_mismatch` identifies an upstream response shape or
+required-field change; other typed errors identify runtime or CLI failures.
+Checks that require a live terminal or recognized agent may be `unverified`.
+
+CLI selection follows the Orca environment: `ORCA_CLI_COMMAND` overrides the
+command, `ORCA_DEV_REPO_ROOT` selects `orca-dev`, and Linux outside an
+Orca-managed terminal selects `orca-ide`; the default is `orca` on PATH.
+
+Terminal handles are scoped to one Orca runtime. OSW records each managed
+pane's `tabId:leafId`; if Orca reports `terminal_handle_stale`, the watcher
+looks up the pane's current handle, persists it, and retries the read, wait, or
+send operation once. If the pane no longer exists, normal terminal-lost/error
+handling still applies.
 
 ## Dispatch and Continue
 
@@ -66,6 +87,10 @@ workspace and terminal before deciding whether the result is usable.
 
 If caller detection failed, use `list`, `status`, and the reports directory
 instead of assuming the worker is still running.
+
+These notifications are proactive OSW watcher messages delivered with
+`orca terminal send`; they are not Orca-native cross-session notifications.
+They require either caller auto-detection or an explicit `--caller-terminal`.
 
 ## Intervention and Cleanup
 

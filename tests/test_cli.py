@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 
 from osw import state as state_mod
 from osw.cli import app, _spawn_watcher
+from osw.orca_cli import OrcaError
 
 runner = CliRunner()
 
@@ -35,6 +36,85 @@ def test_list_and_status(tmp_path, monkeypatch):
     assert "no agents" in runner.invoke(app, ["list"]).output.lower()
     assert json.loads(runner.invoke(app, ["list", "--json"]).output) == {}
     assert "agents: none" in runner.invoke(app, ["status"]).output.lower()
+
+
+def test_doctor_json_reports_orca_contract_without_init(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    report = {
+        "ok": True,
+        "orca": {"command": ["orca"], "version": "1.4.166"},
+        "runtime": {"state": "ready", "reachable": True},
+        "graph": {"state": "ready"},
+        "worktree": {"path": str(tmp_path)},
+        "contract": {
+            "terminal_list": "ok",
+            "terminal_show": "ok",
+            "worktree_ps": "ok",
+            "agent_status": "ok",
+        },
+        "counts": {"terminals": 1, "worktrees": 2, "agents": 1},
+    }
+
+    with patch(
+        "osw.cli.compatibility_report",
+        AsyncMock(return_value=report),
+        create=True,
+    ):
+        result = runner.invoke(app, ["doctor", "--json"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == report
+
+
+def test_doctor_text_reports_each_checked_contract(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    report = {
+        "ok": True,
+        "orca": {"command": ["orca"], "version": "1.4.166"},
+        "runtime": {"state": "ready", "reachable": True},
+        "graph": {"state": "ready"},
+        "worktree": {"path": str(tmp_path)},
+        "contract": {
+            "terminal_list": "ok",
+            "terminal_show": "ok",
+            "worktree_ps": "ok",
+            "agent_status": "ok",
+        },
+        "counts": {"terminals": 1, "worktrees": 2, "agents": 1},
+    }
+
+    with patch(
+        "osw.cli.compatibility_report",
+        AsyncMock(return_value=report),
+    ):
+        result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "terminal_show=ok" in result.output
+
+
+def test_doctor_json_reports_typed_contract_failure(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    failure = OrcaError(
+        "missing result.terminals",
+        1,
+        code="orca_contract_mismatch",
+    )
+
+    with patch(
+        "osw.cli.compatibility_report",
+        AsyncMock(side_effect=failure),
+    ):
+        result = runner.invoke(app, ["doctor", "--json"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.output) == {
+        "ok": False,
+        "error": {
+            "code": "orca_contract_mismatch",
+            "message": "missing result.terminals",
+        },
+    }
 
 
 def test_logs_command_tails_events_and_filters_agent(tmp_path, monkeypatch):
@@ -97,7 +177,11 @@ def test_new_creates_provider_terminal_agent_file_and_detaches_watcher(tmp_path,
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
 
-    create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
+    create = AsyncMock(return_value={"result": {"terminal": {
+        "handle": "term-new",
+        "tabId": "tab-a",
+        "leafId": "leaf-b",
+    }}})
     spawn = Mock(return_value=4567)
     with patch("osw.cli.terminal_create", create), \
          patch("osw.cli._spawn_watcher", spawn):
@@ -130,6 +214,7 @@ def test_new_creates_provider_terminal_agent_file_and_detaches_watcher(tmp_path,
 
     agent = state_mod.read_agent(tmp_path, "research_001")
     assert agent["terminal"] == "term-new"
+    assert agent["pane_key"] == "tab-a:leaf-b"
     assert agent["prompt"] == "do the task"
     assert "task_started_on_launch" not in agent
     assert agent["caller_terminal"] == "caller-1"

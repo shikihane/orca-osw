@@ -8,7 +8,17 @@
 python -m pip install anyio typer rich
 ```
 
-## 2. 初始化
+## 2. 检查 Orca 兼容性
+
+```bash
+python /path/to/orca-osw/skill/osw.py doctor
+```
+
+这是只读检查；每次升级 Orca 后都应重新运行。脚本中可使用 `--json`；
+响应契约变化时命令会以非零状态退出，并返回可识别的
+`orca_contract_mismatch` 错误码。
+
+## 3. 初始化
 
 ```bash
 cd /你的/项目
@@ -17,7 +27,7 @@ python /path/to/orca-osw/skill/osw.py init
 
 在当前目录创建 `.orca/osw/`，写入默认 `state.json`。
 
-## 3. 查看 provider 模型
+## 4. 查看 provider 模型
 
 ```bash
 python /path/to/orca-osw/skill/osw.py models claude
@@ -27,7 +37,7 @@ python /path/to/orca-osw/skill/osw.py models pi
 
 这是只读操作，不会修改 `.orca/osw/state.json`。
 
-## 4. 创建 agent
+## 5. 创建 agent
 
 ```bash
 python /path/to/orca-osw/skill/osw.py new claude --prefix code --model sonnet --thinking high "修复 src/auth.py 的失败测试"
@@ -39,7 +49,7 @@ python /path/to/orca-osw/skill/osw.py new claude --prefix code --model sonnet --
 Created code_001 on terminal term_xxx (provider: claude)
 ```
 
-## 5. 查看状态
+## 6. 查看状态
 
 ```bash
 python /path/to/orca-osw/skill/osw.py list
@@ -61,7 +71,7 @@ Agents:
 Watchers running: 1
 ```
 
-## 6. 自动交接流程
+## 7. 自动交接流程
 
 当 Orca 报告该轮完成时（`worktree ps`；未识别的 CLI 回退到空闲检测）：
 
@@ -74,13 +84,13 @@ Watchers running: 1
 # [osw] task-finished agent=code_001 terminal=term_xxx report=... handoff=... summary=...
 ```
 
-## 7. 广播消息
+## 8. 广播消息
 
 ```bash
 python /path/to/orca-osw/skill/osw.py all "请暂停当前工作，等待新指令"
 ```
 
-## 8. 接管已有终端
+## 9. 接管已有终端
 
 ```bash
 python /path/to/orca-osw/skill/osw.py use term_yyy --prefix debug "审查 PR 变更"
@@ -89,14 +99,14 @@ python /path/to/orca-osw/skill/osw.py use code_001 "继续这个任务"
 
 终端必须属于当前目录的 worktree。
 
-## 9. 移除 agent
+## 10. 移除 agent
 
 ```bash
 python /path/to/orca-osw/skill/osw.py del agent_001          # 仅从管理中移除
 python /path/to/orca-osw/skill/osw.py del agent_001 --close  # 同时关闭终端
 ```
 
-## 10. 状态与模型发现
+## 11. 状态与模型发现
 
 项目状态刻意保持很小：
 
