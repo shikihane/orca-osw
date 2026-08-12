@@ -567,6 +567,107 @@ async def test_untracked_pane_without_tui_idle_ready_on_output_silence(tmp_path)
 
 
 @pytest.mark.anyio
+async def test_untracked_pane_ready_on_preview_marker(tmp_path):
+    """kimi's fresh-session ready screen names itself in the preview:
+    ready at once, without waiting out any silence window."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    show = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tabId": "tab-a", "leafId": "leaf-b",
+            "lastOutputAt": int(time.time() * 1000),  # just painted
+            "preview": "No session yet — one will be created on your "
+                       "first message.\n > ",
+        }}
+    })
+    ps = AsyncMock(return_value=[{"agents": []}])
+    wait = AsyncMock(side_effect=OrcaError("timeout waiting for tui-idle", 1))
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.POLL_SECS", 0):
+        source = await watcher._wait_ready()
+
+    assert source == "preview_marker"
+
+
+@pytest.mark.anyio
+async def test_untracked_pane_ready_on_composer_after_short_silence(tmp_path):
+    """An idle composer (e.g. an adopted kimi pane mid-conversation,
+    whose preview lacks the fresh-session marker) is ready once output
+    has been silent for the short preview window — no 30s wait."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "continue this",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    silent_since = int(time.time() * 1000) - 15_000
+    show = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tabId": "tab-a", "leafId": "leaf-b",
+            "lastOutputAt": silent_since,
+            # mangled box-drawing glyphs, as on Windows previews
+            "preview": "some earlier output\n\udc82 >    \udc82",
+        }}
+    })
+    ps = AsyncMock(return_value=[{"agents": []}])
+    wait = AsyncMock(side_effect=OrcaError("timeout waiting for tui-idle", 1))
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.POLL_SECS", 0):
+        source = await watcher._wait_ready()
+
+    assert source == "preview_marker"
+
+
+@pytest.mark.anyio
+async def test_composer_without_silence_is_not_ready(tmp_path):
+    """kimi keeps the composer painted mid-turn: a visible composer with
+    fresh output must not count as ready."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "continue this",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    show = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tabId": "tab-a", "leafId": "leaf-b",
+            "lastOutputAt": int(time.time() * 1000),  # still painting
+            "preview": "working...\n\udc82 >    \udc82",
+        }}
+    })
+    ps = AsyncMock(return_value=[{"agents": []}])
+    wait = AsyncMock(side_effect=OrcaError("timeout waiting for tui-idle", 1))
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.READY_TIMEOUT_MS", 50):
+        source = await watcher._wait_ready()
+
+    assert source is None
+
+
+@pytest.mark.anyio
 async def test_untracked_pane_with_recent_output_is_not_ready(tmp_path):
     """Output silence shorter than the stable window must keep waiting."""
     state.init_state_dir(tmp_path)

@@ -8,8 +8,9 @@ shared flow for `new` and `use`:
 
   ready:            wait until the pane can accept a prompt
                     (`worktree ps` "done" for tracked panes,
-                    `tui-idle` otherwise, stable output silence for
-                    TUIs Orca never reports idle)
+                    `tui-idle` otherwise, ready-screen preview markers
+                    or stable output silence for TUIs Orca never
+                    reports idle)
   phase "task":     send the prompt, wait until Orca reports the
                     agent's turn is done
   phase "handoff":  send the fixed wrap-up instruction, wait again,
@@ -67,6 +68,8 @@ log = get_logger("watcher")
 
 POLL_SECS = 2.0                    # worktree ps poll interval
 READY_TIMEOUT_MS = 600_000         # max wait for the agent TUI to come up
+READY_IDLE_STABLE_MS = 30_000      # ready-phase fallback: silent this long = ready
+READY_PREVIEW_SILENCE_MS = 10_000  # composer marker also needs this much silence
 FALLBACK_IDLE_STABLE_MS = 60_000   # untracked CLI: silent this long = turn over
 HARD_TIMEOUT_SECS = 3600           # give up on the whole task after this
 STUCK_NOTIFY_SECS = 300            # tracked agent frozen this long -> tell caller
@@ -84,6 +87,30 @@ HANDOFF_TEMPLATE = (
     "remains or is blocked. Create the file even if the task was "
     "trivial, then stop; do not start any new work."
 )
+
+# Terminal-preview strings proving a kimi TUI has finished starting and
+# sits at its composer. Orca neither tracks kimi in `worktree ps` nor
+# emits tui-idle for it, so these give the ready-wait a fast path that
+# pure output silence cannot. Plain ASCII survives the preview's mangled
+# box-drawing glyphs on Windows; matched against `terminal show`'s
+# preview tail, with output silence and the slow stable window as
+# fallbacks when a future kimi version rewords them.
+READY_PREVIEW_MARKERS = (
+    "one will be created on your first message",  # fresh-session screen
+)
+
+
+def _composer_visible(preview: str) -> bool:
+    """True when the preview ends at an empty `>` composer line.
+
+    kimi keeps the composer painted even mid-turn, so callers must gate
+    this on a minimum output-silence window.
+    """
+    for line in preview.splitlines():
+        text = "".join(ch for ch in line if ch.isprintable()).strip()
+        if text == ">":
+            return True
+    return False
 
 
 def now_iso() -> str:
@@ -271,7 +298,8 @@ class Watcher:
         except OrcaError:
             return False
 
-    async def _last_output_at(self) -> int:
+    async def _terminal_snapshot(self) -> tuple[int, str]:
+        """(lastOutputAt, preview) for the pane, from one terminal show."""
         try:
             data = await terminal_show(self.handle)
         except OrcaError as exc:
@@ -280,7 +308,10 @@ class Watcher:
                 raise
             data = await terminal_show(self.handle)
         term = data.get("result", {}).get("terminal", {})
-        return int(term.get("lastOutputAt") or 0)
+        return int(term.get("lastOutputAt") or 0), str(term.get("preview") or "")
+
+    async def _last_output_at(self) -> int:
+        return (await self._terminal_snapshot())[0]
 
     async def _send_terminal(self, text: str) -> None:
         try:
@@ -362,13 +393,15 @@ class Watcher:
         agents-awaiting-input UI). `tui-idle` is the fallback for panes
         Orca does not track — but Orca only emits tui-idle for TUIs it
         recognizes, so a TUI it neither tracks nor recognizes (e.g.
-        kimi) is ready once its output has been silent for the same
-        stable window the completion fallback uses. Readiness is never
-        treated as task completion: the task prompt is always sent and
-        observed as its own turn afterwards.
+        kimi) is judged on its terminal preview instead: a known
+        ready-screen marker or a composer idle for a short silence
+        window means ready now; otherwise output must stay silent for
+        READY_IDLE_STABLE_MS. Readiness is never treated as task
+        completion: the task prompt is always sent and observed as its
+        own turn afterwards.
 
         Returns the readiness source ("ps_idle" / "tui_idle" /
-        "output_idle"), or None on timeout.
+        "preview_marker" / "output_idle"), or None on timeout.
         """
         deadline = time.monotonic() + READY_TIMEOUT_MS / 1000
         while time.monotonic() < deadline:
@@ -392,11 +425,18 @@ class Watcher:
                 if await self._wait_tui_idle():
                     return "tui_idle"
                 try:
-                    last = await self._last_output_at()
+                    last, preview = await self._terminal_snapshot()
                 except OrcaError:
-                    last = 0
-                if last and time.time() * 1000 - last >= FALLBACK_IDLE_STABLE_MS:
-                    return "output_idle"
+                    last, preview = 0, ""
+                if last:
+                    silent_ms = time.time() * 1000 - last
+                    if any(marker in preview for marker in READY_PREVIEW_MARKERS):
+                        return "preview_marker"
+                    if (silent_ms >= READY_PREVIEW_SILENCE_MS
+                            and _composer_visible(preview)):
+                        return "preview_marker"
+                    if silent_ms >= READY_IDLE_STABLE_MS:
+                        return "output_idle"
             await anyio.sleep(POLL_SECS)
         return None
 
