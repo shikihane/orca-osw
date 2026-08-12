@@ -143,6 +143,18 @@ state.
   module (`tests/test_providers.py` for launch commands, `tests/test_cli.py`
   for user-visible CLI behavior).
 
+## OSW Provider Policy
+
+| Task type | Provider | Model | Thinking |
+|---|---|---|---|
+| test | kimi | kimi-code/k3 | n/a (kimi rejects --thinking; effort is set per model alias in kimi's config.toml) |
+
+Note: `osw models kimi` prints `<display-name> <command>` rows, e.g.
+`kimi-k3   kimi --model kimi-code/k3`. The first column is a display
+label only; `new --model` needs the real alias from the second column
+(`kimi-code/k3`), matching a `[models."..."]` key in `~/.kimi-code/config.toml`.
+Passing the display label causes kimi to fail with `[config.invalid]`.
+
 ## Skill Installation
 
 Install or update the skill with `python install.py`. It physically copies
