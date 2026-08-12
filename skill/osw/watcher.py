@@ -253,11 +253,29 @@ class Watcher:
     async def _notify(self, line: str) -> None:
         caller = self.agent.get("caller_terminal")
         if not caller:
+            # Never drop a completion notification silently: record an
+            # ERROR event so the gap is visible in `osw logs`.
+            log.warning(
+                "notify skipped (agent=%s): no caller_terminal recorded",
+                self.agent_id,
+            )
+            self._event(
+                "notify_skipped",
+                level="ERROR",
+                message="no caller_terminal recorded; notification dropped",
+                data={"line": line},
+            )
             return
         try:
             await terminal_send(caller, line)
         except OrcaError as exc:
             log.warning("notify failed (caller=%s): %s", caller, exc)
+            self._event(
+                "notify_failed",
+                level="ERROR",
+                message=f"failed to notify caller terminal: {exc}",
+                data={"caller_terminal": caller, "line": line},
+            )
 
     async def _rebind_terminal(self) -> bool:
         """Refresh a runtime-scoped handle using the pane's stable identity."""

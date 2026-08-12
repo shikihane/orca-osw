@@ -142,6 +142,38 @@ def _detect_caller_terminal() -> str | None:
     return None
 
 
+def _validate_env_caller() -> str | None:
+    """Return ORCA_TERMINAL_HANDLE if Orca still accepts it.
+
+    The handle is inherited by every orca subcommand; once the hosting
+    terminal is gone, Orca rejects it with ``terminal_handle_stale`` and
+    every osw command fails. Drop it from the environment and fall back
+    to marker detection instead of erroring out.
+    """
+    env_handle = os.environ.get("ORCA_TERMINAL_HANDLE", "").strip()
+    if not env_handle:
+        return None
+    try:
+        anyio.run(terminal_show, env_handle)
+    except OrcaError as exc:
+        if exc.code != "terminal_handle_stale":
+            # Orca unreachable or a transient failure: keep the handle and
+            # let later commands surface the real error.
+            return env_handle
+        log.warning(
+            "ORCA_TERMINAL_HANDLE=%s is stale, ignoring it", env_handle
+        )
+        typer.echo(
+            f"WARNING: ORCA_TERMINAL_HANDLE ({env_handle}) is stale; "
+            "ignoring it and falling back to caller detection.",
+            err=True,
+        )
+        os.environ.pop("ORCA_TERMINAL_HANDLE", None)
+        return None
+    log.info("caller from ORCA_TERMINAL_HANDLE  terminal=%s", env_handle)
+    return env_handle
+
+
 def _maybe_detect_caller(caller_terminal: str | None) -> str | None:
     if caller_terminal:
         return caller_terminal
@@ -149,13 +181,39 @@ def _maybe_detect_caller(caller_terminal: str | None) -> str | None:
     # creates; child processes inherit it, so this works even when osw
     # runs deep inside an agent's tool pipeline where stdout is a pipe
     # and the marker-in-preview trick below cannot work.
-    env_handle = os.environ.get("ORCA_TERMINAL_HANDLE", "").strip()
+    env_handle = _validate_env_caller()
     if env_handle:
-        log.info("caller from ORCA_TERMINAL_HANDLE  terminal=%s", env_handle)
         return env_handle
     if sys.stdin.isatty() and sys.stdout.isatty():
         return _detect_caller_terminal()
+    log.warning("caller detect skipped: stdin/stdout are not TTYs")
     return None
+
+
+def _resolve_caller(caller_terminal: str | None, no_notify: bool) -> str | None:
+    """Resolve the notification target or fail loudly.
+
+    A dispatch without a caller terminal can never report completion, so
+    it is rejected unless the user explicitly opts out via --no-notify.
+    """
+    caller = _maybe_detect_caller(caller_terminal)
+    if caller:
+        return caller
+    if no_notify:
+        typer.echo(
+            "WARNING: no caller terminal identified; completion will NOT "
+            "be reported. Poll `osw.py status` instead.",
+            err=True,
+        )
+        return None
+    typer.echo(
+        "Error: could not identify the caller terminal, so the completion "
+        "notification would be lost. Run from an Orca-managed terminal, "
+        "pass --caller-terminal <handle>, or pass --no-notify to proceed "
+        "without notifications.",
+        err=True,
+    )
+    raise typer.Exit(1)
 
 
 def _unwrap_terminal(data: dict) -> dict:
@@ -418,6 +476,7 @@ def new(
     thinking: str = typer.Option(None, "--thinking", help="Provider thinking/effort value passed through unchanged"),
     prefix: str = typer.Option(None, "--prefix", help="Agent id prefix, e.g. research, code, test, debug, review, misc"),
     caller_terminal: str = typer.Option(None, "--caller-terminal", help="Terminal handle to receive completion reports"),
+    no_notify: bool = typer.Option(False, "--no-notify", help="Proceed without a caller terminal; completion will not be reported"),
 ) -> None:
     """Create a new provider agent terminal and return after starting its watcher."""
     root = resolve_project_root()
@@ -436,6 +495,11 @@ def new(
     except ProviderError as exc:
         typer.echo(f"Error: {exc}")
         raise typer.Exit(1)
+
+    # Resolve the caller before creating anything: a dispatch without a
+    # notification target is rejected, and must not leave an orphan
+    # terminal behind.
+    caller = _resolve_caller(caller_terminal, no_notify)
 
     # The terminal starts the bare provider TUI only; the watcher sends
     # the task prompt as its own observable turn once the TUI is ready.
@@ -472,7 +536,7 @@ def new(
         agent_id,
         handle,
         prompt,
-        _maybe_detect_caller(caller_terminal),
+        caller,
         provider=provider,
         provider_command=provider_command,
         model_name=model or "",
@@ -506,6 +570,7 @@ def use(
     prompt: str = typer.Argument(..., help="Prompt to send to the terminal"),
     prefix: str = typer.Option(None, "--prefix", help="Agent id prefix, e.g. research, code, test, debug, review, misc"),
     caller_terminal: str = typer.Option(None, "--caller-terminal", help="Terminal handle to receive completion reports"),
+    no_notify: bool = typer.Option(False, "--no-notify", help="Proceed without a caller terminal; completion will not be reported"),
 ) -> None:
     """Adopt an already-running terminal as a managed agent."""
     root = resolve_project_root()
@@ -570,7 +635,7 @@ def use(
         agent_id,
         handle,
         prompt,
-        _maybe_detect_caller(caller_terminal),
+        _resolve_caller(caller_terminal, no_notify),
         provider=str((existing_agent or {}).get("provider") or ""),
         provider_command=str((existing_agent or {}).get("provider_command") or ""),
         model_name=str((existing_agent or {}).get("model_name") or ""),

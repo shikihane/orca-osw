@@ -998,6 +998,58 @@ async def test_swallowed_prompt_fails_closed_and_notifies_caller(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_notify_without_caller_records_error_event(tmp_path):
+    """A missing caller_terminal must never silently drop a notification:
+    no send is attempted and an ERROR event lands in events.jsonl."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "caller_terminal": None,
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    send = AsyncMock(return_value={})
+
+    with patch("osw.watcher.terminal_send", send):
+        await watcher._notify("# [osw] task-finished agent_001")
+
+    send.assert_not_awaited()
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert '"event": "notify_skipped"' in events
+    assert '"level": "ERROR"' in events
+
+
+@pytest.mark.anyio
+async def test_notify_send_failure_records_error_event(tmp_path):
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "caller_terminal": "term-caller",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    send = AsyncMock(
+        side_effect=OrcaError("terminal handle is stale", 1, code="terminal_handle_stale")
+    )
+
+    with patch("osw.watcher.terminal_send", send):
+        await watcher._notify("# [osw] task-finished agent_001")
+
+    send.assert_awaited_once()
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert '"event": "notify_failed"' in events
+    assert '"level": "ERROR"' in events
+
+
+@pytest.mark.anyio
 async def test_prompt_echoed_in_ps_counts_as_receipt(tmp_path):
     """If ps reports our prompt text on the pane, the CLI took the
     input — no receipt alarm even without a working observation."""

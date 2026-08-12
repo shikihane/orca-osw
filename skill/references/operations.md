@@ -47,12 +47,17 @@ handling still applies.
 ## Dispatch and Continue
 
 ```text
-python <skill-dir>/osw.py new <provider> [--prefix <role>] [--model <model>] [--thinking <level>] [--caller-terminal <handle>] "<task>"
-python <skill-dir>/osw.py use <agent-id-or-terminal> [--prefix <role>] [--caller-terminal <handle>] "<task>"
+python <skill-dir>/osw.py new <provider> [--prefix <role>] [--model <model>] [--thinking <level>] [--caller-terminal <handle>] [--no-notify] "<task>"
+python <skill-dir>/osw.py use <agent-id-or-terminal> [--prefix <role>] [--caller-terminal <handle>] [--no-notify] "<task>"
 ```
 
-In an interactive terminal, OSW attempts to detect the caller automatically;
-pass `--caller-terminal` only when a known handle must receive notifications.
+OSW resolves the notification target in this order: `--caller-terminal`,
+then the inherited `ORCA_TERMINAL_HANDLE` (validated first; a stale handle
+is dropped with a warning instead of aborting the dispatch), then
+marker-based auto-detection in an interactive Orca terminal. If no caller
+can be identified, the dispatch is rejected — an agent that can never
+report completion is not created. Pass `--no-notify` to proceed anyway;
+OSW prints a warning and you must poll `list`/`status` yourself.
 
 `use <agent-id>` requires a finished managed agent and preserves its id and
 provider context; do not pass `--prefix`. `use <terminal>` adopts a terminal in
@@ -85,12 +90,16 @@ worker's work summary.
 A `task-finished` notification can report `handoff_missing`; inspect the actual
 workspace and terminal before deciding whether the result is usable.
 
-If caller detection failed, use `list`, `status`, and the reports directory
-instead of assuming the worker is still running.
+If a dispatch went out with `--no-notify`, use `list`, `status`, and the
+reports directory instead of assuming the worker is still running.
+Notifications that cannot be delivered (missing or stale caller handle)
+are recorded as ERROR events in `osw logs`, never dropped silently.
 
 These notifications are proactive OSW watcher messages delivered with
 `orca terminal send`; they are not Orca-native cross-session notifications.
-They require either caller auto-detection or an explicit `--caller-terminal`.
+They require a resolved caller terminal at dispatch time (`--caller-terminal`,
+a valid inherited `ORCA_TERMINAL_HANDLE`, or auto-detection), unless the
+dispatch explicitly opted out with `--no-notify`.
 
 ## Intervention and Cleanup
 

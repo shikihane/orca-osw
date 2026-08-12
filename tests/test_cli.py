@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -237,7 +238,9 @@ def test_new_detects_caller_from_orca_env(tmp_path, monkeypatch):
     monkeypatch.setenv("ORCA_TERMINAL_HANDLE", "term-host")
 
     create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
+    show = AsyncMock(return_value={"result": {"terminal": {"handle": "term-host"}}})
     with patch("osw.cli.terminal_create", create), \
+         patch("osw.cli.terminal_show", show), \
          patch("osw.cli._spawn_watcher", Mock(return_value=4567)):
         result = runner.invoke(app, ["new", "claude", "do the task"])
 
@@ -262,6 +265,84 @@ def test_explicit_caller_terminal_beats_orca_env(tmp_path, monkeypatch):
     assert result.exit_code == 0
     agent = state_mod.read_agent(tmp_path, "agent_001")
     assert agent["caller_terminal"] == "caller-1"
+
+
+def test_new_fails_loudly_when_caller_unknown(tmp_path, monkeypatch):
+    """No env handle and no TTY (agent tool pipeline): dispatch is rejected
+    instead of silently creating an agent that can never report back."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+
+    create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
+    with patch("osw.cli.terminal_create", create), \
+         patch("osw.cli._spawn_watcher", Mock(return_value=4567)):
+        result = runner.invoke(app, ["new", "claude", "do the task"])
+
+    assert result.exit_code == 1
+    assert "could not identify the caller terminal" in result.output
+    assert "--no-notify" in result.output
+    create.assert_not_awaited()
+    assert not list(tmp_path.glob(".orca/osw/agents/*.json"))
+
+
+def test_new_no_notify_proceeds_with_warning(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+
+    create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
+    with patch("osw.cli.terminal_create", create), \
+         patch("osw.cli._spawn_watcher", Mock(return_value=4567)):
+        result = runner.invoke(app, ["new", "claude", "--no-notify", "do the task"])
+
+    assert result.exit_code == 0
+    assert "completion will NOT be reported" in result.output
+    agent = state_mod.read_agent(tmp_path, "agent_001")
+    assert agent["caller_terminal"] is None
+
+
+def test_new_stale_env_handle_falls_back_instead_of_erroring(tmp_path, monkeypatch):
+    """A stale ORCA_TERMINAL_HANDLE used to abort dispatch with
+    terminal_handle_stale; now it is dropped with a warning."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.setenv("ORCA_TERMINAL_HANDLE", "term-gone")
+
+    show = AsyncMock(
+        side_effect=OrcaError("terminal handle is stale", 1, code="terminal_handle_stale")
+    )
+    create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
+    with patch("osw.cli.terminal_show", show), \
+         patch("osw.cli.terminal_create", create), \
+         patch("osw.cli._spawn_watcher", Mock(return_value=4567)):
+        result = runner.invoke(app, ["new", "claude", "--no-notify", "do the task"])
+
+    assert result.exit_code == 0
+    assert "term-gone" in result.output
+    assert "stale" in result.output
+    assert os.environ.get("ORCA_TERMINAL_HANDLE") is None
+    agent = state_mod.read_agent(tmp_path, "agent_001")
+    assert agent["caller_terminal"] is None
+
+
+def test_new_keeps_env_handle_on_transient_orca_error(tmp_path, monkeypatch):
+    """Only terminal_handle_stale drops the handle; other failures (e.g.
+    Orca unreachable) keep it so the real error surfaces later."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.setenv("ORCA_TERMINAL_HANDLE", "term-host")
+
+    show = AsyncMock(side_effect=OrcaError("connection refused", 1))
+    create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
+    with patch("osw.cli.terminal_show", show), \
+         patch("osw.cli.terminal_create", create), \
+         patch("osw.cli._spawn_watcher", Mock(return_value=4567)):
+        result = runner.invoke(app, ["new", "claude", "do the task"])
+
+    assert result.exit_code == 0
+    agent = state_mod.read_agent(tmp_path, "agent_001")
+    assert agent["caller_terminal"] == "term-host"
 
 
 def test_spawn_watcher_hides_detached_process_on_windows(tmp_path):
@@ -304,6 +385,7 @@ def test_new_rejects_unknown_provider(tmp_path, monkeypatch):
 def test_use_adopts_terminal_with_terminal_show_result_unwrap(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
 
     show = AsyncMock(return_value={
         "result": {
@@ -317,7 +399,8 @@ def test_use_adopts_terminal_with_terminal_show_result_unwrap(tmp_path, monkeypa
     with patch("osw.cli.terminal_show", show), \
          patch("osw.cli._spawn_watcher", spawn):
         result = runner.invoke(
-            app, ["use", "term-existing", "--prefix", "debug", "continue this"]
+            app,
+            ["use", "term-existing", "--prefix", "debug", "--no-notify", "continue this"],
         )
 
     assert result.exit_code == 0
@@ -333,6 +416,7 @@ def test_use_adopts_terminal_with_terminal_show_result_unwrap(tmp_path, monkeypa
 def test_use_accepts_existing_agent_id(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
     state_mod.write_agent(tmp_path, {
         "agent_id": "agent_001",
         "terminal": "term-existing",
@@ -363,7 +447,7 @@ def test_use_accepts_existing_agent_id(tmp_path, monkeypatch):
     with patch("osw.cli.terminal_show", show), \
          patch("osw.cli.terminal_send", send), \
          patch("osw.cli._spawn_watcher", spawn):
-        result = runner.invoke(app, ["use", "agent_001", "continue this"])
+        result = runner.invoke(app, ["use", "agent_001", "--no-notify", "continue this"])
 
     assert result.exit_code == 0
     assert "Reused agent_001" in result.output
@@ -378,6 +462,7 @@ def test_use_accepts_existing_agent_id(tmp_path, monkeypatch):
 def test_use_existing_agent_id_reuses_same_id(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
     state_mod.write_agent(tmp_path, {
         "agent_id": "research_099",
         "terminal": "term-existing",
@@ -404,7 +489,7 @@ def test_use_existing_agent_id_reuses_same_id(tmp_path, monkeypatch):
     spawn = Mock(return_value=9876)
     with patch("osw.cli.terminal_show", show), \
          patch("osw.cli._spawn_watcher", spawn):
-        result = runner.invoke(app, ["use", "research_099", "continue this"])
+        result = runner.invoke(app, ["use", "research_099", "--no-notify", "continue this"])
 
     assert result.exit_code == 0
     assert "Reused research_099" in result.output
