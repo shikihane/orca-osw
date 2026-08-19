@@ -29,6 +29,7 @@ from osw.orca_cli import (
     detect_current_terminal,
     terminal_close,
     terminal_create,
+    terminal_list,
     terminal_send,
     terminal_show,
     worktree_ps,
@@ -251,6 +252,28 @@ def _resolve_terminal_arg(root: Path, value: str) -> tuple[str, dict | None]:
     except FileNotFoundError:
         return value, None
     return str(agent.get("terminal") or value), agent
+
+
+async def _refresh_stale_handle(root: Path, pane_key: str | None) -> str | None:
+    """Re-resolve a stale runtime-scoped handle via the pane's stable identity.
+
+    Mirrors the watcher's _rebind_terminal: handles die with the Orca
+    runtime, but tabId:leafId survives, so the current handle for the
+    same pane can be looked up in `terminal list`.
+    """
+    if not pane_key:
+        return None
+    try:
+        terminals = await terminal_list(f"path:{root}")
+    except OrcaError:
+        return None
+    for terminal in terminals:
+        tab = terminal.get("tabId")
+        leaf = terminal.get("leafId")
+        handle = terminal.get("handle")
+        if handle and f"{tab}:{leaf}" == pane_key:
+            return str(handle)
+    return None
 
 
 def _script_path() -> Path:
@@ -614,16 +637,47 @@ def use(
     try:
         data = anyio.run(terminal_show, terminal)
     except OrcaError as exc:
+        # A stale handle is recoverable exactly once: look the pane up by
+        # its stable tabId:leafId and retry with the current handle —
+        # the same rebind the watcher performs internally, applied here
+        # at the `use` entry point too.
+        rebound = None
+        if exc.code == "terminal_handle_stale":
+            pane_key = str((existing_agent or {}).get("pane_key") or "")
+            rebound = anyio.run(_refresh_stale_handle, root, pane_key or None)
+        if rebound is None:
+            emit_event(
+                logs_dir(root),
+                component="cli",
+                event="terminal_show_failed",
+                level="ERROR",
+                terminal=terminal,
+                message=exc.message,
+            )
+            typer.echo(f"Error: {exc.message}")
+            raise typer.Exit(1)
         emit_event(
             logs_dir(root),
             component="cli",
-            event="terminal_show_failed",
-            level="ERROR",
-            terminal=terminal,
-            message=exc.message,
+            event="terminal_rebound",
+            terminal=rebound,
+            message="stale handle re-resolved by pane identity",
+            data={"previous": terminal, "current": rebound},
         )
-        typer.echo(f"Error: {exc.message}")
-        raise typer.Exit(1)
+        terminal = rebound
+        try:
+            data = anyio.run(terminal_show, terminal)
+        except OrcaError as exc2:
+            emit_event(
+                logs_dir(root),
+                component="cli",
+                event="terminal_show_failed",
+                level="ERROR",
+                terminal=terminal,
+                message=exc2.message,
+            )
+            typer.echo(f"Error: {exc2.message}")
+            raise typer.Exit(1)
 
     terminal_obj = _unwrap_terminal(data)
     worktree_path = _terminal_worktree_path(terminal_obj)

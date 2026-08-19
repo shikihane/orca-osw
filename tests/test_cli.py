@@ -600,6 +600,74 @@ def test_use_rejects_wrong_worktree(tmp_path, monkeypatch):
     assert state_mod.list_agents(tmp_path) == {}
 
 
+def test_use_recovers_stale_handle_via_pane_identity(tmp_path, monkeypatch):
+    """A done agent whose runtime-scoped handle went stale (Orca runtime
+    restarted) must be re-resolved by its stable pane identity and
+    adopted, instead of failing with terminal_handle_stale."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-old",
+        "pane_key": "tab-a:leaf-b",
+        "worktree_path": str(tmp_path),
+        "state": "done",
+        "prompt": "old task",
+    })
+    stale = OrcaError(
+        "Terminal handle belongs to an older runtime",
+        1,
+        code="terminal_handle_stale",
+    )
+    show = AsyncMock(side_effect=[
+        stale,
+        {"result": {"terminal": {
+            "handle": "term-new",
+            "worktreePath": str(tmp_path),
+            "tabId": "tab-a",
+            "leafId": "leaf-b",
+        }}},
+    ])
+    terminals = AsyncMock(return_value=[{
+        "handle": "term-new", "tabId": "tab-a", "leafId": "leaf-b",
+    }])
+    spawn = Mock(return_value=9876)
+    with patch("osw.cli.terminal_show", show), \
+         patch("osw.cli.terminal_list", terminals), \
+         patch("osw.cli._spawn_watcher", spawn):
+        result = runner.invoke(app, ["use", "agent_001", "--no-notify", "continue this"])
+
+    assert result.exit_code == 0
+    assert "Reused agent_001 on terminal term-new" in result.output
+    assert [call.args[0] for call in show.await_args_list] == [
+        "term-old", "term-new",
+    ]
+    agent = state_mod.read_agent(tmp_path, "agent_001")
+    assert agent["terminal"] == "term-new"
+    spawn.assert_called_once_with(tmp_path, "agent_001")
+
+
+def test_use_stale_handle_without_pane_still_fails_loudly(tmp_path, monkeypatch):
+    """No recorded pane identity means nothing to rebind to: keep the
+    original error-and-exit behavior."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    stale = OrcaError(
+        "Terminal handle belongs to an older runtime",
+        1,
+        code="terminal_handle_stale",
+    )
+    show = AsyncMock(side_effect=stale)
+    with patch("osw.cli.terminal_show", show):
+        result = runner.invoke(app, ["use", "term-gone", "--no-notify", "task"])
+
+    assert result.exit_code == 1
+    assert "older runtime" in result.output
+    assert state_mod.list_agents(tmp_path) == {}
+
+
 def test_all_broadcasts_to_agent_files(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
