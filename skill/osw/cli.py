@@ -37,6 +37,7 @@ from osw.process import hidden_subprocess_kwargs
 from osw.providers import (
     ProviderError,
     build_provider_command,
+    ensure_workspace_trust,
     probe_variants,
     scan_agent_clis,
 )
@@ -504,6 +505,18 @@ def new(
     # notification target is rejected, and must not leave an orphan
     # terminal behind.
     caller = _resolve_caller(caller_terminal, no_notify)
+
+    # Pre-record workspace trust so the provider TUI does not block on
+    # its interactive "trust this directory?" prompt in a fresh worktree.
+    trust_note = ensure_workspace_trust(provider, root)
+    if trust_note:
+        emit_event(
+            logs_dir(root),
+            component="cli",
+            event="workspace_trust",
+            message=trust_note,
+            data={"provider": provider, "root": str(root)},
+        )
 
     # The terminal starts the bare provider TUI only; the watcher sends
     # the task prompt as its own observable turn once the TUI is ready.

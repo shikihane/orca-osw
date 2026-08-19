@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import tomllib
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -11,6 +14,7 @@ from osw.providers import (
     ProviderError,
     build_provider_command,
     codex_variants,
+    ensure_workspace_trust,
     kimi_variants,
     parse_claude_aliases,
     parse_omp_models,
@@ -267,3 +271,50 @@ def test_build_provider_command_strips_optional_values():
         "claude", model=" sonnet ", thinking="  ",
     ) == "claude --dangerously-skip-permissions --model sonnet"
 
+
+# --- ensure_workspace_trust ---
+
+def test_trust_claude_writes_and_preserves(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    conf = tmp_path / ".claude.json"
+    conf.write_text(json.dumps({"numStartups": 1, "projects": {}}), encoding="utf-8")
+    root = tmp_path / "proj"
+    assert ensure_workspace_trust("claude", root) == "trusted"
+    data = json.loads(conf.read_text(encoding="utf-8"))
+    assert data["numStartups"] == 1
+    assert data["projects"][root.as_posix()]["hasTrustDialogAccepted"] is True
+    # idempotent
+    assert ensure_workspace_trust("claude", root) == "already trusted"
+
+
+def test_trust_codex_appends_toml(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    codex = tmp_path / ".codex"
+    codex.mkdir()
+    conf = codex / "config.toml"
+    conf.write_text('model = "gpt-5.2"\n', encoding="utf-8")
+    root = tmp_path / "proj"
+    assert ensure_workspace_trust("codex", root) == "trusted"
+    with conf.open("rb") as f:
+        data = tomllib.load(f)
+    assert data["model"] == "gpt-5.2"
+    assert data["projects"][str(root)]["trust_level"] == "trusted"
+    # idempotent
+    assert ensure_workspace_trust("codex", root) == "already trusted"
+
+
+def test_trust_kimi_writes_hash_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "proj"
+    assert ensure_workspace_trust("kimi", root) == "trusted"
+    digest = hashlib.sha256(root.as_posix().encode()).hexdigest()[:12]
+    trust_file = tmp_path / ".kimi-code" / "workspace-trust" / f"wd_proj_{digest}"
+    payload = json.loads(trust_file.read_text(encoding="utf-8"))
+    assert payload["root"] == root.as_posix()
+    assert payload["trustedAt"] > 0
+    # idempotent
+    assert ensure_workspace_trust("kimi", root) == "already trusted"
+
+
+def test_trust_unknown_provider_is_noop(tmp_path):
+    assert ensure_workspace_trust("pi", tmp_path) == ""

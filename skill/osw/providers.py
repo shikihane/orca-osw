@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
 import subprocess
+import time
 import tomllib
 from pathlib import Path
 
@@ -90,6 +92,82 @@ def build_provider_command(
             flag = "--effort" if provider == "claude" else "--thinking"
             args += [flag, thinking]
     return " ".join(_quote_command_arg(arg) for arg in args)
+
+
+def ensure_workspace_trust(provider: str, root: Path) -> str:
+    """Pre-record workspace trust so the provider TUI skips its
+    interactive "trust this directory?" prompt on first launch.
+
+    Best-effort and idempotent: returns a short note of what was done
+    ("" for providers without a known trust store), and never raises —
+    a failed write just means the prompt appears as before.
+    """
+    try:
+        if provider == "claude":
+            return _trust_claude(root)
+        if provider == "codex":
+            return _trust_codex(root)
+        if provider == "kimi":
+            return _trust_kimi(root)
+    except OSError:
+        return "trust pre-record failed"
+    return ""
+
+
+def _trust_claude(root: Path) -> str:
+    """claude keeps per-project trust in ~/.claude.json as
+    projects["<posix path>"].hasTrustDialogAccepted."""
+    path = Path.home() / ".claude.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    projects = data.setdefault("projects", {})
+    entry = projects.setdefault(root.as_posix(), {})
+    if entry.get("hasTrustDialogAccepted") is True:
+        return "already trusted"
+    entry["hasTrustDialogAccepted"] = True
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return "trusted"
+
+
+def _trust_codex(root: Path) -> str:
+    """codex keeps trust in ~/.codex/config.toml as
+    [projects."<windows path>"] trust_level = "trusted"."""
+    path = Path.home() / ".codex" / "config.toml"
+    key = str(root).replace("\\", "\\\\").replace('"', '\\"')
+    try:
+        with path.open("rb") as f:
+            config = tomllib.load(f)
+    except FileNotFoundError:
+        config = {}
+    projects = config.get("projects")
+    if isinstance(projects, dict):
+        entry = projects.get(str(root))
+        if isinstance(entry, dict) and entry.get("trust_level") == "trusted":
+            return "already trusted"
+    with path.open("a", encoding="utf-8") as f:
+        f.write(f'\n[projects."{key}"]\ntrust_level = "trusted"\n')
+    return "trusted"
+
+
+def _trust_kimi(root: Path) -> str:
+    """kimi keeps trust in ~/.kimi-code/workspace-trust/ as
+    wd_<basename-lower>_<sha256(posix root)[:12]> JSON files."""
+    posix_root = root.as_posix()
+    digest = hashlib.sha256(posix_root.encode("utf-8")).hexdigest()[:12]
+    slug = re.sub(r"[^a-z0-9._-]+", "-", root.name.lower()).strip("-") or "root"
+    path = Path.home() / ".kimi-code" / "workspace-trust" / f"wd_{slug}_{digest}"
+    if path.exists():
+        return "already trusted"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"root": posix_root, "trustedAt": int(time.time() * 1000)}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return "trusted"
 
 
 def scan_agent_clis(probe_version: bool = True) -> list[dict]:

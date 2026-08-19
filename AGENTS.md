@@ -47,7 +47,10 @@ and any CLI examples affected by the change. Link related issues when available.
 ## Security & Configuration Tips
 
 Provider launch commands may include autonomy flags such as Claude permission
-bypass or Codex sandbox bypass. Use them only in trusted, externally controlled
+bypass or Codex sandbox bypass. Before launch, `osw new` also pre-records
+workspace trust for claude/codex/kimi (via `ensure_workspace_trust` in
+`skill/osw/providers.py`) so the TUI skips its interactive "trust this
+directory?" prompt. Use them only in trusted, externally controlled
 workspaces. Do not commit generated `.orca/` runtime state, local logs, reports,
 or handoff files.
 
