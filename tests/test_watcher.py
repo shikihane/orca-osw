@@ -219,6 +219,9 @@ async def test_watcher_retries_prompt_after_stale_handle_rebind(tmp_path):
              "handle": "term-new", "tabId": "tab-a", "leafId": "leaf-b",
          }])), \
          patch.object(Watcher, "_wait_turn_done", finish_turn), \
+         patch.object(
+             Watcher, "_verify_prompt_echo", AsyncMock(return_value=True),
+         ), \
          patch("osw.watcher._handoff_ok", return_value=True):
         await Watcher(tmp_path, "agent_001").run()
 
@@ -388,6 +391,9 @@ async def test_watcher_emits_trace_events(tmp_path):
          })), \
          patch("osw.watcher.terminal_send", AsyncMock(return_value={})), \
          patch("osw.watcher._handoff_ok", return_value=True), \
+         patch.object(
+             Watcher, "_verify_prompt_echo", AsyncMock(return_value=True),
+         ), \
          patch.object(Watcher, "_wait_turn_done", fake_wait_turn_done):
         await Watcher(tmp_path, "agent_001").run()
 
@@ -445,6 +451,9 @@ async def test_startup_idle_is_readiness_not_completion(tmp_path):
          patch("osw.watcher.terminal_wait", wait), \
          patch("osw.watcher.terminal_send", send), \
          patch("osw.watcher.POLL_SECS", 0), \
+         patch.object(
+             Watcher, "_verify_prompt_echo", AsyncMock(return_value=True),
+         ), \
          patch("osw.watcher._handoff_ok", return_value=True):
         await Watcher(tmp_path, "agent_001").run()
 
@@ -491,6 +500,9 @@ async def test_no_post_send_task_evidence_fails_closed(tmp_path):
          patch("osw.watcher.terminal_wait", wait), \
          patch("osw.watcher.terminal_send", send), \
          patch("osw.watcher.POLL_SECS", 0), \
+         patch.object(
+             Watcher, "_verify_prompt_echo", AsyncMock(return_value=True),
+         ), \
          patch("osw.watcher.HARD_TIMEOUT_SECS", 0.1):
         await Watcher(tmp_path, "agent_001").run()
 
@@ -1218,3 +1230,127 @@ def test_handoff_template_covers_background_tasks():
     instruction = HANDOFF_TEMPLATE.format(path="C:/x/handoff.md")
     assert "background task" in instruction
     assert "\n" not in instruction
+
+
+@pytest.mark.anyio
+async def test_missing_prompt_echo_resends_once_and_alarms(tmp_path):
+    """The trust-dialog failure mode: the prompt went somewhere that is
+    not the composer, so it never appears in the terminal preview. The
+    watcher must resend once and raise an alarm when it is still
+    invisible afterwards."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "caller_terminal": "term-caller",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    show = AsyncMock(return_value={
+        "result": {"terminal": {
+            "lastOutputAt": 1000,
+            "preview": "Trust this folder?\n > Yes  > No",
+        }}
+    })
+    send = AsyncMock(return_value={})
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn("do the task", phase="task")
+
+    assert result == "fallback_idle"
+    sent = [call.args[1] for call in send.await_args_list]
+    # prompt, resend, then the caller alarm
+    assert sent[:2] == ["do the task", "do the task"]
+    assert any("prompt-echo-unverified" in line for line in sent[2:])
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert events.count('"event": "prompt_echo_missing"') == 2
+    assert '"event": "turn_resent"' in events
+
+
+@pytest.mark.anyio
+async def test_prompt_echo_check_abstains_on_pure_non_ascii(tmp_path):
+    """A fully non-ASCII prompt cannot survive the Windows preview's
+    mangling, so a mismatch proves nothing: no resend, no alarm."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    show = AsyncMock(return_value={
+        "result": {"terminal": {"lastOutputAt": 1000, "preview": "??"}},
+    })
+    send = AsyncMock(return_value={})
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn("请总结一下这个项目的架构", phase="task")
+
+    assert result == "fallback_idle"
+    send.assert_awaited_once()
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "prompt_echo_missing" not in events
+
+
+@pytest.mark.anyio
+async def test_blocking_dialog_is_never_ready(tmp_path):
+    """A silent terminal showing kimi's 'Trust this folder?' dialog is
+    a blocked screen, not an idle composer: readiness must not fire,
+    and the dialog must be surfaced to the caller."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "caller_terminal": "term-caller",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    silent_since = int(time.time() * 1000) - 120_000
+    show = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tabId": "tab-a", "leafId": "leaf-b",
+            "lastOutputAt": silent_since,
+            "preview": "Trust this folder?\n > Yes, trust  > No",
+        }}
+    })
+    ps = AsyncMock(return_value=[{"agents": []}])
+    wait = AsyncMock(side_effect=OrcaError("timeout waiting for tui-idle", 1))
+    send = AsyncMock(return_value={})
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.READY_TIMEOUT_MS", 50):
+        source = await watcher._wait_ready()
+
+    assert source is None
+    send.assert_awaited_once()
+    assert "agent-dialog" in send.await_args.args[1]
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert '"event": "blocking_dialog_detected"' in events

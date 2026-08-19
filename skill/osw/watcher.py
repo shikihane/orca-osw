@@ -107,6 +107,28 @@ READY_PREVIEW_MARKERS = (
     "one will be created on your first message",  # fresh-session screen
 )
 
+# A modal first-run dialog is the classic prompt swallow: the composer
+# is not what receives keyboard input while one of these is up, so a
+# pane showing one is never ready no matter how silent its output is.
+BLOCKING_DIALOG_MARKERS = (
+    "Trust this folder",
+)
+
+# Post-send prompt verification: the terminal preview is re-read after
+# the send and the prompt's ASCII fragment must be visible (echoed in
+# the composer or the conversation). Non-ASCII text is mangled in
+# Windows previews, so the check compares only printable ASCII and
+# abstains when the prompt carries too little of it.
+PROMPT_ECHO_DELAY_SECS = 3.0
+PROMPT_ECHO_MIN_CHARS = 8
+
+
+def _ascii_fragment(text: str) -> str:
+    """The part of `text` that survives a Windows terminal preview."""
+    flat = one_line(text)
+    fragment = "".join(ch for ch in flat if ch.isascii() and ch.isprintable())
+    return " ".join(fragment.split())
+
 
 def _composer_visible(preview: str) -> bool:
     """True when the preview ends at an empty `>` composer line.
@@ -349,6 +371,30 @@ class Watcher:
                 raise
         await terminal_send(self.handle, text)
 
+    async def _verify_prompt_echo(self, text: str) -> bool | None:
+        """Re-read the terminal and check the sent prompt is visible.
+
+        Returns True/False, or None when no verdict is possible: the
+        prompt is too non-ASCII to survive preview mangling (a mismatch
+        proves nothing then), or the terminal cannot be read.
+        """
+        fragment = _ascii_fragment(text)
+        if len(fragment) < PROMPT_ECHO_MIN_CHARS:
+            return None
+        # Two looks before judging: the TUI may need a moment to render
+        # the submitted message into the preview.
+        for _ in range(2):
+            await anyio.sleep(PROMPT_ECHO_DELAY_SECS)
+            try:
+                _, preview = await self._terminal_snapshot()
+            except OrcaError:
+                return None
+            # Compare on a prefix: the composer may wrap or clip a long
+            # prompt, but a submitted turn shows its head.
+            if fragment[:32] in _ascii_fragment(preview):
+                return True
+        return False
+
     async def run(self) -> None:
         self._update(watcher_pid=os.getpid(), state="starting")
         self._event("watcher_started", data={"pid": os.getpid()})
@@ -430,6 +476,7 @@ class Watcher:
         "preview_marker" / "output_idle"), or None on timeout.
         """
         deadline = time.monotonic() + READY_TIMEOUT_MS / 1000
+        dialog_notified = False
         while time.monotonic() < deadline:
             if self.pane is None:
                 self.pane = await _pane_key(self.handle)
@@ -454,7 +501,25 @@ class Watcher:
                     last, preview = await self._terminal_snapshot()
                 except OrcaError:
                     last, preview = 0, ""
-                if last:
+                # A modal dialog (e.g. kimi's first-run "Trust this
+                # folder?") means the composer is not the input target:
+                # silence here is a blocked screen, never readiness.
+                if any(m in preview for m in BLOCKING_DIALOG_MARKERS):
+                    if not dialog_notified:
+                        dialog_notified = True
+                        self._event(
+                            "blocking_dialog_detected",
+                            level="ERROR",
+                            message="modal dialog is up; "
+                                    "the prompt would be swallowed",
+                        )
+                        await self._notify(
+                            f"# [osw] agent-dialog agent={self.agent_id}"
+                            f" terminal={self.handle}"
+                            " (a modal dialog is blocking the agent; "
+                            "answer it directly in that terminal)"
+                        )
+                elif last:
                     silent_ms = time.time() * 1000 - last
                     if any(marker in preview for marker in READY_PREVIEW_MARKERS):
                         return "preview_marker"
@@ -508,6 +573,47 @@ class Watcher:
             "turn_sent",
             data={"phase": phase, "chars": len(text)},
         )
+        # Belt-and-suspenders against a swallowed prompt (modal dialog,
+        # login screen): the text must be visible in the terminal it was
+        # sent to. One resend, then an alarm — the turn supervision
+        # below still decides the outcome.
+        echoed = await self._verify_prompt_echo(text)
+        if echoed is False:
+            log.warning(
+                "watcher(%s): prompt not visible in terminal, resending",
+                self.agent_id,
+            )
+            self._event(
+                "prompt_echo_missing",
+                level="WARNING",
+                message="prompt not visible in terminal preview; resending once",
+                data={"phase": phase},
+            )
+            try:
+                await self._send_terminal(text)
+            except OrcaError as exc:
+                log.error("watcher(%s): resend failed: %s", self.agent_id, exc)
+                self._event(
+                    "turn_send_failed",
+                    level="ERROR",
+                    message=str(exc),
+                    data={"phase": phase},
+                )
+                return "send_failed"
+            self._event("turn_resent", data={"phase": phase})
+            echoed = await self._verify_prompt_echo(text)
+            if echoed is False:
+                self._event(
+                    "prompt_echo_missing",
+                    level="ERROR",
+                    message="prompt still not visible after resend",
+                    data={"phase": phase},
+                )
+                await self._notify(
+                    f"# [osw] prompt-echo-unverified agent={self.agent_id}"
+                    f" terminal={self.handle}"
+                    " (prompt may have been swallowed; check that terminal)"
+                )
         source = await self._wait_turn_done(
             sent_at_ms, baseline_state_started, sent_text=text
         )
