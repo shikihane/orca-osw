@@ -40,6 +40,7 @@ stable-silence window instead.
 from __future__ import annotations
 
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -84,9 +85,16 @@ HANDOFF_TEMPLATE = (
     "Task wrap-up: the task above is finished. Write a concise English "
     "handoff document to {path} (markdown) covering: 1) what you did, "
     "2) key findings and decisions, 3) files you modified, 4) what "
-    "remains or is blocked. Create the file even if the task was "
-    "trivial, then stop; do not start any new work."
+    "remains or is blocked. If any of your background tasks are still "
+    "running, wait for them to finish and fold their results into the "
+    "handoff before writing the file. Create the file even if the task "
+    "was trivial, then stop; do not start any new work."
 )
+
+# kimi paints this status badge while its own background bash tasks are
+# still running; the TUI itself sits idle then, so output-silence alone
+# would mistake "waiting on background tasks" for "turn finished".
+BACKGROUND_TASK_BADGE_RE = re.compile(r"\[\d+ tasks? running\]")
 
 # Terminal-preview strings proving a kimi TUI has finished starting and
 # sits at its composer. Orca neither tracks kimi in `worktree ps` nor
@@ -527,6 +535,7 @@ class Watcher:
         activity_observed = False
         ask_notified = False
         stall_notified = False
+        background_defer_notified = False
 
         while time.monotonic() < self.deadline:
             await anyio.sleep(POLL_SECS)
@@ -649,7 +658,7 @@ class Watcher:
             # freshly spawned pane yet, and real evidence beats these
             # heuristics the moment it appears.
             try:
-                last = await self._last_output_at()
+                last, preview = await self._terminal_snapshot()
             except OrcaError:
                 return "terminal_lost"
             if last > baseline_out:
@@ -671,6 +680,16 @@ class Watcher:
                 )
                 return "tui_idle"
             if started and (time.time() * 1000 - last) >= FALLBACK_IDLE_STABLE_MS:
+                # An idle TUI is not a finished turn while the agent's
+                # own background tasks are still running: kimi parks at
+                # the composer with a "[N task(s) running]" badge and
+                # waits for their completion notifications. Defer
+                # completion until the badge clears.
+                if BACKGROUND_TASK_BADGE_RE.search(preview):
+                    if not background_defer_notified:
+                        background_defer_notified = True
+                        self._event("background_tasks_defer_completion")
+                    continue
                 self._event(
                     "task_done_observed", data={"source": "fallback_idle"},
                 )

@@ -1125,3 +1125,96 @@ async def test_late_ps_registration_upgrades_to_ps_done(tmp_path):
 
     assert result == "ps_done"
     wait.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_background_task_badge_defers_fallback_idle(tmp_path):
+    """kimi parks idle at the composer while its own background bash
+    tasks run, painting a "[N task(s) running]" badge. Output silence
+    then means "waiting on background tasks", not "turn over": fallback
+    completion must hold off until the badge clears."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 2
+
+    # baseline read and echo absorption come first, then the per-poll
+    # snapshots: one output burst, then silence; the badge shows for
+    # the first two silent polls and clears on the third
+    snapshots = iter([
+        (1000, ""),
+        (1000, ""),
+        (2000, "all quiet\n[1 task running]"),
+        (2000, "all quiet\n[1 task running]"),
+    ])
+
+    async def show(*args, **kwargs):
+        last, preview = next(snapshots, (2000, "all quiet\n> "))
+        return {"result": {"terminal": {
+            "lastOutputAt": last,
+            "preview": preview,
+        }}}
+    ps = AsyncMock(return_value=[{"agents": []}])
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.FALLBACK_IDLE_STABLE_MS", 0):
+        result = await watcher._wait_turn_done(time.time() * 1000)
+
+    assert result == "fallback_idle"
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert '"event": "background_tasks_defer_completion"' in events
+
+
+@pytest.mark.anyio
+async def test_fallback_idle_still_completes_without_badge(tmp_path):
+    """The guard must not leak: an idle preview without the badge still
+    completes through the slow stable-silence path."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 1
+
+    output_times = iter([1000, 1000])
+
+    async def show(*args, **kwargs):
+        return {"result": {"terminal": {
+            "lastOutputAt": next(output_times, 2000),
+            "preview": "task results here\n> ",
+        }}}
+    ps = AsyncMock(return_value=[{"agents": []}])
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.FALLBACK_IDLE_STABLE_MS", 0):
+        result = await watcher._wait_turn_done(time.time() * 1000)
+
+    assert result == "fallback_idle"
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "background_tasks_defer_completion" not in events
+
+
+def test_handoff_template_covers_background_tasks():
+    from osw.watcher import HANDOFF_TEMPLATE
+
+    instruction = HANDOFF_TEMPLATE.format(path="C:/x/handoff.md")
+    assert "background task" in instruction
+    assert "\n" not in instruction
