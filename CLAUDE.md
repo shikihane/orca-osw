@@ -7,10 +7,11 @@ See also `AGENTS.md` for repository guidelines shared across agent tools.
 ## What This Is
 
 OSW ("Orca Agent Supervisor") is a Python CLI that dispatches and supervises
-Orca-backed agent sessions (`claude`, `codex`, `pi`) in the current working
-directory. There is **no daemon**: `new`/`use` creates or adopts an Orca
-terminal, writes one agent record, spawns one detached watcher process, and
-returns immediately. Orca itself is the source of truth for agent state.
+Orca-backed agent sessions (`claude`, `codex`, `pi`, `omp`, `kimi`) in the
+current working directory. There is **no daemon**: `new`/`use` creates or
+adopts an Orca terminal, writes one agent record, spawns one detached watcher
+process, and returns immediately. Orca itself is the source of truth for
+agent state.
 
 Runtime dependencies are `anyio` and `typer` only (`rich` optional for
 colored logs, `pytest` for tests).
@@ -27,7 +28,7 @@ pytest tests/test_cli.py -v                     # one file
 pytest tests/test_watcher.py::test_name -v      # one test
 
 python skill/osw.py init                        # init .orca/osw/ state in cwd
-python skill/osw.py models <claude|codex|pi>    # read-only model discovery
+python skill/osw.py models <claude|codex|pi|omp|kimi>  # read-only model discovery
 python skill/osw.py new <provider> --prefix <role> --model <m> --thinking <t> "<task>"
 python skill/osw.py use <agent-id|terminal-handle> "<follow-up>"
 python skill/osw.py list --json
@@ -86,15 +87,15 @@ the prompt's own terminal echo never counts as output, and the quick
 tui-idle exit after tracking loss requires the pane to have been observed
 `working` this turn — a pane Orca never registered (e.g. one spawned
 moments ago, before ps catches up) rides the slow stable-silence path.
-Orca recognizes `claude`, `codex`, and `pi` TUIs (as of Orca 1.4.x).
+Orca recognizes `claude`, `codex`, and `pi` TUIs (as of Orca 1.4.x); OMP and
+Kimi still work through the generic terminal-output fallback when untracked.
 Tracked panes must additionally acknowledge each prompt within
 `RECEIPT_TIMEOUT_MS` (report `working`, finish the turn, or echo the
 prompt text in ps) — no acknowledgement means the input was swallowed by
 something other than the agent's composer (login screen, update dialog):
 the turn fails closed as `no_receipt` and the caller is notified.
-Startup trust dialogs do not occur in practice: the provider autonomy
-flags skip them (verified empirically on all three CLIs in an untrusted
-worktree).
+Provider autonomy flags skip approval prompts, including OMP's
+`--auto-approve` and Kimi's `--yolo`; use them only in trusted workspaces.
 
 Caller notification: `new`/`use` resolve the dispatching terminal from
 `ORCA_TERMINAL_HANDLE` (exported by Orca into every terminal it creates and

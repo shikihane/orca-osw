@@ -33,6 +33,8 @@ This creates `.orca/osw/` with a default `state.json`.
 python /path/to/orca-osw/skill/osw.py models claude
 python /path/to/orca-osw/skill/osw.py models codex
 python /path/to/orca-osw/skill/osw.py models pi
+python /path/to/orca-osw/skill/osw.py models omp
+python /path/to/orca-osw/skill/osw.py models kimi
 ```
 
 This is read-only and does not change `.orca/osw/state.json`.

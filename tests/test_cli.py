@@ -229,6 +229,46 @@ def test_new_creates_provider_terminal_agent_file_and_detaches_watcher(tmp_path,
     assert agent["state"] == "assigned"
 
 
+def test_new_supports_omp_provider(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    create = AsyncMock(return_value={"result": {"terminal": {
+        "handle": "term-omp",
+        "tabId": "tab-omp",
+        "leafId": "leaf-omp",
+    }}})
+    spawn = Mock(return_value=6789)
+
+    with patch("osw.cli.terminal_create", create), \
+         patch("osw.cli._spawn_watcher", spawn):
+        result = runner.invoke(
+            app,
+            [
+                "new",
+                "omp",
+                "--model",
+                "openai-codex/gpt-5.3-codex",
+                "--thinking",
+                "xhigh",
+                "--no-notify",
+                "do the task",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Created agent_001" in result.output
+    assert "(provider: omp)" in result.output
+    create.assert_awaited_once_with(
+        "omp --auto-approve --model openai-codex/gpt-5.3-codex "
+        "--thinking xhigh"
+    )
+    spawn.assert_called_once_with(tmp_path, "agent_001")
+    agent = state_mod.read_agent(tmp_path, "agent_001")
+    assert agent["provider"] == "omp"
+    assert agent["model_name"] == "openai-codex/gpt-5.3-codex"
+    assert agent["thinking"] == "xhigh"
+
+
 def test_new_detects_caller_from_orca_env(tmp_path, monkeypatch):
     """Orca exports ORCA_TERMINAL_HANDLE into every terminal it creates;
     osw invoked through an agent's tool pipeline (stdout is a pipe, the
@@ -657,3 +697,4 @@ def test_init_non_interactive_never_prompts(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert state_mod.read_state(tmp_path) == {"version": 3, "project_root": str(tmp_path)}
+    assert "python osw.py models omp" in result.output

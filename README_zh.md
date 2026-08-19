@@ -30,6 +30,7 @@ python -m pip install anyio typer rich
 python skill/osw.py doctor
 python skill/osw.py init
 python skill/osw.py models pi
+python skill/osw.py models omp
 
 python skill/osw.py new claude --prefix code --model sonnet --thinking high "修复失败的测试"
 python skill/osw.py new codex --prefix research --model gpt-5 --thinking medium "重构 provider 层"
@@ -54,12 +55,13 @@ python skill/osw.py status
 
 ### 选项
 
-- `new` 的 provider 支持 `claude`、`codex`、`pi`、`kimi`。
+- `new` 的 provider 支持 `claude`、`codex`、`pi`、`omp`、`kimi`。
 - `--prefix` 生成语义化 agent id，例如 `research_001`、`code_001`、`test_001`、`debug_001`、`review_001`、`misc_001`；省略时使用 `agent_NNN`。
 - `use <agent-id>` 会复用这个确切的 agent id 和终端上下文；`--prefix` 只用于 `new` 或 `use <terminal-handle>`。
 - `--model` 原样传给 provider。
-- `--thinking` 按 provider 转换：`claude --effort`、`codex -c model_reasoning_effort=...`、`pi --thinking`。
-- OSW 默认添加 provider 的非阻塞/批准类启动参数：`claude --dangerously-skip-permissions`、`codex --dangerously-bypass-approvals-and-sandbox`、`pi --approve`。
+- `--thinking` 按 provider 转换：`claude --effort`、`codex -c model_reasoning_effort=...`、`pi`/`omp --thinking`；`kimi` 的 effort 位于模型配置中，因此会拒绝该参数。
+- `models omp` 读取 `omp models --json`；将其中的 `provider/model` selector 传给 `new omp --model`。
+- OSW 默认添加 provider 的非阻塞/批准类启动参数：`claude --dangerously-skip-permissions`、`codex --dangerously-bypass-approvals-and-sandbox`、`pi --approve`、`omp --auto-approve`、`kimi --yolo`。
 - `new` 和 `use` 支持 `--caller-terminal <句柄>`，指定接收完成报告的父终端。
 - `del --close` 同时让 Orca 关闭终端。
 - `list --json` 输出原始 JSON。

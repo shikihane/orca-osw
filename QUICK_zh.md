@@ -33,6 +33,8 @@ python /path/to/orca-osw/skill/osw.py init
 python /path/to/orca-osw/skill/osw.py models claude
 python /path/to/orca-osw/skill/osw.py models codex
 python /path/to/orca-osw/skill/osw.py models pi
+python /path/to/orca-osw/skill/osw.py models omp
+python /path/to/orca-osw/skill/osw.py models kimi
 ```
 
 这是只读操作，不会修改 `.orca/osw/state.json`。

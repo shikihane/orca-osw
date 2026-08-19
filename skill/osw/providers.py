@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ KNOWN_AGENT_CLIS = [
     "claude",
     "codex",
     "pi",
+    "omp",
     "kimi",
     "gemini",
     "aider",
@@ -32,11 +34,12 @@ def _quote_command_arg(value: str) -> str:
     return subprocess.list2cmdline([value])
 
 
-SUPPORTED_PROVIDERS = ("claude", "codex", "pi", "kimi")
+SUPPORTED_PROVIDERS = ("claude", "codex", "pi", "omp", "kimi")
 PROVIDER_AUTONOMY_FLAGS = {
     "claude": ("--dangerously-skip-permissions",),
     "codex": ("--dangerously-bypass-approvals-and-sandbox",),
     "pi": ("--approve",),
+    "omp": ("--auto-approve",),
     "kimi": ("--yolo",),
 }
 
@@ -131,6 +134,10 @@ def probe_variants(name: str, path: str | None = None) -> list[dict]:
         return parse_claude_aliases(_run_capture([exe, "--help"])) or bare
     if name == "codex":
         return bare + codex_variants(_read_codex_config())
+    if name == "omp":
+        return parse_omp_models(
+            _run_capture([exe, "models", "--json"])
+        ) or bare
     if name == "kimi":
         return kimi_variants(_read_kimi_config()) or bare
     return bare
@@ -199,6 +206,40 @@ def kimi_variants(config: dict) -> list[dict]:
         variants.append({
             "name": f"kimi-{label}",
             "command": f"kimi --model {_quote_command_arg(alias)}",
+        })
+    return variants
+
+
+def parse_omp_models(output: str) -> list[dict]:
+    """Parse the machine-readable catalog from `omp models --json`."""
+    try:
+        payload = json.loads(output)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return []
+
+    variants: list[dict] = []
+    seen: set[str] = set()
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        selector = model.get("selector")
+        if not isinstance(selector, str):
+            continue
+        selector = selector.strip()
+        if not selector or selector in seen:
+            continue
+        label = re.sub(r"[^a-zA-Z0-9._-]+", "-", selector).strip("-")
+        if not label:
+            continue
+        seen.add(selector)
+        variants.append({
+            "name": f"omp-{label}",
+            "command": f"omp --model {_quote_command_arg(selector)}",
         })
     return variants
 

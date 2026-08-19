@@ -445,12 +445,16 @@ def init(
         typer.echo("  python osw.py models claude")
         typer.echo("  python osw.py models codex")
         typer.echo("  python osw.py models pi")
+        typer.echo("  python osw.py models omp")
         typer.echo("  python osw.py models kimi")
 
 
 @app.command("models")
 def models(
-    provider: str = typer.Argument(..., help="Provider to query: claude, codex, pi, or kimi"),
+    provider: str = typer.Argument(
+        ...,
+        help="Provider to query: claude, codex, pi, omp, or kimi",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
 ) -> None:
     """Discover provider model options without writing OSW state."""

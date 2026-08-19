@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import json
+from unittest.mock import patch
+
 import pytest
 
 from osw.providers import (
     CODEX_EFFORTS,
+    KNOWN_AGENT_CLIS,
     ProviderError,
     build_provider_command,
     codex_variants,
     kimi_variants,
     parse_claude_aliases,
+    parse_omp_models,
     parse_pi_models,
+    probe_variants,
 )
 
 # Real output shapes captured from the actual CLIs
@@ -28,6 +34,23 @@ CLAUDE_HELP = """\
                                         model's full name (e.g.
                                         'claude-fable-5').
 """
+
+OMP_MODELS_JSON = json.dumps({
+    "models": [
+        {
+            "provider": "openai-codex",
+            "id": "gpt-5.3-codex",
+            "selector": "openai-codex/gpt-5.3-codex",
+            "thinking": ["low", "medium", "high", "xhigh"],
+        },
+        {
+            "provider": "anthropic",
+            "id": "claude-opus-4-6",
+            "selector": "anthropic/claude-opus-4-6",
+            "thinking": ["low", "medium", "high", "max"],
+        },
+    ],
+})
 
 
 def test_parse_pi_models():
@@ -89,6 +112,70 @@ def test_build_provider_command_for_codex():
     assert command == (
         "codex --dangerously-bypass-approvals-and-sandbox "
         "-c model_reasoning_effort=medium -m gpt-5"
+    )
+
+
+def test_omp_is_scanned_as_an_agent_cli():
+    assert "omp" in KNOWN_AGENT_CLIS
+
+
+def test_parse_omp_models():
+    variants = parse_omp_models(OMP_MODELS_JSON)
+
+    assert variants == [
+        {
+            "name": "omp-openai-codex-gpt-5.3-codex",
+            "command": "omp --model openai-codex/gpt-5.3-codex",
+        },
+        {
+            "name": "omp-anthropic-claude-opus-4-6",
+            "command": "omp --model anthropic/claude-opus-4-6",
+        },
+    ]
+
+
+def test_parse_omp_models_tolerates_invalid_entries_and_duplicates():
+    output = json.dumps({
+        "models": [
+            {"selector": "openai/gpt-5"},
+            {"selector": " openai/gpt-5 "},
+            {"selector": ""},
+            {"id": "missing-provider"},
+            "garbage",
+        ],
+    })
+
+    assert parse_omp_models(output) == [
+        {
+            "name": "omp-openai-gpt-5",
+            "command": "omp --model openai/gpt-5",
+        },
+    ]
+    assert parse_omp_models("") == []
+    assert parse_omp_models("not json") == []
+    assert parse_omp_models(json.dumps({"models": "garbage"})) == []
+
+
+def test_probe_variants_for_omp_uses_json_model_catalog():
+    with patch("osw.providers._run_capture", return_value=OMP_MODELS_JSON) as run:
+        variants = probe_variants("omp", path=r"C:\bin\omp.exe")
+
+    run.assert_called_once_with([r"C:\bin\omp.exe", "models", "--json"])
+    assert variants[0]["command"] == (
+        "omp --model openai-codex/gpt-5.3-codex"
+    )
+
+
+def test_build_provider_command_for_omp():
+    command = build_provider_command(
+        "omp",
+        model="openai-codex/gpt-5.3-codex",
+        thinking="xhigh",
+    )
+
+    assert command == (
+        "omp --auto-approve --model openai-codex/gpt-5.3-codex "
+        "--thinking xhigh"
     )
 
 
@@ -167,6 +254,7 @@ def test_build_provider_command_omits_optional_flags():
     )
     assert build_provider_command("pi") == "pi --approve"
     assert build_provider_command("kimi") == "kimi --yolo"
+    assert build_provider_command("omp") == "omp --auto-approve"
 
 
 def test_build_provider_command_rejects_unknown_provider():
@@ -178,3 +266,4 @@ def test_build_provider_command_strips_optional_values():
     assert build_provider_command(
         "claude", model=" sonnet ", thinking="  ",
     ) == "claude --dangerously-skip-permissions --model sonnet"
+
