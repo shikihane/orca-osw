@@ -28,6 +28,17 @@ composer swallowed the input (login screen, update dialog, crash
 remains) — the turn fails closed as "no_receipt" and the caller is
 notified, instead of idling to the hard timeout.
 
+Independently of ps tracking, every sent prompt's echo is verified
+against the terminal's scrollback (never the preview tail: a
+full-screen TUI's bottom lines are its composer box, where the
+submitted message can never appear). The check first gauges whether
+the read can actually reach the pane's retained buffer — a pane
+exposing only its current screenful (e.g. an alternate-screen TUI)
+has no echo surface, and judging there is a guaranteed false miss.
+A missing echo on a usable surface alarms the caller but never
+triggers a resend — a false miss would otherwise inject a duplicate
+prompt into a working agent's input queue.
+
 CLIs Orca does not recognize (no `agents` entry in `worktree ps`)
 fall back to lastOutputAt idle detection. That fallback never counts
 the prompt's own terminal echo as output, and the quick tui-idle exit
@@ -51,6 +62,7 @@ from osw.log import emit_event, enable_file_logging, get_logger, setup_logging
 from osw.orca_cli import (
     OrcaError,
     terminal_list,
+    terminal_read,
     terminal_send,
     terminal_show,
     terminal_wait,
@@ -107,6 +119,19 @@ READY_PREVIEW_MARKERS = (
     "one will be created on your first message",  # fresh-session screen
 )
 
+# Ready-screen signatures that are painted permanently, not just on a
+# fresh-session screen — so unlike the markers above they must be gated
+# on a short output-silence window (a busy TUI is never silent, and a
+# freshly spawned TUI gets a moment to finish booting before the send).
+# Claude Code v2 exposes neither a ps entry nor tui-idle nor a composer
+# line in the preview: the bottom line is its status bar, which carries
+# the model string ("claude-fable-5", "claude-sonnet-4", ...). Without
+# this marker every fresh dispatch pays the full READY_IDLE_STABLE_MS
+# silence wait while the TUI sits ready.
+READY_SCREEN_MARKERS = (
+    "claude-",
+)
+
 # A modal first-run dialog is the classic prompt swallow: the composer
 # is not what receives keyboard input while one of these is up, so a
 # pane showing one is never ready no matter how silent its output is.
@@ -114,20 +139,49 @@ BLOCKING_DIALOG_MARKERS = (
     "Trust this folder",
 )
 
-# Post-send prompt verification: the terminal preview is re-read after
-# the send and the prompt's ASCII fragment must be visible (echoed in
-# the composer or the conversation). Non-ASCII text is mangled in
-# Windows previews, so the check compares only printable ASCII and
-# abstains when the prompt carries too little of it.
+# Post-send prompt verification: after the send, the terminal's
+# scrollback is re-read and must contain the prompt's echo. The
+# preview tail cannot serve here: on a full-screen TUI those bottom
+# lines are permanently occupied by the composer box and status line,
+# so the submitted message — rendered in the conversation area above —
+# never enters that window, and judging by it produces a guaranteed
+# false miss on every prompt. `terminal read` preserves raw text
+# (CJK included), so the prompt's normalized prefix is the primary
+# match unit, with its first sufficiently long ASCII island as a
+# mangling-proof fallback. Both units are bounded prefixes, because a
+# TUI may clip the echoed line at the terminal width (kimi renders a
+# long submission as one clipped line ending in an ellipsis). A prompt
+# carrying neither unit in sufficient length cannot be verified and
+# the check abstains.
+#
+# The read itself is only checked for usability first: panes whose TUI
+# runs on the alternate screen (or that Orca otherwise exposes only as
+# the current screenful) return a handful of lines while their own
+# cursors report a far larger retained buffer. There is no echo
+# surface to judge by there — some panes render the conversation into
+# real scrollback, some never do — so the check abstains instead of
+# producing another guaranteed false miss.
 PROMPT_ECHO_DELAY_SECS = 3.0
 PROMPT_ECHO_MIN_CHARS = 8
+PROMPT_ECHO_PREFIX_CHARS = 24
+PROMPT_ECHO_ISLAND_CHARS = 16
+PROMPT_ECHO_READ_LINES = 400
+PROMPT_ECHO_MIN_SURFACE_LINES = 16  # below this, thinness cannot be judged
+PROMPT_ECHO_SURFACE_MIN_RATIO = 4   # tail must cover >= 1/4 of reachable lines
 
 
-def _ascii_fragment(text: str) -> str:
-    """The part of `text` that survives a Windows terminal preview."""
+def _prompt_echo_units(text: str) -> list[str]:
+    """Bounded substrings of `text` a submitted-turn echo must contain."""
     flat = one_line(text)
-    fragment = "".join(ch for ch in flat if ch.isascii() and ch.isprintable())
-    return " ".join(fragment.split())
+    units = []
+    prefix = flat[:PROMPT_ECHO_PREFIX_CHARS].rstrip()
+    if len(prefix) >= PROMPT_ECHO_MIN_CHARS:
+        units.append(prefix)
+    for island in re.findall(r"[\x21-\x7e]+", flat):
+        if len(island) >= PROMPT_ECHO_MIN_CHARS:
+            units.append(island[:PROMPT_ECHO_ISLAND_CHARS])
+            break
+    return units
 
 
 def _composer_visible(preview: str) -> bool:
@@ -361,6 +415,39 @@ class Watcher:
     async def _last_output_at(self) -> int:
         return (await self._terminal_snapshot())[0]
 
+    async def _echo_surface(
+        self, limit: int
+    ) -> tuple[list[str], int | None] | None:
+        """(tail lines, retained line count) for the pane.
+
+        The retained count comes from the read cursors
+        (latestCursor - oldestCursor) and is None when the response
+        carries no cursors. None overall when the terminal cannot be
+        read.
+        """
+        try:
+            data = await terminal_read(self.handle, limit=limit)
+        except OrcaError as exc:
+            if exc.code != "terminal_handle_stale" \
+                    or not await self._rebind_terminal():
+                return None
+            try:
+                data = await terminal_read(self.handle, limit=limit)
+            except OrcaError:
+                return None
+        term = data.get("result", {}).get("terminal", {})
+        tail = term.get("tail")
+        if not isinstance(tail, list):
+            return None
+        retained = None
+        try:
+            retained = max(
+                0, int(term["latestCursor"]) - int(term["oldestCursor"])
+            )
+        except (KeyError, TypeError, ValueError):
+            pass
+        return [str(line) for line in tail], retained
+
     async def _send_terminal(self, text: str) -> None:
         try:
             await terminal_send(self.handle, text)
@@ -372,26 +459,43 @@ class Watcher:
         await terminal_send(self.handle, text)
 
     async def _verify_prompt_echo(self, text: str) -> bool | None:
-        """Re-read the terminal and check the sent prompt is visible.
+        """Re-read the terminal scrollback and check the sent prompt's
+        echo is there.
 
         Returns True/False, or None when no verdict is possible: the
-        prompt is too non-ASCII to survive preview mangling (a mismatch
-        proves nothing then), or the terminal cannot be read.
+        prompt carries no match unit long enough to be trustworthy, the
+        terminal cannot be read, or the read cannot reach the pane's
+        retained buffer (no usable echo surface).
         """
-        fragment = _ascii_fragment(text)
-        if len(fragment) < PROMPT_ECHO_MIN_CHARS:
+        units = _prompt_echo_units(text)
+        if not units:
             return None
         # Two looks before judging: the TUI may need a moment to render
-        # the submitted message into the preview.
+        # the submitted message into the scrollback.
         for _ in range(2):
             await anyio.sleep(PROMPT_ECHO_DELAY_SECS)
-            try:
-                _, preview = await self._terminal_snapshot()
-            except OrcaError:
+            surface = await self._echo_surface(PROMPT_ECHO_READ_LINES)
+            if surface is None:
                 return None
-            # Compare on a prefix: the composer may wrap or clip a long
-            # prompt, but a submitted turn shows its head.
-            if fragment[:32] in _ascii_fragment(preview):
+            tail, retained = surface
+            reachable = min(PROMPT_ECHO_READ_LINES, retained) \
+                if retained is not None else len(tail)
+            if (reachable >= PROMPT_ECHO_MIN_SURFACE_LINES
+                    and len(tail) * PROMPT_ECHO_SURFACE_MIN_RATIO < reachable):
+                self._event(
+                    "prompt_echo_unverifiable",
+                    message="terminal read exposes only a fraction of the "
+                            "retained buffer; no usable echo surface",
+                    data={"returned": len(tail), "retained": retained},
+                )
+                return None
+            haystack = one_line(
+                "".join(
+                    ch if ch.isprintable() or ch.isspace() else " "
+                    for ch in " ".join(tail)
+                )
+            )
+            if any(unit in haystack for unit in units):
                 return True
         return False
 
@@ -465,10 +569,10 @@ class Watcher:
         agents-awaiting-input UI). `tui-idle` is the fallback for panes
         Orca does not track — but Orca only emits tui-idle for TUIs it
         recognizes, so a TUI it neither tracks nor recognizes (e.g.
-        kimi) is judged on its terminal preview instead: a known
-        ready-screen marker or a composer idle for a short silence
-        window means ready now; otherwise output must stay silent for
-        READY_IDLE_STABLE_MS. Readiness is never treated as task
+        kimi, Claude Code v2) is judged on its terminal preview
+        instead: a known ready-screen marker, or a composer / status-bar
+        signature plus a short silence window, means ready now;
+        otherwise output must stay silent for READY_IDLE_STABLE_MS. Readiness is never treated as task
         completion: the task prompt is always sent and observed as its
         own turn afterwards.
 
@@ -523,8 +627,9 @@ class Watcher:
                     silent_ms = time.time() * 1000 - last
                     if any(marker in preview for marker in READY_PREVIEW_MARKERS):
                         return "preview_marker"
-                    if (silent_ms >= READY_PREVIEW_SILENCE_MS
-                            and _composer_visible(preview)):
+                    if silent_ms >= READY_PREVIEW_SILENCE_MS and (
+                            _composer_visible(preview)
+                            or any(m in preview for m in READY_SCREEN_MARKERS)):
                         return "preview_marker"
                     if silent_ms >= READY_IDLE_STABLE_MS:
                         return "output_idle"
@@ -574,46 +679,29 @@ class Watcher:
             data={"phase": phase, "chars": len(text)},
         )
         # Belt-and-suspenders against a swallowed prompt (modal dialog,
-        # login screen): the text must be visible in the terminal it was
-        # sent to. One resend, then an alarm — the turn supervision
-        # below still decides the outcome.
+        # login screen): the text must be visible in the terminal's
+        # scrollback afterwards. A miss only alarms — it never resends:
+        # resent text lands in a working agent's input queue whenever
+        # the miss is false (a full-screen TUI whose echo the check
+        # cannot see made every miss false), and genuine non-receipt
+        # already fails closed in the turn supervision below.
         echoed = await self._verify_prompt_echo(text)
         if echoed is False:
             log.warning(
-                "watcher(%s): prompt not visible in terminal, resending",
+                "watcher(%s): prompt not visible in terminal scrollback",
                 self.agent_id,
             )
             self._event(
                 "prompt_echo_missing",
-                level="WARNING",
-                message="prompt not visible in terminal preview; resending once",
+                level="ERROR",
+                message="prompt not visible in terminal scrollback",
                 data={"phase": phase},
             )
-            try:
-                await self._send_terminal(text)
-            except OrcaError as exc:
-                log.error("watcher(%s): resend failed: %s", self.agent_id, exc)
-                self._event(
-                    "turn_send_failed",
-                    level="ERROR",
-                    message=str(exc),
-                    data={"phase": phase},
-                )
-                return "send_failed"
-            self._event("turn_resent", data={"phase": phase})
-            echoed = await self._verify_prompt_echo(text)
-            if echoed is False:
-                self._event(
-                    "prompt_echo_missing",
-                    level="ERROR",
-                    message="prompt still not visible after resend",
-                    data={"phase": phase},
-                )
-                await self._notify(
-                    f"# [osw] prompt-echo-unverified agent={self.agent_id}"
-                    f" terminal={self.handle}"
-                    " (prompt may have been swallowed; check that terminal)"
-                )
+            await self._notify(
+                f"# [osw] prompt-echo-unverified agent={self.agent_id}"
+                f" terminal={self.handle}"
+                " (prompt may have been swallowed; check that terminal)"
+            )
         source = await self._wait_turn_done(
             sent_at_ms, baseline_state_started, sent_text=text
         )

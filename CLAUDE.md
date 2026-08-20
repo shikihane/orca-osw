@@ -94,6 +94,17 @@ Tracked panes must additionally acknowledge each prompt within
 prompt text in ps) — no acknowledgement means the input was swallowed by
 something other than the agent's composer (login screen, update dialog):
 the turn fails closed as `no_receipt` and the caller is notified.
+Independently, every sent prompt's echo is verified against the
+terminal's scrollback (`terminal read` — never the preview tail, which
+a full-screen TUI permanently occupies with its composer box). The
+check first gauges whether the read can reach the pane's retained
+buffer (tail size vs. the read cursors' `latestCursor - oldestCursor`);
+a pane exposing only its current screenful (alternate-screen TUI) has
+no echo surface, and judging there is a guaranteed false miss, so the
+check abstains (`prompt_echo_unverifiable`). A missing echo on a
+usable surface alarms the caller but never triggers a resend: a false
+miss would inject a duplicate prompt into a working agent's input
+queue.
 Provider autonomy flags skip approval prompts, including OMP's
 `--auto-approve` and Kimi's `--yolo`; use them only in trusted workspaces.
 

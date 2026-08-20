@@ -647,6 +647,76 @@ async def test_untracked_pane_ready_on_composer_after_short_silence(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_untracked_pane_ready_on_claude_status_bar_after_short_silence(
+    tmp_path,
+):
+    """Claude Code v2 exposes no ps entry, no tui-idle, and no composer
+    line in the preview — only its status bar with the model string.
+    Gated on the short silence window, that signature is readiness:
+    a fresh dispatch must not pay the full 30s stable window."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    silent_since = int(time.time() * 1000) - 15_000
+    show = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tabId": "tab-a", "leafId": "leaf-b",
+            "lastOutputAt": silent_since,
+            "preview": " ▐claude-fable-5nginote_mpt_tool",
+        }}
+    })
+    ps = AsyncMock(return_value=[{"agents": []}])
+    wait = AsyncMock(side_effect=OrcaError("timeout waiting for tui-idle", 1))
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.POLL_SECS", 0):
+        source = await watcher._wait_ready()
+
+    assert source == "preview_marker"
+
+
+@pytest.mark.anyio
+async def test_claude_status_bar_without_silence_is_not_ready(tmp_path):
+    """The status bar is painted mid-turn as well: the signature only
+    counts after the short silence window, never while output flows."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    show = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tabId": "tab-a", "leafId": "leaf-b",
+            "lastOutputAt": int(time.time() * 1000),  # still painting
+            "preview": " ▐claude-fable-5nginote_mpt_tool",
+        }}
+    })
+    ps = AsyncMock(return_value=[{"agents": []}])
+    wait = AsyncMock(side_effect=OrcaError("timeout waiting for tui-idle", 1))
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.READY_TIMEOUT_MS", 50):
+        source = await watcher._wait_ready()
+
+    assert source is None
+
+
+@pytest.mark.anyio
 async def test_composer_without_silence_is_not_ready(tmp_path):
     """kimi keeps the composer painted mid-turn: a visible composer with
     fresh output must not count as ready."""
@@ -1233,11 +1303,13 @@ def test_handoff_template_covers_background_tasks():
 
 
 @pytest.mark.anyio
-async def test_missing_prompt_echo_resends_once_and_alarms(tmp_path):
+async def test_missing_prompt_echo_alarms_without_resending(tmp_path):
     """The trust-dialog failure mode: the prompt went somewhere that is
-    not the composer, so it never appears in the terminal preview. The
-    watcher must resend once and raise an alarm when it is still
-    invisible afterwards."""
+    not the composer, so it never appears in the terminal scrollback.
+    The watcher must alarm the caller — but never resend on an echo
+    miss alone: when the miss is false (a TUI whose echo the check
+    cannot see), the resent text lands in a working agent's input
+    queue as a duplicate of the user's task."""
     state.init_state_dir(tmp_path)
     state.write_agent(tmp_path, {
         "agent_id": "agent_001",
@@ -1248,10 +1320,9 @@ async def test_missing_prompt_echo_resends_once_and_alarms(tmp_path):
     })
     watcher = Watcher(tmp_path, "agent_001")
 
-    show = AsyncMock(return_value={
+    read = AsyncMock(return_value={
         "result": {"terminal": {
-            "lastOutputAt": 1000,
-            "preview": "Trust this folder?\n > Yes  > No",
+            "tail": ["Trust this folder?", " > Yes  > No"],
         }}
     })
     send = AsyncMock(return_value={})
@@ -1259,7 +1330,7 @@ async def test_missing_prompt_echo_resends_once_and_alarms(tmp_path):
     async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
         return "fallback_idle"
 
-    with patch("osw.watcher.terminal_show", show), \
+    with patch("osw.watcher.terminal_read", read), \
          patch("osw.watcher.terminal_send", send), \
          patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
          patch.object(Watcher, "_wait_turn_done", finish_turn):
@@ -1267,20 +1338,25 @@ async def test_missing_prompt_echo_resends_once_and_alarms(tmp_path):
 
     assert result == "fallback_idle"
     sent = [call.args[1] for call in send.await_args_list]
-    # prompt, resend, then the caller alarm
-    assert sent[:2] == ["do the task", "do the task"]
-    assert any("prompt-echo-unverified" in line for line in sent[2:])
+    # prompt exactly once, then the caller alarm — no duplicate prompt
+    assert sent[0] == "do the task"
+    assert sent.count("do the task") == 1
+    assert any("prompt-echo-unverified" in line for line in sent[1:])
     events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
         encoding="utf-8"
     )
-    assert events.count('"event": "prompt_echo_missing"') == 2
-    assert '"event": "turn_resent"' in events
+    assert events.count('"event": "prompt_echo_missing"') == 1
+    assert '"level": "ERROR"' in events
+    assert "turn_resent" not in events
 
 
 @pytest.mark.anyio
-async def test_prompt_echo_check_abstains_on_pure_non_ascii(tmp_path):
-    """A fully non-ASCII prompt cannot survive the Windows preview's
-    mangling, so a mismatch proves nothing: no resend, no alarm."""
+async def test_prompt_echo_verified_from_scrollback(tmp_path):
+    """A full-screen TUI (kimi) keeps its composer box painted in the
+    preview tail even mid-turn, so the submitted message can never be
+    seen there — but it sits in the scrollback, rendered with a
+    decorator and wrapped across lines. Verification must pass on the
+    scrollback alone."""
     state.init_state_dir(tmp_path)
     state.write_agent(tmp_path, {
         "agent_id": "agent_001",
@@ -1290,19 +1366,268 @@ async def test_prompt_echo_check_abstains_on_pure_non_ascii(tmp_path):
     })
     watcher = Watcher(tmp_path, "agent_001")
 
-    show = AsyncMock(return_value={
-        "result": {"terminal": {"lastOutputAt": 1000, "preview": "??"}},
+    prompt = "Summarize the build layout of this repo"
+    read = AsyncMock(return_value={
+        "result": {"terminal": {"tail": [
+            " ✨ Summarize the build layout of this",
+            "    repo",
+            " ● Inspecting the tree...",
+            "╭────────────────────────────────────────╮",
+            "│ >                                      │",
+        ]}}
     })
     send = AsyncMock(return_value={})
 
     async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
         return "fallback_idle"
 
-    with patch("osw.watcher.terminal_show", show), \
+    with patch("osw.watcher.terminal_read", read), \
          patch("osw.watcher.terminal_send", send), \
          patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
          patch.object(Watcher, "_wait_turn_done", finish_turn):
-        result = await watcher._run_turn("请总结一下这个项目的架构", phase="task")
+        result = await watcher._run_turn(prompt, phase="task")
+
+    assert result == "fallback_idle"
+    send.assert_awaited_once()  # the prompt; no alarm, no resend
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "prompt_echo_missing" not in events
+
+
+@pytest.mark.anyio
+async def test_prompt_echo_matches_clipped_echo_via_ascii_island(tmp_path):
+    """kimi renders a long submission as one line clipped at the
+    terminal width with a trailing ellipsis. The raw prefix then
+    reaches past the clip, but the first ASCII island is short enough
+    to survive it."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    prompt = "分析 E_BURN.FWBurnChipID USB / pipeline 烧录流程"
+    read = AsyncMock(return_value={
+        "result": {"terminal": {"tail": [
+            " ✨ 分析 E_BURN.FWBurnChipID…",
+            " > ",
+        ]}}
+    })
+    send = AsyncMock(return_value={})
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn(prompt, phase="task")
+
+    assert result == "fallback_idle"
+    send.assert_awaited_once()
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "prompt_echo_missing" not in events
+
+
+@pytest.mark.anyio
+async def test_prompt_echo_verified_for_pure_cjk_prompt(tmp_path):
+    """The scrollback preserves raw text including CJK, so a fully
+    non-ASCII prompt verifies against its normalized prefix."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    prompt = "请总结一下这个项目的整体架构并且列出关键模块"
+    read = AsyncMock(return_value={
+        "result": {"terminal": {"tail": [
+            f" ✨ {prompt}",
+            " > ",
+        ]}}
+    })
+    send = AsyncMock(return_value={})
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn(prompt, phase="task")
+
+    assert result == "fallback_idle"
+    send.assert_awaited_once()
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "prompt_echo_missing" not in events
+
+
+@pytest.mark.anyio
+async def test_prompt_echo_check_abstains_without_match_unit(tmp_path):
+    """A prompt too short to yield a trustworthy match unit cannot be
+    verified; a mismatch then proves nothing: no alarm."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    read = AsyncMock(return_value={
+        "result": {"terminal": {"tail": ["??"]}}
+    })
+    send = AsyncMock(return_value={})
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn("继续", phase="task")
+
+    assert result == "fallback_idle"
+    send.assert_awaited_once()
+    read.assert_not_awaited()
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "prompt_echo_missing" not in events
+
+
+@pytest.mark.anyio
+async def test_prompt_echo_check_abstains_on_thin_scrollback_surface(tmp_path):
+    """A pane exposing only its current screenful (alternate-screen TUI,
+    or an Orca pane whose read cannot reach the retained buffer) has no
+    echo surface: the read returns a handful of lines while its cursors
+    report a far larger retained buffer. Judging the echo there is a
+    guaranteed false miss — abstain instead of alarming."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    read = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tail": [" 🌒 thinking..."],
+            "oldestCursor": "0",
+            "latestCursor": "1586",
+            "returnedLineCount": 1,
+        }}
+    })
+    send = AsyncMock(return_value={})
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn("do the task", phase="task")
+
+    assert result == "fallback_idle"
+    send.assert_awaited_once()
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "prompt_echo_missing" not in events
+    assert '"event": "prompt_echo_unverifiable"' in events
+
+
+@pytest.mark.anyio
+async def test_prompt_echo_verified_with_full_retained_scrollback(tmp_path):
+    """A read whose tail covers the retained buffer is a usable echo
+    surface: the wrapped echo inside it verifies the prompt."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    prompt = "Summarize the build layout of this repo"
+    tail = [f" ● earlier output line {n}" for n in range(300)]
+    tail += [
+        " ✨ Summarize the build layout of this",
+        "    repo",
+        "╭────────────────────────────────────────╮",
+        "│ >                                      │",
+    ]
+    read = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tail": tail,
+            "oldestCursor": "18654",
+            "latestCursor": "20654",
+            "returnedLineCount": len(tail),
+        }}
+    })
+    send = AsyncMock(return_value={})
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn(prompt, phase="task")
+
+    assert result == "fallback_idle"
+    send.assert_awaited_once()
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "prompt_echo_missing" not in events
+    assert "prompt_echo_unverifiable" not in events
+
+
+@pytest.mark.anyio
+async def test_prompt_echo_check_abstains_when_terminal_unreadable(tmp_path):
+    """A scrollback read failure means no verdict is possible: abstain
+    instead of alarming."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    read = AsyncMock(side_effect=OrcaError("terminal gone", 1))
+    send = AsyncMock(return_value={})
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn("do the task", phase="task")
 
     assert result == "fallback_idle"
     send.assert_awaited_once()
