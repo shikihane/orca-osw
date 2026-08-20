@@ -489,13 +489,18 @@ class Watcher:
                     data={"returned": len(tail), "retained": retained},
                 )
                 return None
-            haystack = one_line(
-                "".join(
-                    ch if ch.isprintable() or ch.isspace() else " "
-                    for ch in " ".join(tail)
-                )
+            # Whitespace-insensitive matching: a wrapped echo breaks
+            # the prompt across visual lines (CJK is double-width, so a
+            # 24-char prefix straddles a wrap on any terminal narrower
+            # than ~48 columns), and the line join would otherwise
+            # inject spaces mid-unit and produce a guaranteed false
+            # miss. Stripping all whitespace from both sides makes the
+            # wrap points irrelevant.
+            haystack = "".join(
+                ch for ch in " ".join(tail)
+                if ch.isprintable() and not ch.isspace()
             )
-            if any(unit in haystack for unit in units):
+            if any("".join(unit.split()) in haystack for unit in units):
                 return True
         return False
 

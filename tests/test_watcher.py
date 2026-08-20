@@ -1605,6 +1605,49 @@ async def test_prompt_echo_verified_with_full_retained_scrollback(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_prompt_echo_verified_when_wrap_splits_cjk_prefix(tmp_path):
+    """CJK glyphs are double-width, so on a narrow pane the terminal
+    wraps the echo inside the 24-char match prefix. Verification must
+    ignore the wrap instead of reporting a false miss."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    prompt = "请分析这个仓库里位置词先验与重排层如何配合的问题并给出改进方案"
+    read = AsyncMock(return_value={
+        "result": {"terminal": {"tail": [
+            " ✨ 请分析这个仓库里位置词",
+            "    先验与重排层如何配合的问",
+            "    题并给出改进方案",
+            " ● Inspecting the tree...",
+            " > ",
+        ]}}
+    })
+    send = AsyncMock(return_value={})
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn(prompt, phase="task")
+
+    assert result == "fallback_idle"
+    send.assert_awaited_once()
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "prompt_echo_missing" not in events
+
+
+@pytest.mark.anyio
 async def test_prompt_echo_check_abstains_when_terminal_unreadable(tmp_path):
     """A scrollback read failure means no verdict is possible: abstain
     instead of alarming."""
