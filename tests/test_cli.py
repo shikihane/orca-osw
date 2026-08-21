@@ -482,10 +482,8 @@ def test_use_accepts_existing_agent_id(tmp_path, monkeypatch):
             }
         }
     })
-    send = AsyncMock(return_value={})
     spawn = Mock(return_value=9876)
     with patch("osw.cli.terminal_show", show), \
-         patch("osw.cli.terminal_send", send), \
          patch("osw.cli._spawn_watcher", spawn):
         result = runner.invoke(app, ["use", "agent_001", "--no-notify", "continue this"])
 
@@ -666,21 +664,6 @@ def test_use_stale_handle_without_pane_still_fails_loudly(tmp_path, monkeypatch)
     assert result.exit_code == 1
     assert "older runtime" in result.output
     assert state_mod.list_agents(tmp_path) == {}
-
-
-def test_all_broadcasts_to_agent_files(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    state_mod.init_state_dir(tmp_path)
-    state_mod.write_agent(tmp_path, {"agent_id": "agent_001", "terminal": "t1", "state": "working"})
-    state_mod.write_agent(tmp_path, {"agent_id": "agent_002", "terminal": "t2", "state": "done"})
-
-    send = AsyncMock(return_value={})
-    with patch("osw.cli.terminal_send", send):
-        result = runner.invoke(app, ["all", "status"])
-
-    assert result.exit_code == 0
-    assert "Sent to 1 agent" in result.output
-    send.assert_awaited_once_with("t1", "status")
 
 
 def test_del_removes_agent_kills_watcher_and_optionally_closes(tmp_path, monkeypatch):

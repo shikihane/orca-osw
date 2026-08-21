@@ -101,7 +101,6 @@ Create `osw/server.py` with:
 - Handle request types:
   - `new`: create terminal via orca_cli, register in state, start watcher, return agent_id + handle
   - `use`: verify terminal belongs to cwd, register, start watcher, return agent_id + handle
-  - `all`: broadcast message to all managed agents
   - `del`: cancel watcher, optionally close terminal, remove from state
 
 State updates: only server writes state.json. Use a lock for state mutations.
@@ -113,7 +112,6 @@ Tests in `tests/test_server.py`:
 - `use` rejects terminal from wrong directory (mock orca_cli)
 - watcher handles idle + forced handoff flow (mock orca_cli)
 - `del` cancels watcher
-- `all` broadcasts to all managed agents (mock orca_cli)
 
 ### Task 6: cli.py + osw.py — CLI commands and entry point
 

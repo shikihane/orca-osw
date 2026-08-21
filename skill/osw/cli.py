@@ -30,7 +30,6 @@ from osw.orca_cli import (
     terminal_close,
     terminal_create,
     terminal_list,
-    terminal_send,
     terminal_show,
     worktree_ps,
 )
@@ -729,58 +728,6 @@ def use(
         agent_id=agent_id,
         terminal=handle,
         message="agent adopted",
-    )
-
-
-@app.command(name="all")
-def all_(message: str) -> None:
-    """Broadcast a message to every currently managed, unfinished agent."""
-    root = resolve_project_root()
-    enable_file_logging(logs_dir(root))
-    _read_state_or_exit(root)
-    emit_event(
-        logs_dir(root),
-        component="cli",
-        event="broadcast_started",
-        message="broadcasting to unfinished agents",
-        data={"chars": len(message)},
-    )
-
-    sent: list[str] = []
-    errors: list[dict] = []
-    for agent_id, agent in list_agents(root).items():
-        if agent.get("state") in ("done", "error", "lost"):
-            continue
-        try:
-            anyio.run(terminal_send, agent["terminal"], message)
-            sent.append(agent_id)
-            emit_event(
-                logs_dir(root),
-                component="cli",
-                event="broadcast_sent",
-                agent_id=agent_id,
-                terminal=agent["terminal"],
-            )
-        except OrcaError as exc:
-            errors.append({"agent_id": agent_id, "error": exc.message})
-            emit_event(
-                logs_dir(root),
-                component="cli",
-                event="broadcast_failed",
-                level="ERROR",
-                agent_id=agent_id,
-                terminal=agent.get("terminal", ""),
-                message=exc.message,
-            )
-
-    typer.echo(f"Sent to {len(sent)} agent(s): {', '.join(sent)}")
-    if errors:
-        typer.echo(f"Errors: {errors}")
-    emit_event(
-        logs_dir(root),
-        component="cli",
-        event="broadcast_finished",
-        data={"sent": sent, "errors": errors},
     )
 
 
