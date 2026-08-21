@@ -31,13 +31,19 @@ notified, instead of idling to the hard timeout.
 Independently of ps tracking, every sent prompt's echo is verified
 against the terminal's scrollback (never the preview tail: a
 full-screen TUI's bottom lines are its composer box, where the
-submitted message can never appear). The check first gauges whether
-the read can actually reach the pane's retained buffer — a pane
-exposing only its current screenful (e.g. an alternate-screen TUI)
-has no echo surface, and judging there is a guaranteed false miss.
-A missing echo on a usable surface alarms the caller but never
-triggers a resend — a false miss would otherwise inject a duplicate
-prompt into a working agent's input queue.
+submitted message can never appear). The check pages past the
+newest screenful when the read cursors say more is retained, then
+judges only surfaces that can actually host a conversation — a tail
+reaching just a fraction of the retained buffer, or one that is only
+a full-screen TUI's repaint frames, has no echo surface, and judging
+there is a guaranteed false miss, so the check abstains instead.
+A missing echo on a usable surface alarms the caller only when ps
+does not track the pane: on a tracked pane the ps receipt window is
+authoritative, and a tracked alternate-screen TUI (Claude Code) never
+renders its conversation into scrollback, so every miss there is
+false by construction. The alarm never triggers a resend either way —
+a false miss would otherwise inject a duplicate prompt into a working
+agent's input queue.
 
 CLIs Orca does not recognize (no `agents` entry in `worktree ps`)
 fall back to lastOutputAt idle detection. That fallback never counts
@@ -154,13 +160,19 @@ BLOCKING_DIALOG_MARKERS = (
 # carrying neither unit in sufficient length cannot be verified and
 # the check abstains.
 #
-# The read itself is only checked for usability first: panes whose TUI
-# runs on the alternate screen (or that Orca otherwise exposes only as
-# the current screenful) return a handful of lines while their own
-# cursors report a far larger retained buffer. There is no echo
-# surface to judge by there — some panes render the conversation into
-# real scrollback, some never do — so the check abstains instead of
-# producing another guaranteed false miss.
+# A default `terminal read` exposes only the pane's newest screenful,
+# even when its cursors span a far larger retained buffer (kimi's
+# waiting screen reads back as a single line). When the cursors say
+# more is retained than was returned, the check pages the real
+# scrollback with an explicit cursor before judging — judging on the
+# screenful alone produced false misses on full-screen TUIs.
+#
+# Even the paged tail is judged for usability before the match runs
+# (see _unusable_echo_surface): a surface that cannot host the
+# conversation makes a miss meaningless and a hit worse than
+# meaningless — on repaint frames the only matchable text is a
+# swallowed prompt still sitting in the repainted composer box, which
+# must not count as delivery. Either unusable shape means abstain.
 PROMPT_ECHO_DELAY_SECS = 3.0
 PROMPT_ECHO_MIN_CHARS = 8
 PROMPT_ECHO_PREFIX_CHARS = 24
@@ -168,6 +180,8 @@ PROMPT_ECHO_ISLAND_CHARS = 16
 PROMPT_ECHO_READ_LINES = 400
 PROMPT_ECHO_MIN_SURFACE_LINES = 16  # below this, thinness cannot be judged
 PROMPT_ECHO_SURFACE_MIN_RATIO = 4   # tail must cover >= 1/4 of reachable lines
+PROMPT_ECHO_REDRAW_MIN_LINES = 32   # redraw check only on tails this long
+PROMPT_ECHO_REDRAW_MIN_REPEAT = 3.0  # avg line repeats this much = frames
 
 
 def _prompt_echo_units(text: str) -> list[str]:
@@ -182,6 +196,54 @@ def _prompt_echo_units(text: str) -> list[str]:
             units.append(island[:PROMPT_ECHO_ISLAND_CHARS])
             break
     return units
+
+
+def _unusable_echo_surface(tail: list[str], retained: int | None) -> str | None:
+    """Why `tail` cannot host a conversation echo, or None if it can.
+
+    Two shapes of pane have no echo surface, and judging the echo on
+    either is a guaranteed false miss:
+
+    "thin" — the read reaches only a fraction of the pane's retained
+    buffer: the TUI runs on the alternate screen (or Orca otherwise
+    exposes just the current screenful), so the conversation, if it is
+    rendered anywhere at all, is out of reach. Too short a reachable
+    window cannot be judged for thinness — a genuinely short surface
+    (trust dialog, fresh pane) stays usable so a miss there still
+    alarms.
+
+    "redraw" — the tail is just a full-screen TUI's repaint frames:
+    Claude Code mid-turn repaints its whole screen (spinner, status
+    bar, composer hint, path) into the scrollback every frame, so
+    hundreds of retained lines hold the same few distinct contents
+    once per frame. A real conversation consists of lines seen once;
+    frames make the average line repeat many times. Letters-only
+    normalization (strip everything that is not a Unicode letter)
+    collapses the frame-to-frame churn first — the spinner glyph
+    cycles (✶ ✢ ✽ * ·), counters change digits, padding follows the
+    counter width, and Windows mangles non-ASCII into stray
+    surrogates. Lines that normalize to nothing (box-drawing rules,
+    digit-only rows, progress bars) are screen furniture, not
+    content, and are dropped so they can neither inflate the ratio on
+    a conversation nor hide a flood; a long tail of furniture alone
+    is itself redraw-only. Only a long tail is judged this way at
+    all: a short one is thin but genuine (see "thin" above).
+    """
+    reachable = min(PROMPT_ECHO_READ_LINES, retained) \
+        if retained is not None else len(tail)
+    if (reachable >= PROMPT_ECHO_MIN_SURFACE_LINES
+            and len(tail) * PROMPT_ECHO_SURFACE_MIN_RATIO < reachable):
+        return "thin"
+    if len(tail) >= PROMPT_ECHO_REDRAW_MIN_LINES:
+        lines = [
+            re.sub(r"[^\w]|[\d_]", "", line) for line in tail if line.strip()
+        ]
+        lines = [line for line in lines if line]
+        if not lines:
+            return "redraw"
+        if len(lines) / len(set(lines)) >= PROMPT_ECHO_REDRAW_MIN_REPEAT:
+            return "redraw"
+    return None
 
 
 def _composer_visible(preview: str) -> bool:
@@ -415,6 +477,15 @@ class Watcher:
     async def _last_output_at(self) -> int:
         return (await self._terminal_snapshot())[0]
 
+    async def _terminal_read(self, limit: int, cursor: str | None = None) -> dict:
+        try:
+            return await terminal_read(self.handle, limit=limit, cursor=cursor)
+        except OrcaError as exc:
+            if exc.code != "terminal_handle_stale" \
+                    or not await self._rebind_terminal():
+                raise
+            return await terminal_read(self.handle, limit=limit, cursor=cursor)
+
     async def _echo_surface(
         self, limit: int
     ) -> tuple[list[str], int | None] | None:
@@ -424,28 +495,46 @@ class Watcher:
         (latestCursor - oldestCursor) and is None when the response
         carries no cursors. None overall when the terminal cannot be
         read.
+
+        A default read exposes only the pane's newest screenful (kimi's
+        waiting screen can be a single line) while its cursors still
+        span the whole retained buffer — so when the cursors say more
+        is retained than was returned, page the real scrollback with an
+        explicit cursor before judging. Judging on the screenful alone
+        is what produced false `prompt_echo_missing` alarms on full-
+        screen TUIs.
         """
         try:
-            data = await terminal_read(self.handle, limit=limit)
-        except OrcaError as exc:
-            if exc.code != "terminal_handle_stale" \
-                    or not await self._rebind_terminal():
-                return None
-            try:
-                data = await terminal_read(self.handle, limit=limit)
-            except OrcaError:
-                return None
+            data = await self._terminal_read(limit)
+        except OrcaError:
+            return None
         term = data.get("result", {}).get("terminal", {})
         tail = term.get("tail")
         if not isinstance(tail, list):
             return None
         retained = None
         try:
-            retained = max(
-                0, int(term["latestCursor"]) - int(term["oldestCursor"])
-            )
+            oldest = int(term["oldestCursor"])
+            latest = int(term["latestCursor"])
+            retained = max(0, latest - oldest)
         except (KeyError, TypeError, ValueError):
-            pass
+            oldest = latest = None
+        if retained is not None and len(tail) < min(limit, retained):
+            # Paging can only help while the default read returned
+            # fewer lines than both the ask and the buffer; a full
+            # read is already the newest `limit` lines and a paged
+            # read from latest - limit would return the same window.
+            start = max(oldest, latest - limit)
+            try:
+                paged = await self._terminal_read(limit, cursor=str(start))
+            except OrcaError:
+                paged = None
+            if paged is not None:
+                paged_tail = paged.get("result", {}).get(
+                    "terminal", {}).get("tail")
+                if isinstance(paged_tail, list) \
+                        and len(paged_tail) > len(tail):
+                    tail = paged_tail
         return [str(line) for line in tail], retained
 
     async def _send_terminal(self, text: str) -> None:
@@ -464,31 +553,33 @@ class Watcher:
 
         Returns True/False, or None when no verdict is possible: the
         prompt carries no match unit long enough to be trustworthy, the
-        terminal cannot be read, or the read cannot reach the pane's
-        retained buffer (no usable echo surface).
+        terminal cannot be read, or the surface cannot host a
+        conversation echo — a read reaching only a fraction of the
+        retained buffer, or repaint frames only (see
+        _unusable_echo_surface).
         """
         units = _prompt_echo_units(text)
         if not units:
             return None
         # Two looks before judging: the TUI may need a moment to render
-        # the submitted message into the scrollback.
+        # the submitted message into the scrollback. The last look's
+        # usability verdict wins: a surface that turned unusable can
+        # give no verdict, while one that turned usable and still
+        # misses is a genuine miss.
+        unusable = None
         for _ in range(2):
             await anyio.sleep(PROMPT_ECHO_DELAY_SECS)
             surface = await self._echo_surface(PROMPT_ECHO_READ_LINES)
             if surface is None:
                 return None
             tail, retained = surface
-            reachable = min(PROMPT_ECHO_READ_LINES, retained) \
-                if retained is not None else len(tail)
-            if (reachable >= PROMPT_ECHO_MIN_SURFACE_LINES
-                    and len(tail) * PROMPT_ECHO_SURFACE_MIN_RATIO < reachable):
-                self._event(
-                    "prompt_echo_unverifiable",
-                    message="terminal read exposes only a fraction of the "
-                            "retained buffer; no usable echo surface",
-                    data={"returned": len(tail), "retained": retained},
-                )
-                return None
+            # Usability before the match: on an unusable surface the
+            # only matchable text is a swallowed prompt still sitting
+            # in the repainted composer box — a hit there must not
+            # count as delivery any more than a miss counts as loss.
+            unusable = _unusable_echo_surface(tail, retained)
+            if unusable is not None:
+                continue
             # Whitespace-insensitive matching: a wrapped echo breaks
             # the prompt across visual lines (CJK is double-width, so a
             # 24-char prefix straddles a wrap on any terminal narrower
@@ -502,6 +593,20 @@ class Watcher:
             )
             if any("".join(unit.split()) in haystack for unit in units):
                 return True
+        if unusable is not None:
+            self._event(
+                "prompt_echo_unverifiable",
+                message=(
+                    "terminal read exposes only a fraction of the "
+                    "retained buffer; no usable echo surface"
+                    if unusable == "thin" else
+                    "scrollback holds only repaint frames; "
+                    "no usable echo surface"
+                ),
+                data={"reason": unusable, "returned": len(tail),
+                      "retained": retained},
+            )
+            return None
         return False
 
     async def run(self) -> None:
@@ -515,13 +620,19 @@ class Watcher:
         self._event("ready_wait_started")
         ready_source = await self._wait_ready()
         if ready_source is None:
-            log.error("watcher(%s): ready-wait timed out", self.agent_id)
+            busy = await self._pane_alive()
+            reason = "pane_busy" if busy else "ready_failed"
+            error = ("agent still busy at the ready deadline"
+                     if busy else "ready timeout")
+            log.error("watcher(%s): ready-wait timed out (%s)",
+                      self.agent_id, reason)
             self._event(
                 "ready_wait_failed",
                 level="ERROR",
-                message="terminal never became ready",
+                message=("terminal never became ready; pane still busy"
+                         if busy else "terminal never became ready"),
             )
-            await self._finalize("error", "ready_failed", error="ready timeout")
+            await self._finalize("error", reason, error=error)
             return
         self._event("ready_observed", data={"source": ready_source})
         log.info(
@@ -546,7 +657,12 @@ class Watcher:
         self._update(handoff_path=str(handoff))
         instruction = HANDOFF_TEMPLATE.format(path=handoff)
         for attempt in (1, 2):
-            handoff_source = await self._run_turn(instruction, phase="handoff")
+            # The retry resends byte-identical text: attempt 1's echo
+            # is still in the scrollback, so a verified echo on
+            # attempt 2 cannot prove this send was received.
+            handoff_source = await self._run_turn(
+                instruction, phase="handoff", echo_receipt=attempt == 1,
+            )
             if handoff_source in (
                 "timeout", "terminal_lost", "send_failed", "no_receipt",
             ):
@@ -577,7 +693,11 @@ class Watcher:
         kimi, Claude Code v2) is judged on its terminal preview
         instead: a known ready-screen marker, or a composer / status-bar
         signature plus a short silence window, means ready now;
-        otherwise output must stay silent for READY_IDLE_STABLE_MS. Readiness is never treated as task
+        otherwise output must stay silent for READY_IDLE_STABLE_MS. A
+        tracked pane that ps keeps reporting as "working" re-arms the
+        ready wait instead of failing as "never ready" — a worker still
+        finishing previous work is busy, not broken; the hard deadline
+        still bounds the wait. Readiness is never treated as task
         completion: the task prompt is always sent and observed as its
         own turn afterwards.
 
@@ -586,6 +706,7 @@ class Watcher:
         """
         deadline = time.monotonic() + READY_TIMEOUT_MS / 1000
         dialog_notified = False
+        busy_notified = False
         while time.monotonic() < deadline:
             if self.pane is None:
                 self.pane = await _pane_key(self.handle)
@@ -603,6 +724,28 @@ class Watcher:
                 # turn still running on an adopted pane) means wait.
                 if entry.get("state") == "done":
                     return "ps_idle"
+                if entry.get("state") == "working":
+                    # A pane mid-turn is proof of life, not a stuck
+                    # startup: keep waiting (capped by the watcher's
+                    # hard deadline) instead of failing a live agent as
+                    # "never ready" after READY_TIMEOUT_MS.
+                    deadline = min(
+                        self.deadline,
+                        time.monotonic() + READY_TIMEOUT_MS / 1000,
+                    )
+                    if not busy_notified:
+                        busy_notified = True
+                        self._event(
+                            "ready_wait_busy",
+                            message="pane is mid-turn; extending the "
+                                    "ready wait",
+                        )
+                        await self._notify(
+                            f"# [osw] agent-busy agent={self.agent_id}"
+                            f" terminal={self.handle}"
+                            " (still finishing previous work; the new"
+                            " prompt goes out when it becomes ready)"
+                        )
             else:
                 if await self._wait_tui_idle():
                     return "tui_idle"
@@ -641,6 +784,24 @@ class Watcher:
             await anyio.sleep(POLL_SECS)
         return None
 
+    async def _pane_alive(self) -> bool:
+        """Best-effort proof of life at the ready deadline: ps still
+        reports the pane working, or the terminal produced output in
+        the last minute. Distinguishes "agent still busy" from a dead
+        or stuck startup when the ready wait times out."""
+        if self.pane is not None:
+            try:
+                entry = await _ps_entry(self.pane)
+            except OrcaError:
+                entry = None
+            if entry is not None and entry.get("state") == "working":
+                return True
+        try:
+            last = await self._last_output_at()
+        except OrcaError:
+            return False
+        return bool(last) and time.time() * 1000 - last < 60_000
+
     async def _pane_done_state_started(self) -> int:
         """stateStartedAt of the pane's current "done" entry, or 0.
 
@@ -658,12 +819,19 @@ class Watcher:
             return int(entry.get("stateStartedAt") or 0)
         return 0
 
-    async def _run_turn(self, text: str, phase: str) -> str:
+    async def _run_turn(
+        self, text: str, phase: str, echo_receipt: bool = True,
+    ) -> str:
         """Send one prompt and wait for the turn to complete.
 
         Returns the completion source: "ps_done", "tui_idle",
         "fallback_idle", or one of the failure modes
         "send_failed"/"timeout"/"terminal_lost"/"no_receipt".
+
+        `echo_receipt=False` keeps a verified scrollback echo from
+        counting as prompt receipt: a resend of byte-identical text
+        (the handoff retry) matches the previous attempt's echo just
+        as well, so the echo proves nothing about this send.
         """
         sent_at_ms = time.time() * 1000
         baseline_state_started = await self._pane_done_state_started()
@@ -690,25 +858,49 @@ class Watcher:
         # the miss is false (a full-screen TUI whose echo the check
         # cannot see made every miss false), and genuine non-receipt
         # already fails closed in the turn supervision below.
+        #
+        # The alarm is reserved for panes ps does not track. On a
+        # tracked pane the ps receipt window below is authoritative —
+        # and for a tracked alternate-screen TUI (Claude Code) the
+        # conversation never enters the scrollback at all: every miss
+        # there is false by construction, while a genuine swallow still
+        # fails closed as no_receipt. Early in such a turn the repaint
+        # frames have not yet flooded the retained buffer, so the
+        # redraw-surface abstention cannot save the verdict either.
         echoed = await self._verify_prompt_echo(text)
         if echoed is False:
             log.warning(
                 "watcher(%s): prompt not visible in terminal scrollback",
                 self.agent_id,
             )
-            self._event(
-                "prompt_echo_missing",
-                level="ERROR",
-                message="prompt not visible in terminal scrollback",
-                data={"phase": phase},
-            )
-            await self._notify(
-                f"# [osw] prompt-echo-unverified agent={self.agent_id}"
-                f" terminal={self.handle}"
-                " (prompt may have been swallowed; check that terminal)"
-            )
+            if self.pane is None:
+                self._event(
+                    "prompt_echo_missing",
+                    level="ERROR",
+                    message="prompt not visible in terminal scrollback",
+                    data={"phase": phase},
+                )
+                await self._notify(
+                    f"# [osw] prompt-echo-unverified agent={self.agent_id}"
+                    f" terminal={self.handle}"
+                    " (prompt may have been swallowed; check that terminal)"
+                )
+            else:
+                self._event(
+                    "prompt_echo_missing",
+                    message="prompt not visible in terminal scrollback; "
+                            "pane is ps-tracked, so the receipt window "
+                            "below is authoritative",
+                    data={"phase": phase},
+                )
+        # A verified scrollback echo is direct evidence the submitted
+        # prompt reached the TUI's conversation — stronger than the ps
+        # prompt-text match, which mangles CJK on Windows. Count it as
+        # receipt up front so a ps that stays blind to the new turn
+        # (stale "done") cannot fail a delivered prompt closed.
         source = await self._wait_turn_done(
-            sent_at_ms, baseline_state_started, sent_text=text
+            sent_at_ms, baseline_state_started, sent_text=text,
+            receipt_hint=echo_receipt and echoed is True,
         )
         self._event(
             "turn_finished",
@@ -718,7 +910,7 @@ class Watcher:
 
     async def _wait_turn_done(
         self, sent_at_ms: float, baseline_state_started: int = 0,
-        sent_text: str = "",
+        sent_text: str = "", receipt_hint: bool = False,
     ) -> str:
         try:
             baseline_out = await self._last_output_at()
@@ -727,7 +919,9 @@ class Watcher:
         started = False
         entry_seen = False   # Orca showed a ps entry for this pane this turn
         saw_working = False  # ...and reported it "working" at least once
-        receipt = False      # evidence the CLI actually took our prompt
+        # receipt: evidence the CLI actually took our prompt. A verified
+        # scrollback echo already proves that; ps evidence adds to it.
+        receipt = receipt_hint
         sent_flat = one_line(sent_text)
         echo_absorbed = False
         misses = 0

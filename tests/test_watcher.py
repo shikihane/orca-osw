@@ -124,7 +124,7 @@ async def test_watcher_persists_pane_key_before_running_turns(tmp_path):
         "state": "assigned",
     })
 
-    async def fake_run_turn(self, text, phase):
+    async def fake_run_turn(self, text, phase, **_):
         return "ps_done"
 
     async def fake_finalize(self, final_state, source, error=""):
@@ -203,7 +203,7 @@ async def test_watcher_retries_prompt_after_stale_handle_rebind(tmp_path):
     )
     send = AsyncMock(side_effect=[stale, {}, {}])
 
-    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
         return "ps_done"
 
     with patch("osw.watcher.terminal_show", AsyncMock(return_value={
@@ -381,7 +381,7 @@ async def test_watcher_emits_trace_events(tmp_path):
     })
 
     async def fake_wait_turn_done(
-        self, sent_at_ms, baseline_state_started=0, sent_text=""
+        self, sent_at_ms, baseline_state_started=0, sent_text="", **_
     ):
         return "ps_done"
 
@@ -750,8 +750,9 @@ async def test_composer_without_silence_is_not_ready(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_untracked_pane_with_recent_output_is_not_ready(tmp_path):
-    """Output silence shorter than the stable window must keep waiting."""
+async def test_untracked_pane_with_recent_output_reports_pane_busy(tmp_path):
+    """A ready wait that times out while the terminal kept producing
+    output is a busy pane, not a dead one: report pane_busy."""
     state.init_state_dir(tmp_path)
     state.write_agent(tmp_path, {
         "agent_id": "agent_001",
@@ -780,12 +781,50 @@ async def test_untracked_pane_with_recent_output_is_not_ready(tmp_path):
 
     agent = state.read_agent(tmp_path, "agent_001")
     assert agent["state"] == "error"
+    assert agent["completion_source"] == "pane_busy"
+    send.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_silent_pane_ready_timeout_fails_closed(tmp_path):
+    """No ps entry and no output at all by the ready deadline: the
+    terminal never came up — ready_failed."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+
+    show = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tabId": "tab-a", "leafId": "leaf-b", "lastOutputAt": 0,
+        }}
+    })
+    ps = AsyncMock(return_value=[{"agents": []}])
+    wait = AsyncMock(side_effect=OrcaError("timeout waiting for tui-idle", 1))
+    send = AsyncMock(return_value={})
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.READY_TIMEOUT_MS", 50):
+        await Watcher(tmp_path, "agent_001").run()
+
+    agent = state.read_agent(tmp_path, "agent_001")
+    assert agent["state"] == "error"
     assert agent["completion_source"] == "ready_failed"
     send.assert_not_awaited()
 
 
 @pytest.mark.anyio
-async def test_busy_tracked_pane_never_ready_fails_closed(tmp_path):
+async def test_busy_tracked_pane_extends_ready_wait_until_hard_deadline(tmp_path):
+    """A tracked pane ps keeps reporting "working" is alive: the ready
+    wait re-arms instead of failing after READY_TIMEOUT_MS, and only
+    the hard deadline ends it — reported as pane_busy."""
     state.init_state_dir(tmp_path)
     state.write_agent(tmp_path, {
         "agent_id": "agent_001",
@@ -808,14 +847,63 @@ async def test_busy_tracked_pane_never_ready_fails_closed(tmp_path):
          patch("osw.watcher.terminal_wait", wait), \
          patch("osw.watcher.terminal_send", send), \
          patch("osw.watcher.POLL_SECS", 0), \
-         patch("osw.watcher.READY_TIMEOUT_MS", 50):
+         patch("osw.watcher.READY_TIMEOUT_MS", 50), \
+         patch("osw.watcher.HARD_TIMEOUT_SECS", 0.2):
         await Watcher(tmp_path, "agent_001").run()
 
     agent = state.read_agent(tmp_path, "agent_001")
     assert agent["state"] == "error"
-    assert agent["completion_source"] == "ready_failed"
+    assert agent["completion_source"] == "pane_busy"
     send.assert_not_awaited()
     wait.assert_not_awaited()  # tracked pane: tui-idle is never consulted
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert '"event": "ready_wait_busy"' in events
+
+
+@pytest.mark.anyio
+async def test_busy_tracked_pane_becoming_ready_receives_prompt(tmp_path):
+    """The follow-up is not lost when the pane is busy past
+    READY_TIMEOUT_MS: once ps reports "done" the prompt goes out."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "continue this",
+        "state": "assigned",
+    })
+
+    show = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tabId": "tab-a", "leafId": "leaf-b",
+            "lastOutputAt": int(time.time() * 1000),
+        }}
+    })
+    working = _ps_result("tab-a:leaf-b", "working")
+    done = _ps_result("tab-a:leaf-b", "done", int(time.time() * 1000))
+    ps_calls = iter([working] * 5 + [done])
+
+    async def ps_seq():
+        # 5 busy polls ≈ 400ms total — well past the bare 250ms
+        # timeout, so only the re-arm keeps the wait alive; each
+        # single poll stays far under the window even with Windows
+        # timer granularity and the first iteration's state writes.
+        await anyio.sleep(0.08)
+        return next(ps_calls, done)
+
+    ps = AsyncMock(side_effect=ps_seq)
+    wait = AsyncMock(return_value={})
+
+    watcher = Watcher(tmp_path, "agent_001")
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.READY_TIMEOUT_MS", 250):
+        source = await watcher._wait_ready()
+
+    assert source == "ps_idle"
 
 
 @pytest.mark.anyio
@@ -1167,6 +1255,81 @@ async def test_prompt_echoed_in_ps_counts_as_receipt(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_verified_scrollback_echo_counts_as_receipt(tmp_path):
+    """A prompt whose echo was verified in the terminal scrollback was
+    demonstrably delivered — a ps that stays blind to the new turn
+    (stale "done") must not fail it closed as no_receipt."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "caller_terminal": "term-caller",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 0.05
+
+    stale = int(time.time() * 1000)
+    show = AsyncMock(return_value={
+        "result": {"terminal": {"lastOutputAt": 1000}},
+    })
+    ps = AsyncMock(return_value=_ps_result("tab-a:leaf-b", "done", stale))
+    send = AsyncMock(return_value={})
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.RECEIPT_TIMEOUT_MS", 0):
+        result = await watcher._wait_turn_done(
+            time.time() * 1000, baseline_state_started=stale,
+            sent_text="do the task", receipt_hint=True,
+        )
+
+    assert result == "timeout"  # no receipt alarm; just no completion yet
+    send.assert_not_awaited()
+    events_file = state.logs_dir(tmp_path) / "events.jsonl"
+    if events_file.exists():
+        assert "prompt_receipt_missing" not in events_file.read_text(
+            encoding="utf-8"
+        )
+
+
+@pytest.mark.anyio
+async def test_handoff_retry_does_not_reuse_stale_echo_as_receipt(tmp_path):
+    """The handoff retry resends byte-identical text, so attempt 1's
+    scrollback echo matches attempt 2's check just as well — a forged
+    receipt would let a swallowed retry ride to the hard timeout
+    instead of failing closed. Attempt 2 must run with echo-receipt
+    disabled."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+
+    turns = []
+
+    async def fake_run_turn(self, text, phase, echo_receipt=True):
+        turns.append((phase, echo_receipt))
+        return "ps_done"  # handoff file never appears -> retry fires
+
+    with patch.object(Watcher, "_wait_ready", AsyncMock(return_value="ps_idle")), \
+         patch.object(Watcher, "_run_turn", fake_run_turn):
+        await Watcher(tmp_path, "agent_001").run()
+
+    assert turns == [
+        ("task", True),
+        ("handoff", True),
+        ("handoff", False),  # identical resend: stale echo proves nothing
+    ]
+
+
+@pytest.mark.anyio
 async def test_late_ps_registration_upgrades_to_ps_done(tmp_path):
     """Orca registers a freshly spawned pane a few polls late: the
     watcher keeps polling ps meanwhile and completes on real evidence
@@ -1327,7 +1490,7 @@ async def test_missing_prompt_echo_alarms_without_resending(tmp_path):
     })
     send = AsyncMock(return_value={})
 
-    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
         return "fallback_idle"
 
     with patch("osw.watcher.terminal_read", read), \
@@ -1348,6 +1511,49 @@ async def test_missing_prompt_echo_alarms_without_resending(tmp_path):
     assert events.count('"event": "prompt_echo_missing"') == 1
     assert '"level": "ERROR"' in events
     assert "turn_resent" not in events
+
+
+@pytest.mark.anyio
+async def test_missing_prompt_echo_on_tracked_pane_does_not_alarm(tmp_path):
+    """On a ps-tracked pane the receipt window is authoritative: a
+    missing scrollback echo (normal for a tracked alternate-screen TUI
+    like Claude Code, whose conversation never enters scrollback) is
+    logged as an INFO event but must not alarm the caller."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "caller_terminal": "term-caller",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "pane-key"  # ps tracks this pane
+
+    read = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tail": ["✻ Wrangling… (0m 4s · ↓ 0.2k tokens)", "", "", ""],
+        }}
+    })
+    send = AsyncMock(return_value={})
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
+        return "ps_done"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn("do the task", phase="task")
+
+    assert result == "ps_done"
+    sent = [call.args[1] for call in send.await_args_list]
+    assert sent == ["do the task"]  # no caller notification
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert events.count('"event": "prompt_echo_missing"') == 1
+    assert '"level": "ERROR"' not in events
 
 
 @pytest.mark.anyio
@@ -1378,7 +1584,7 @@ async def test_prompt_echo_verified_from_scrollback(tmp_path):
     })
     send = AsyncMock(return_value={})
 
-    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
         return "fallback_idle"
 
     with patch("osw.watcher.terminal_read", read), \
@@ -1419,7 +1625,7 @@ async def test_prompt_echo_matches_clipped_echo_via_ascii_island(tmp_path):
     })
     send = AsyncMock(return_value={})
 
-    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
         return "fallback_idle"
 
     with patch("osw.watcher.terminal_read", read), \
@@ -1458,7 +1664,7 @@ async def test_prompt_echo_verified_for_pure_cjk_prompt(tmp_path):
     })
     send = AsyncMock(return_value={})
 
-    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
         return "fallback_idle"
 
     with patch("osw.watcher.terminal_read", read), \
@@ -1493,7 +1699,7 @@ async def test_prompt_echo_check_abstains_without_match_unit(tmp_path):
     })
     send = AsyncMock(return_value={})
 
-    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
         return "fallback_idle"
 
     with patch("osw.watcher.terminal_read", read), \
@@ -1537,7 +1743,7 @@ async def test_prompt_echo_check_abstains_on_thin_scrollback_surface(tmp_path):
     })
     send = AsyncMock(return_value={})
 
-    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
         return "fallback_idle"
 
     with patch("osw.watcher.terminal_read", read), \
@@ -1556,6 +1762,282 @@ async def test_prompt_echo_check_abstains_on_thin_scrollback_surface(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_prompt_echo_pages_scrollback_past_screenful(tmp_path):
+    """A default `terminal read` exposes only the pane's newest
+    screenful (kimi's waiting screen reads back as one line) even when
+    the cursors span a large retained buffer holding the echo. The
+    check must re-read with an explicit cursor and verify against the
+    real scrollback instead of judging on the screenful."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    prompt = "Summarize the build layout of this repo"
+
+    def word(n: int) -> str:  # letters vary per line, like real output
+        return chr(97 + n % 26) + chr(97 + (n // 26) % 26)
+
+    scrollback = [f" ● earlier output line {n} about {word(n)} topics"
+                  for n in range(300)]
+    scrollback += [
+        " ✨ Summarize the build layout of this",
+        "    repo",
+    ]
+
+    async def read(handle, limit=200, cursor=None):
+        if cursor is None:
+            return {"result": {"terminal": {
+                "tail": [" 🌔 · Tip: ask Kimi to schedule tasks"],
+                "oldestCursor": "1607",
+                "latestCursor": "3607",
+                "returnedLineCount": 1,
+            }}}
+        return {"result": {"terminal": {
+            "tail": scrollback,
+            "oldestCursor": "1607",
+            "latestCursor": "3607",
+            "returnedLineCount": len(scrollback),
+        }}}
+
+    send = AsyncMock(return_value={})
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn(prompt, phase="task")
+
+    assert result == "fallback_idle"
+    send.assert_awaited_once()
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "prompt_echo_missing" not in events
+    assert "prompt_echo_unverifiable" not in events
+
+
+@pytest.mark.anyio
+async def test_prompt_echo_skips_paging_when_default_read_is_full(tmp_path):
+    """A default read that already returned the full `limit` lines is
+    the newest window paging would fetch again: the paged read must be
+    skipped, not fired and discarded."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    def word(n: int) -> str:  # letters vary per line even without digits
+        return chr(97 + n % 26) + chr(97 + (n // 26) % 26)
+
+    tail = [f" ● earlier output line {n} about {word(n)} topics"
+            for n in range(399)]
+    tail.append(" ✨ do the task")
+    read = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tail": tail,
+            "oldestCursor": "0",
+            "latestCursor": "2000",
+            "returnedLineCount": len(tail),
+        }}
+    })
+    send = AsyncMock(return_value={})
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn("do the task", phase="task")
+
+    assert result == "fallback_idle"
+    assert read.await_count == 1  # echo hit on the first, unpaged look
+    assert all(
+        call.kwargs.get("cursor") is None for call in read.await_args_list
+    )
+
+
+@pytest.mark.anyio
+async def test_prompt_echo_check_abstains_on_redraw_only_scrollback(tmp_path):
+    """An alternate-screen TUI (Claude Code mid-turn) repaints its
+    status line into the scrollback every frame: the paged read returns
+    hundreds of lines that are all the same spinner with different
+    counters. That flood passes the thinness gauge yet never contains
+    the conversation — judging the echo there is a guaranteed false
+    miss, so the check must abstain instead of alarming."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    glyphs = ["✶", "✢", "✽", "*", "·"]
+    frames = []
+    for n in range(50):
+        # every frame repaints the whole screen: spinner (glyph cycles,
+        # counter digits change, padding width follows), then the
+        # permanent status-bar furniture
+        frames += [
+            f"{glyphs[n % 5]}─Ionizing…─" + "─" * (n % 7)
+            + f" (1m {n % 60}s · ↓ 4.{n % 10}k tokens)",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · 2 agents",
+            f"  main · D:\\bit\\master\\repo · {n * 137} tokens used",
+        ] + [""] * 5
+
+    async def read(handle, limit=200, cursor=None):
+        if cursor is None:
+            return {"result": {"terminal": {
+                "tail": ["· Wrangling… (1m 52s · ↓ 4.8k tokens)", "", "", ""],
+                "oldestCursor": "5504",
+                "latestCursor": "7504",
+                "returnedLineCount": 4,
+            }}}
+        return {"result": {"terminal": {
+            "tail": frames,
+            "oldestCursor": "5504",
+            "latestCursor": "7504",
+            "returnedLineCount": len(frames),
+        }}}
+
+    send = AsyncMock(return_value={})
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn("do the task", phase="task")
+
+    assert result == "fallback_idle"
+    send.assert_awaited_once()
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "prompt_echo_missing" not in events
+    assert '"event": "prompt_echo_unverifiable"' in events
+
+
+@pytest.mark.anyio
+async def test_swallowed_prompt_in_repainted_composer_is_not_delivery(tmp_path):
+    """A prompt whose Enter was swallowed sits in the composer box and
+    gets repainted into the scrollback with every frame. Matching it
+    there must not count as a verified echo (and must not feed the
+    receipt hint): the surface is repaint frames, so the check
+    abstains."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    frames = []
+    for n in range(50):
+        frames += [
+            f"· Ionizing… (1m {n % 60}s · ↓ 4.{n % 10}k tokens)",
+            "│ > do the task                                  │",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ] + [""] * 5
+
+    read = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tail": frames,
+            "oldestCursor": "5504",
+            "latestCursor": "7504",
+            "returnedLineCount": len(frames),
+        }}
+    })
+    send = AsyncMock(return_value={})
+
+    hints = []
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0,
+                          sent_text="", receipt_hint=False, **_):
+        hints.append(receipt_hint)
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn("do the task", phase="task")
+
+    assert result == "fallback_idle"
+    assert hints == [False]  # the composer match never became receipt
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "prompt_echo_missing" not in events
+    assert '"event": "prompt_echo_unverifiable"' in events
+
+
+@pytest.mark.anyio
+async def test_prompt_echo_missing_still_alarms_on_real_scrollback(tmp_path):
+    """The redraw check must not swallow genuine misses: a long
+    scrollback of real conversation lines (each seen once) is a usable
+    echo surface, so a prompt absent from it still alarms."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    def word(n: int) -> str:  # letters vary per line even without digits
+        return chr(97 + n % 26) + chr(97 + (n // 26) % 26)
+
+    tail = [f" ● earlier output line {n} about {word(n)} topics"
+            for n in range(300)]
+    read = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tail": tail,
+            "oldestCursor": "18654",
+            "latestCursor": "20654",
+            "returnedLineCount": len(tail),
+        }}
+    })
+    send = AsyncMock(return_value={})
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn("do the task", phase="task")
+
+    assert result == "fallback_idle"
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert '"event": "prompt_echo_missing"' in events
+    assert "prompt_echo_unverifiable" not in events
+
+
+@pytest.mark.anyio
 async def test_prompt_echo_verified_with_full_retained_scrollback(tmp_path):
     """A read whose tail covers the retained buffer is a usable echo
     surface: the wrapped echo inside it verifies the prompt."""
@@ -1569,7 +2051,12 @@ async def test_prompt_echo_verified_with_full_retained_scrollback(tmp_path):
     watcher = Watcher(tmp_path, "agent_001")
 
     prompt = "Summarize the build layout of this repo"
-    tail = [f" ● earlier output line {n}" for n in range(300)]
+
+    def word(n: int) -> str:  # letters vary per line, like real output
+        return chr(97 + n % 26) + chr(97 + (n // 26) % 26)
+
+    tail = [f" ● earlier output line {n} about {word(n)} topics"
+            for n in range(300)]
     tail += [
         " ✨ Summarize the build layout of this",
         "    repo",
@@ -1586,7 +2073,7 @@ async def test_prompt_echo_verified_with_full_retained_scrollback(tmp_path):
     })
     send = AsyncMock(return_value={})
 
-    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
         return "fallback_idle"
 
     with patch("osw.watcher.terminal_read", read), \
@@ -1630,7 +2117,7 @@ async def test_prompt_echo_verified_when_wrap_splits_cjk_prefix(tmp_path):
     })
     send = AsyncMock(return_value={})
 
-    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
         return "fallback_idle"
 
     with patch("osw.watcher.terminal_read", read), \
@@ -1663,7 +2150,7 @@ async def test_prompt_echo_check_abstains_when_terminal_unreadable(tmp_path):
     read = AsyncMock(side_effect=OrcaError("terminal gone", 1))
     send = AsyncMock(return_value={})
 
-    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text=""):
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
         return "fallback_idle"
 
     with patch("osw.watcher.terminal_read", read), \

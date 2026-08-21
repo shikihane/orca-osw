@@ -97,14 +97,20 @@ the turn fails closed as `no_receipt` and the caller is notified.
 Independently, every sent prompt's echo is verified against the
 terminal's scrollback (`terminal read` — never the preview tail, which
 a full-screen TUI permanently occupies with its composer box). The
-check first gauges whether the read can reach the pane's retained
-buffer (tail size vs. the read cursors' `latestCursor - oldestCursor`);
-a pane exposing only its current screenful (alternate-screen TUI) has
-no echo surface, and judging there is a guaranteed false miss, so the
+check pages past the newest screenful when the read cursors
+(`latestCursor - oldestCursor`) say more is retained, then judges the
+surface for usability before matching: a tail reaching only a fraction
+of the retained buffer (alternate-screen TUI), or one that is just
+repaint frames (Claude Code mid-turn floods the buffer with its
+redrawn screen, where the only matchable text would be a swallowed
+prompt still sitting in the composer), has no echo surface, and the
 check abstains (`prompt_echo_unverifiable`). A missing echo on a
-usable surface alarms the caller but never triggers a resend: a false
-miss would inject a duplicate prompt into a working agent's input
-queue.
+usable surface alarms the caller only when ps does not track the pane
+(on a tracked pane the receipt window is authoritative) and never
+triggers a resend: a false miss would inject a duplicate prompt into a
+working agent's input queue. A verified echo counts as prompt receipt,
+except on the handoff retry, whose byte-identical resend would match
+the first attempt's echo.
 Provider autonomy flags skip approval prompts, including OMP's
 `--auto-approve` and Kimi's `--yolo`; use them only in trusted workspaces.
 

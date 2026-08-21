@@ -85,9 +85,10 @@ worker's work summary.
 | Notification | Coordinator action |
 |---|---|
 | `agent-waiting` | Answer the worker directly in its terminal. |
+| `agent-busy` | Informational: the pane was still finishing previous work at dispatch; the ready wait is extended and the prompt goes out once the pane becomes ready. |
 | `agent-stalled` | Inspect `logs`, then inspect the terminal before intervening. |
 | `task-finished` | Open the report and handoff; move the task to acceptance. |
-| `task-error` | Read the report reason and logs before retrying. |
+| `task-error` | Read the report reason and logs before retrying. `pane_busy` means the worker was still provably busy at the ready deadline — retry after it finishes; it is not a dead terminal. |
 
 A `task-finished` notification can report `handoff_missing`; inspect the actual
 workspace and terminal before deciding whether the result is usable.
