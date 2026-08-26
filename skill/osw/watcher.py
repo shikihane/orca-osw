@@ -45,6 +45,15 @@ false by construction. The alarm never triggers a resend either way —
 a false miss would otherwise inject a duplicate prompt into a working
 agent's input queue.
 
+Orca's send-time effect confirmation is held to the same standard:
+`agent_prompt_stalled` means the write landed but Orca saw no fresh
+idle->working edge within its short window — typical for a prompt
+arriving at a TUI that is already "working" (a fresh Claude Code
+session still on its startup turn). The turn proceeds to the receipt
+window, which is authoritative; only genuine write failures
+(`terminal_not_writable`, unrecoverable stale handle, a permission
+modal swallowing the input) fail the send.
+
 CLIs Orca does not recognize (no `agents` entry in `worktree ps`)
 fall back to lastOutputAt idle detection. That fallback never counts
 the prompt's own terminal echo as output, and the quick tui-idle exit
@@ -537,15 +546,29 @@ class Watcher:
                     tail = paged_tail
         return [str(line) for line in tail], retained
 
-    async def _send_terminal(self, text: str) -> None:
+    async def _send_terminal(self, text: str) -> bool:
+        """Send `text`; True when Orca confirmed the prompt took effect.
+
+        Orca's send-time confirmation watches the TUI for a fresh
+        non-working -> working edge within a short window. A TUI that is
+        already "working" when the prompt lands (a fresh Claude Code
+        session still on its startup turn) accepts the prompt without a
+        new edge, so Orca reports `agent_prompt_stalled` even though the
+        write succeeded. That is a delivery-unconfirmed signal, not a
+        write failure: return False and let the receipt window below
+        judge. Genuine write failures still raise.
+        """
         try:
             await terminal_send(self.handle, text)
-            return
+            return True
         except OrcaError as exc:
+            if exc.code == "agent_prompt_stalled":
+                return False
             if exc.code != "terminal_handle_stale" \
                     or not await self._rebind_terminal():
                 raise
         await terminal_send(self.handle, text)
+        return True
 
     async def _verify_prompt_echo(self, text: str) -> bool | None:
         """Re-read the terminal scrollback and check the sent prompt's
@@ -832,11 +855,18 @@ class Watcher:
         counting as prompt receipt: a resend of byte-identical text
         (the handoff retry) matches the previous attempt's echo just
         as well, so the echo proves nothing about this send.
+
+        Orca's send-time effect confirmation may report
+        `agent_prompt_stalled` for a prompt that did land (the TUI was
+        already "working" when it arrived, so no fresh idle->working
+        edge fired within Orca's window). That is not a send failure:
+        the turn proceeds to the receipt window below, which fails
+        closed as "no_receipt" if the prompt truly never arrived.
         """
         sent_at_ms = time.time() * 1000
         baseline_state_started = await self._pane_done_state_started()
         try:
-            await self._send_terminal(text)
+            confirmed = await self._send_terminal(text)
         except OrcaError as exc:
             log.error("watcher(%s): send failed: %s", self.agent_id, exc)
             self._event(
@@ -851,6 +881,38 @@ class Watcher:
             "turn_sent",
             data={"phase": phase, "chars": len(text)},
         )
+        if not confirmed:
+            # The write landed but Orca's effect confirmation timed
+            # out (agent_prompt_stalled): a fresh TUI (or one still on
+            # its startup turn) accepted the prompt without a fresh
+            # idle->working edge within Orca's short window, so Orca
+            # could not confirm delivery even though the write
+            # succeeded. Not a send failure — the receipt window below
+            # is authoritative and fails closed as no_receipt if the
+            # prompt truly never arrived. This is a known Orca-side
+            # race, not hidden: the caller is always told, and the
+            # turn still completes normally when the prompt landed.
+            log.warning(
+                "watcher(%s): prompt written but effect unconfirmed "
+                "(agent_prompt_stalled); receipt window authoritative",
+                self.agent_id,
+            )
+            self._event(
+                "prompt_delivery_unconfirmed",
+                level="WARNING",
+                message=(
+                    "Orca could not confirm the prompt took effect "
+                    "(agent_prompt_stalled); the receipt window below "
+                    "is authoritative"
+                ),
+                data={"phase": phase},
+            )
+            await self._notify(
+                f"# [osw] prompt-delivery-unconfirmed agent={self.agent_id}"
+                f" terminal={self.handle}"
+                " (Orca send-confirm timed out; prompt was written,"
+                " turn continues under receipt supervision)"
+            )
         # Belt-and-suspenders against a swallowed prompt (modal dialog,
         # login screen): the text must be visible in the terminal's
         # scrollback afterwards. A miss only alarms — it never resends:

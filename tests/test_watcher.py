@@ -2209,3 +2209,124 @@ async def test_blocking_dialog_is_never_ready(tmp_path):
         encoding="utf-8"
     )
     assert '"event": "blocking_dialog_detected"' in events
+
+
+@pytest.mark.anyio
+async def test_send_stalled_proceeds_to_turn_supervision(tmp_path):
+    """`agent_prompt_stalled` means the write landed but Orca saw no
+    fresh idle->working edge within its short window (the prompt
+    arrived at a TUI that was not ready for it yet). Not a send
+    failure: the turn proceeds to the receipt window, which is
+    authoritative — but the caller is always told, never silently
+    swallowed."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "caller_terminal": "term-caller",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "pane-key"  # ps tracks this pane
+
+    read = AsyncMock(return_value={
+        "result": {"terminal": {"tail": ["✻ Grooving… (0m 5s)", "", "", ""]}}
+    })
+    stalled = OrcaError("agent prompt stalled", 1, code="agent_prompt_stalled")
+    send = AsyncMock(side_effect=stalled)
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
+        return "ps_done"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn("do the task", phase="task")
+
+    assert result == "ps_done"
+    sent = [call.args[1] for call in send.await_args_list]
+    assert sent[0] == "do the task"  # prompt sent once, never resent
+    assert sent.count("do the task") == 1
+    assert any("prompt-delivery-unconfirmed" in line for line in sent[1:])
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert events.count('"event": "prompt_delivery_unconfirmed"') == 1
+    assert '"level": "WARNING"' in events
+    assert '"event": "turn_send_failed"' not in events
+
+
+@pytest.mark.anyio
+async def test_send_stalled_on_untracked_pane_notifies(tmp_path):
+    """The same stalled write on a pane ps does not track has no
+    receipt window to fall back on, so the caller is alerted (mirrors
+    the echo-miss policy), but the turn still proceeds."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "caller_terminal": "term-caller",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    read = AsyncMock(return_value={
+        "result": {"terminal": {"tail": ["✻ Grooving… (0m 5s)", "", "", ""]}}
+    })
+    stalled = OrcaError("agent prompt stalled", 1, code="agent_prompt_stalled")
+    send = AsyncMock(side_effect=stalled)
+
+    async def finish_turn(self, sent_at_ms, baseline_state_started=0, sent_text="", **_):
+        return "fallback_idle"
+
+    with patch("osw.watcher.terminal_read", read), \
+         patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.PROMPT_ECHO_DELAY_SECS", 0), \
+         patch.object(Watcher, "_wait_turn_done", finish_turn):
+        result = await watcher._run_turn("do the task", phase="task")
+
+    assert result == "fallback_idle"
+    sent = [call.args[1] for call in send.await_args_list]
+    assert sent[0] == "do the task"  # prompt exactly once
+    assert any("prompt-delivery-unconfirmed" in line for line in sent[1:])
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert events.count('"event": "prompt_delivery_unconfirmed"') == 1
+    assert '"event": "turn_send_failed"' not in events
+
+
+@pytest.mark.anyio
+async def test_send_real_failure_still_fails_closed(tmp_path):
+    """Genuine write failures (e.g. the terminal rejected the write)
+    keep failing the turn closed as send_failed — only
+    `agent_prompt_stalled` is delivery-unconfirmed."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "caller_terminal": "term-caller",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    not_writable = OrcaError(
+        "terminal not writable", 1, code="terminal_not_writable"
+    )
+    send = AsyncMock(side_effect=not_writable)
+
+    with patch("osw.watcher.terminal_send", send):
+        result = await watcher._run_turn("do the task", phase="task")
+
+    assert result == "send_failed"
+    send.assert_awaited_once()
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert events.count('"event": "turn_send_failed"') == 1
+    assert '"level": "ERROR"' in events
+    assert '"event": "prompt_delivery_unconfirmed"' not in events
