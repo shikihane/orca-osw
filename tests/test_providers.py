@@ -17,6 +17,7 @@ from osw.providers import (
     ensure_workspace_trust,
     kimi_variants,
     parse_claude_aliases,
+    parse_grok_models,
     parse_omp_models,
     parse_pi_models,
     probe_variants,
@@ -37,6 +38,19 @@ CLAUDE_HELP = """\
                                         'fable', 'opus', or 'sonnet') or a
                                         model's full name (e.g.
                                         'claude-fable-5').
+"""
+
+GROK_MODELS = """\
+You are not authenticated.
+
+Default model: grok-4.5
+
+Available models:
+  * grok-4.5 (default)
+  - claude-*
+  - grok-build-0.1
+  - grok-4.20-multi-agent-0309
+  - grok-4.3
 """
 
 OMP_MODELS_JSON = json.dumps({
@@ -241,6 +255,52 @@ def test_build_provider_command_kimi_rejects_thinking():
         build_provider_command("kimi", thinking="max")
 
 
+def test_grok_is_scanned_as_an_agent_cli():
+    assert "grok" in KNOWN_AGENT_CLIS
+
+
+def test_parse_grok_models():
+    variants = parse_grok_models(GROK_MODELS)
+    assert variants == [
+        {"name": "grok-grok-4.5", "command": "grok --model grok-4.5"},
+        {"name": "grok-grok-build-0.1", "command": "grok --model grok-build-0.1"},
+        {"name": "grok-grok-4.20-multi-agent-0309",
+         "command": "grok --model grok-4.20-multi-agent-0309"},
+        {"name": "grok-grok-4.3", "command": "grok --model grok-4.3"},
+    ]
+    # gateway wildcard patterns are not selectable models
+    assert all("*" not in v["command"] for v in variants)
+
+
+def test_parse_grok_models_tolerates_garbage():
+    assert parse_grok_models("") == []
+    assert parse_grok_models("unexpected error text") == []
+    # rows before the header never count
+    assert parse_grok_models("* grok-4.5 (default)") == []
+
+
+def test_probe_variants_for_grok_uses_models_command():
+    with patch("osw.providers._run_capture", return_value=GROK_MODELS) as run:
+        variants = probe_variants("grok", path=r"C:\bin\grok.exe")
+
+    run.assert_called_once_with([r"C:\bin\grok.exe", "models"])
+    assert {"name": "grok-grok-4.5",
+            "command": "grok --model grok-4.5"} in variants
+
+
+def test_build_provider_command_for_grok():
+    command = build_provider_command(
+        "grok",
+        model="grok-4.3",
+        thinking="high",
+    )
+
+    assert command == (
+        "grok --always-approve --trust --model grok-4.3 "
+        "--reasoning-effort high"
+    )
+
+
 def test_build_provider_command_for_pi():
     command = build_provider_command(
         "pi",
@@ -259,6 +319,7 @@ def test_build_provider_command_omits_optional_flags():
     assert build_provider_command("pi") == "pi --approve"
     assert build_provider_command("kimi") == "kimi --yolo"
     assert build_provider_command("omp") == "omp --auto-approve"
+    assert build_provider_command("grok") == "grok --always-approve --trust"
 
 
 def test_build_provider_command_rejects_unknown_provider():

@@ -470,13 +470,14 @@ def init(
         typer.echo("  python osw.py models pi")
         typer.echo("  python osw.py models omp")
         typer.echo("  python osw.py models kimi")
+        typer.echo("  python osw.py models grok")
 
 
 @app.command("models")
 def models(
     provider: str = typer.Argument(
         ...,
-        help="Provider to query: claude, codex, pi, omp, or kimi",
+        help="Provider to query: claude, codex, pi, omp, kimi, or grok",
     ),
     json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
 ) -> None:

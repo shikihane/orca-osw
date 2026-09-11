@@ -34,7 +34,7 @@ cleanup, read [references/operations.md](references/operations.md).
 Inspect real model choices when the human needs options:
 
 ```text
-python <skill-dir>/osw.py models <claude|codex|pi|omp|kimi>
+python <skill-dir>/osw.py models <claude|codex|pi|omp|kimi|grok>
 ```
 
 Create a fresh worker:

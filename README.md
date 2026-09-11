@@ -55,13 +55,13 @@ python skill/osw.py status
 
 ### Options
 
-- `new` accepts `claude`, `codex`, `pi`, `omp`, or `kimi` as the provider.
+- `new` accepts `claude`, `codex`, `pi`, `omp`, `kimi`, or `grok` as the provider.
 - `--prefix` gives semantic agent ids such as `research_001`, `code_001`, `test_001`, `debug_001`, `review_001`, or `misc_001`; omit it for `agent_NNN`.
 - `use <agent-id>` reuses that exact agent id and terminal context; `--prefix` is only for `new` or `use <terminal-handle>`.
 - `--model` is passed through unchanged.
-- `--thinking` is translated per provider: `claude --effort`, `codex -c model_reasoning_effort=...`, and `pi`/`omp --thinking`; `kimi` rejects it because effort lives in its model configuration.
+- `--thinking` is translated per provider: `claude --effort`, `codex -c model_reasoning_effort=...`, `pi`/`omp --thinking`, and `grok --reasoning-effort`; `kimi` rejects it because effort lives in its model configuration.
 - `models omp` reads `omp models --json`; pass one of its `provider/model` selectors to `new omp --model`.
-- OSW adds the provider's non-blocking autonomy flag by default: `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`, `pi --approve`, `omp --auto-approve`, or `kimi --yolo`.
+- OSW adds the provider's non-blocking autonomy flag by default: `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`, `pi --approve`, `omp --auto-approve`, `kimi --yolo`, or `grok --always-approve --trust`.
 - `new` and `use` accept `--caller-terminal <handle>` to receive completion reports on a parent terminal.
 - `del --close` also asks Orca to close the terminal.
 - `list --json` outputs raw JSON.

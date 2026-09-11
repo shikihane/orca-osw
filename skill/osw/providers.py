@@ -20,6 +20,7 @@ KNOWN_AGENT_CLIS = [
     "pi",
     "omp",
     "kimi",
+    "grok",
     "gemini",
     "aider",
     "goose",
@@ -36,13 +37,17 @@ def _quote_command_arg(value: str) -> str:
     return subprocess.list2cmdline([value])
 
 
-SUPPORTED_PROVIDERS = ("claude", "codex", "pi", "omp", "kimi")
+SUPPORTED_PROVIDERS = ("claude", "codex", "pi", "omp", "kimi", "grok")
 PROVIDER_AUTONOMY_FLAGS = {
     "claude": ("--dangerously-skip-permissions",),
     "codex": ("--dangerously-bypass-approvals-and-sandbox",),
     "pi": ("--approve",),
     "omp": ("--auto-approve",),
     "kimi": ("--yolo",),
+    # grok's --trust is also its workspace-trust mechanism: launching with
+    # it records the folder grant (~/.grok/trusted_folders.toml), so grok
+    # needs no ensure_workspace_trust pre-record.
+    "grok": ("--always-approve", "--trust"),
 }
 
 
@@ -85,6 +90,11 @@ def build_provider_command(
             )
         if model:
             args += ["--model", model]
+    elif provider == "grok":
+        if model:
+            args += ["--model", model]
+        if thinking:
+            args += ["--reasoning-effort", thinking]
     else:
         if model:
             args += ["--model", model]
@@ -218,6 +228,8 @@ def probe_variants(name: str, path: str | None = None) -> list[dict]:
         ) or bare
     if name == "kimi":
         return kimi_variants(_read_kimi_config()) or bare
+    if name == "grok":
+        return parse_grok_models(_run_capture([exe, "models"])) or bare
     return bare
 
 
@@ -343,6 +355,35 @@ def parse_pi_models(output: str) -> list[dict]:
         variants.append({
             "name": f"pi-{model}",
             "command": f"pi --model {provider}/{model}",
+        })
+    return variants
+
+
+def parse_grok_models(output: str) -> list[dict]:
+    """Parse the `grok models` listing into variant entries.
+
+    Rows only count after the "Available models:" header — the banner
+    ("You are not authenticated.") and the "Default model:" line are
+    ignored. A row is `* <id> [(default)]` or `- <id>`.
+    """
+    variants: list[dict] = []
+    in_table = False
+    for line in output.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if not in_table:
+            if parts[:2] == ["Available", "models:"]:
+                in_table = True
+            continue
+        if parts[0] not in ("*", "-") or len(parts) < 2:
+            continue
+        model = parts[1]
+        if "*" in model:
+            continue  # gateway wildcard pattern, not a selectable model
+        variants.append({
+            "name": f"grok-{model}",
+            "command": f"grok --model {_quote_command_arg(model)}",
         })
     return variants
 
