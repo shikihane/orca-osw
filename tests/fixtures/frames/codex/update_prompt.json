@@ -1,0 +1,15 @@
+{
+ "source": "screen",
+ "tail": [
+  "✨ Update available! 0.153.4 -> 0.162.1",
+  "1. Update now",
+  "2. Skip"
+ ],
+ "provider": "codex",
+ "captured_at": "2026-10-11",
+ "label": "update_prompt",
+ "capture_path": "transcribed",
+ "transcribed_from": "docs/research/2026-10-11-v2-v3-v5-session-mapping.md",
+ "default_option": "1. Update now",
+ "note": "Text transcription of the dialog strings recorded in the research notes, not a raw captured frame; layout, glyphs and any other lines of the real screen are not reproduced."
+}

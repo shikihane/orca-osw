@@ -76,3 +76,24 @@ def test_format_event_line_is_single_line_and_includes_context():
     assert "term-a" in line
     assert "turn_sent" in line
     assert "hello world" in line
+
+
+def test_console_logging_goes_to_stderr(monkeypatch, capsys):
+    """stdout carries machine-readable output (`list --json`, `enroll`,
+    `guard`); console logging must never land there."""
+    from osw import log as log_mod
+
+    root = logging.getLogger()
+    before = list(root.handlers)
+    level = root.level
+    monkeypatch.setattr(log_mod, "_configured", False)
+    try:
+        log_mod.setup_logging()
+        logging.getLogger("osw.test").warning("console-probe")
+        out, err = capsys.readouterr()
+    finally:
+        root.handlers[:] = before
+        root.setLevel(level)
+
+    assert "console-probe" not in out
+    assert "console-probe" in err

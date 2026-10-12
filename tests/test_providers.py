@@ -21,6 +21,9 @@ from osw.providers import (
     parse_omp_models,
     parse_pi_models,
     probe_variants,
+    resume_args,
+    resume_command,
+    shell_command_line,
 )
 
 # Real output shapes captured from the actual CLIs
@@ -379,3 +382,112 @@ def test_trust_kimi_writes_hash_file(tmp_path, monkeypatch):
 
 def test_trust_unknown_provider_is_noop(tmp_path):
     assert ensure_workspace_trust("pi", tmp_path) == ""
+
+
+# ---------------------------------------------------------------------------
+# resume_command (plan 1.7): resume flag + the launch autonomy/model flags
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("provider,session,expected", [
+    ("claude", "76348f77-8386-4307-931d-ad15d77926b3",
+     "claude --dangerously-skip-permissions --resume 76348f77-8386-4307-931d-ad15d77926b3"),
+    ("codex", "01a129ad-d704-78c3-9e2f-c24dbdcc519d",
+     "codex resume 01a129ad-d704-78c3-9e2f-c24dbdcc519d --dangerously-bypass-approvals-and-sandbox"),
+    ("pi", "01a129a9-be63-7cc2-b873-7693deb785d5",
+     "pi --approve --session 01a129a9-be63-7cc2-b873-7693deb785d5"),
+    ("kimi", "session_467482d2-7221-42b3-ac98-67ab7582550e",
+     "kimi --yolo --session session_467482d2-7221-42b3-ac98-67ab7582550e"),
+    ("grok", "01a129ad-f296-70f3-8604-69cebcaa63e7",
+     "grok --always-approve --trust --resume 01a129ad-f296-70f3-8604-69cebcaa63e7"),
+    ("omp", "01a129dd-0b79-7613-82a5-6054d7e8034e",
+     "omp --auto-approve --resume 01a129dd-0b79-7613-82a5-6054d7e8034e"),
+])
+def test_resume_command_per_provider(provider, session, expected):
+    assert resume_command(provider, session) == expected
+
+
+def test_resume_command_keeps_model_and_thinking_flags():
+    assert resume_command("claude", "sid", "opus", "high") == (
+        "claude --dangerously-skip-permissions --model opus --effort high --resume sid"
+    )
+    assert resume_command("codex", "sid", "gpt-5", "high") == (
+        "codex resume sid --dangerously-bypass-approvals-and-sandbox "
+        "-c model_reasoning_effort=high -m gpt-5"
+    )
+    assert resume_command("pi", "sid", "openai/gpt-5", "low") == (
+        "pi --approve --model openai/gpt-5 --thinking low --session sid"
+    )
+    assert resume_command("kimi", "session_x", "kimi-code/k3") == (
+        "kimi --yolo --model kimi-code/k3 --session session_x"
+    )
+    assert resume_command("grok", "sid", "grok-4", "high") == (
+        "grok --always-approve --trust --model grok-4 --reasoning-effort high --resume sid"
+    )
+
+
+def test_resume_command_matches_launch_command_flags():
+    launch = build_provider_command("claude", "sonnet", "medium")
+    assert resume_command("claude", "sid", "sonnet", "medium") == f"{launch} --resume sid"
+
+
+def test_resume_command_adds_kimi_session_prefix():
+    assert resume_command("kimi", "467482d2-7221") == "kimi --yolo --session session_467482d2-7221"
+
+
+def test_resume_command_rejects_empty_session():
+    with pytest.raises(ProviderError):
+        resume_command("claude", "  ")
+
+
+def test_resume_command_rejects_unsupported_provider():
+    with pytest.raises(ProviderError):
+        resume_command("aider", "sid")
+
+
+def test_resume_command_rejects_kimi_thinking():
+    with pytest.raises(ProviderError):
+        resume_command("kimi", "session_x", thinking="high")
+
+
+# ---------------------------------------------------------------------------
+# shell_command_line (plan 2.1): resume command typed into a live shell
+# ---------------------------------------------------------------------------
+
+def test_resume_args_are_the_resume_command_tokens():
+    assert resume_args("claude", "sid", "opus") == [
+        "claude", "--dangerously-skip-permissions", "--model", "opus", "--resume", "sid",
+    ]
+    assert resume_args("codex", "sid")[:3] == ["codex", "resume", "sid"]
+
+
+@pytest.mark.parametrize("shell,expected", [
+    ("powershell", "claude --model 'claude-opus-5-5[1m]' --resume 'a b'"),
+    ("cmd", 'claude --model "claude-opus-5-5[1m]" --resume "a b"'),
+    ("posix", "claude --model 'claude-opus-5-5[1m]' --resume 'a b'"),
+])
+def test_shell_command_line_quotes_per_shell(shell, expected):
+    args = ["claude", "--model", "claude-opus-5-5[1m]", "--resume", "a b"]
+    assert shell_command_line(args, shell) == expected
+
+
+def test_shell_command_line_plain_tokens_stay_bare():
+    args = ["codex", "resume", "01a1-ff", "-c", "model_reasoning_effort=high"]
+    for shell in ("powershell", "cmd", "posix"):
+        assert shell_command_line(args, shell) == " ".join(args)
+
+
+def test_shell_command_line_powershell_escapes_quotes_and_calls_quoted_binary():
+    assert shell_command_line(["my tool", "it's"], "powershell") == "& 'my tool' 'it''s'"
+
+
+@pytest.mark.parametrize("bad", ['say "hi"', "100%", "two\nlines"])
+def test_shell_command_line_cmd_rejects_unescapable_args(bad):
+    with pytest.raises(ProviderError):
+        shell_command_line(["claude", bad], "cmd")
+
+
+def test_shell_command_line_rejects_newlines_and_unknown_shells():
+    with pytest.raises(ProviderError):
+        shell_command_line(["claude", "a\nb"], "posix")
+    with pytest.raises(ProviderError):
+        shell_command_line(["claude"], "fish")

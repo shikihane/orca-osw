@@ -4,6 +4,20 @@
 
 This repository contains OSW, a Python CLI for managing Orca-backed agent sessions.
 Source code lives under `skill/osw/`, with `skill/osw.py` as the entry point.
+The deterministic readiness gate and the optional Jev (TypeSafe) integration
+live in `skill/osw/ready_gate.py` and `skill/osw/jev.py`; the offline
+evaluation harness is `tools/jev_eval.py`. `skill/osw/sessions.py` reads
+provider session ids from Orca's agent-hook cache
+(`%APPDATA%/orca/agent-hooks/last-status.json`, a non-public format checked
+by `version`). `skill/osw/blockers.py` holds the blocking-screen policy
+(detection, classification, the per-mode decision, the `(provider, kind)`
+key whitelist — only codex's update prompt — never-automated kinds, and
+the machine-wide update lock); every whitelist entry needs a screen sample
+under `tests/fixtures/frames/`. In `shadow` mode a whitelisted blocker is
+recorded (`blocker_shadow_action`) and notified, never acted on. A task or
+followed turn that ps tracked without ever showing a tool call finishes
+`done` with `tools_observed: false` and `warning=no_tool_activity`; it is
+never resent.
 The Codex skill guide is `skill/SKILL.md`. Tests live in `tests/`, with
 `conftest.py` adding the local package path. User-facing docs are in
 `README.md`, `README_zh.md`, `QUICK.md`, and `QUICK_zh.md`. Runtime state such
@@ -19,6 +33,16 @@ should not be treated as source.
 - `python skill/osw.py --help` checks the top-level CLI.
 - `python skill/osw.py new --help` and `python skill/osw.py use --help` verify
   provider and adoption options.
+- `python skill/osw.py enroll|guard|revive|stop --help` cover takeover and
+  recovery: `enroll` records unmanaged agent panes (`enrolled`), `guard`
+  sets the `guardian` and follows a running turn (`follow_turn`), `revive`
+  resumes a provider session — in the original pane when it is a confirmed
+  empty shell, else in a new terminal (`placement: in_place|new_terminal`;
+  `resume_turn` for a `lost` agent) — and `stop` interrupts the current turn
+  (`completion_source: interrupted`). Supervised workers' questions reach
+  the guardian as `# [osw] ask ...` (ids in `notified_asks`); on Windows
+  answer with `resources\bin\orca.exe orchestration reply`, since
+  `orca.cmd` refuses it.
 
 ## Coding Style & Naming Conventions
 
@@ -27,7 +51,12 @@ small functions with clear names. Keep CLI behavior in `skill/osw/cli.py`,
 provider command construction in `skill/osw/providers.py`, persistent state
 helpers in `skill/osw/state.py`, and watcher logic in `skill/osw/watcher.py`.
 Agent ids use `<prefix>_NNN`, for example `agent_001`, `research_001`, or
-`debug_001`.
+`debug_001`. While a watcher runs it is the only writer of its agent
+record; the CLI signals it through side files such as the stop request
+`.orca/osw/agents/<id>.stop`. OSW itself may inject only
+`watcher.HANDOFF_TEMPLATE`, `watcher.RESUME_TEMPLATE`, the keys of
+`blockers.WHITELIST` entries, and the resume command `revive` types into a
+confirmed empty shell.
 
 ## Testing Guidelines
 
@@ -54,7 +83,8 @@ directory?" prompt; grok instead launches with `--always-approve --trust`,
 where `--trust` grants folder trust for the workspace. Use them only in
 trusted, externally controlled
 workspaces. Do not commit generated `.orca/` runtime state, local logs, reports,
-or handoff files.
+or handoff files. Never launch a nested agent process inside a managed pane
+without clearing the inherited `ORCA_*` environment variables.
 
 ## Skill Installation Requirements
 

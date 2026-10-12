@@ -375,3 +375,314 @@ async def test_detect_current_terminal():
     result, _ = await _run(lambda: orca_cli.detect_current_terminal("missing"),
                            stdout=json.dumps(payload).encode())
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Supervised orchestration wrappers
+
+
+@pytest.mark.anyio
+async def test_orchestration_run_current_accepts_null_run():
+    result, cmd = await _run(
+        lambda: orca_cli.orchestration_run_current(),
+        stdout=b'{"result":{"run":null}}',
+    )
+    assert result["run"] is None
+    assert cmd[1:] == ["orchestration", "run-current", "--json"]
+
+
+@pytest.mark.anyio
+async def test_worker_start_builds_expected_argv():
+    payload = {"result": {
+        "runId": "run_1", "taskId": "task_1", "dispatchId": "ctx_1",
+        "effects": [
+            {"kind": "worktree", "action": "reused", "id": "wt"},
+            {"kind": "terminal", "role": "agent", "action": "created",
+             "id": "term-1"},
+        ],
+    }}
+    data, cmd = await _run(
+        lambda: orca_cli.orchestration_worker_start(
+            spec="do it", agent="omp", worktree="path:C:/proj",
+            task_title="Do it", model="m", timeout_ms=240000,
+        ),
+        stdout=json.dumps(payload).encode(),
+    )
+    assert cmd[1:] == [
+        "orchestration", "worker-start",
+        "--spec", "do it",
+        "--worktree", "path:C:/proj",
+        "--agent", "omp",
+        "--task-title", "Do it",
+        "--model", "m",
+        "--timeout-ms", "240000",
+        "--json",
+    ]
+    assert orca_cli.worker_start_receipt(data) == {
+        "run_id": "run_1",
+        "task_id": "task_1",
+        "dispatch_id": "ctx_1",
+        "terminal": "term-1",
+    }
+
+
+@pytest.mark.anyio
+async def test_run_orca_surfaces_failed_worker_receipt():
+    """worker-start exits 1 with an ok envelope whose result carries the
+    failed stage; the error must read that, not the raw JSON blob."""
+    receipt = {
+        "id": "req_1",
+        "ok": True,
+        "result": {
+            "runId": "run_1",
+            "taskId": "task_1",
+            "dispatchId": "ctx_dead",
+            "state": "failed",
+            "stage": "agent_readiness",
+            "failedStage": "agent_readiness",
+            "lastError": "timeout",
+            "residualResources": [{
+                "kind": "terminal", "role": "agent",
+                "action": "created", "id": "term-orphan",
+            }],
+        },
+    }
+    mock_run = AsyncMock(return_value=_completed(
+        returncode=1, stdout=json.dumps(receipt).encode(),
+    ))
+
+    with patch("osw.orca_cli.anyio.run_process", mock_run):
+        with pytest.raises(OrcaError) as exc_info:
+            await orca_cli.orchestration_worker_start(
+                spec="s", agent="omp", worktree="path:C:/p",
+            )
+
+    error = exc_info.value
+    assert error.message == (
+        "orca command failed at agent_readiness: timeout (dispatch ctx_dead)"
+    )
+    assert error.payload["result"]["residualResources"][0]["id"] == "term-orphan"
+
+
+@pytest.mark.anyio
+async def test_worker_start_reuses_terminal_when_given():
+    payload = {"result": {
+        "runId": "run_1", "taskId": "task_1", "dispatchId": "ctx_1",
+        "effects": [],
+    }}
+    _, cmd = await _run(
+        lambda: orca_cli.orchestration_worker_start(
+            spec="do it", agent="omp", worktree="path:C:/proj",
+            terminal="term-1",
+        ),
+        stdout=json.dumps(payload).encode(),
+    )
+    assert cmd[1:] == [
+        "orchestration", "worker-start",
+        "--spec", "do it",
+        "--worktree", "path:C:/proj",
+        "--terminal", "term-1",
+        "--json",
+    ]
+
+
+@pytest.mark.anyio
+async def test_orchestration_lifecycle_wrappers_build_expected_argv():
+    for factory, expected in (
+        (lambda: orca_cli.orchestration_run_use("run_1"),
+         ["orchestration", "run-use", "--id", "run_1"]),
+        (lambda: orca_cli.orchestration_worker_show("ctx_1"),
+         ["orchestration", "worker-show", "--dispatch", "ctx_1"]),
+        (lambda: orca_cli.orchestration_worker_retain("ctx_1"),
+         ["orchestration", "worker-retain", "--dispatch", "ctx_1"]),
+        (lambda: orca_cli.orchestration_worker_release("ctx_1"),
+         ["orchestration", "worker-release", "--dispatch", "ctx_1"]),
+        (lambda: orca_cli.orchestration_worker_stop("ctx_1"),
+         ["orchestration", "worker-stop", "--dispatch", "ctx_1"]),
+    ):
+        _, cmd = await _run(factory, stdout=b'{"result":{}}')
+        assert cmd[1:] == [*expected, "--json"]
+
+
+@pytest.mark.anyio
+async def test_orchestration_run_create_validates_run_id():
+    payload = {"result": {"run": {"id": "run_9"}}}
+    result, cmd = await _run(
+        lambda: orca_cli.orchestration_run_create("OSW: repo"),
+        stdout=json.dumps(payload).encode(),
+    )
+    assert result["run"]["id"] == "run_9"
+    assert cmd[1:] == [
+        "orchestration", "run-create", "--objective", "OSW: repo", "--json",
+    ]
+
+    with pytest.raises(OrcaError) as exc_info:
+        await _run(
+            lambda: orca_cli.orchestration_run_create("x"),
+            stdout=b'{"result":{"run":null}}',
+        )
+    assert exc_info.value.code == "orca_contract_mismatch"
+
+    with pytest.raises(OrcaError):
+        await _run(
+            lambda: orca_cli.orchestration_run_current(),
+            stdout=b'{"result":{"run":"nonsense"}}',
+        )
+
+
+def test_worker_start_receipt_requires_lifecycle_ids():
+    with pytest.raises(OrcaError) as exc_info:
+        orca_cli.worker_start_receipt({"result": {"runId": "run_1"}})
+
+    assert exc_info.value.code == "orca_contract_mismatch"
+
+
+def test_worker_settlement_running_worker_with_agent_wait():
+    view = orca_cli.worker_settlement({"result": {
+        "dispatch": {"status": "dispatched"},
+        "worker": {"state": "working", "stage": "running"},
+        "projection": {
+            "stage": {"dispatch": "dispatched", "worker": "working"},
+            "evidence": {"lastObservedAt": 42},
+        },
+        "observation": {"status": "live", "agentWait": "question"},
+    }})
+
+    assert view["settled"] is False
+    assert view["agent_wait"] == "question"
+    assert view["last_observed_at"] == 42
+
+
+def test_worker_settlement_settled_worker_reports_outcome():
+    view = orca_cli.worker_settlement({"result": {
+        "dispatch": {"status": "completed", "assigneeHandle": "term-a"},
+        "worker": {"state": "succeeded", "stage": "settled",
+                   "agentTerminalHandle": "term-1"},
+        "projection": {
+            "stage": {"dispatch": "completed", "worker": "succeeded"},
+            "outcome": "succeeded",
+            "liveness": {"verdict": "live"},
+        },
+        "observation": {"status": "live", "agentWait": None},
+    }})
+
+    assert view["settled"] is True
+    assert view["outcome"] == "succeeded"
+    assert view["terminal"] == "term-1"
+    assert view["liveness"] == "live"
+
+
+def test_worker_settlement_requires_projection():
+    with pytest.raises(OrcaError) as exc_info:
+        orca_cli.worker_settlement({"result": {"dispatch": {}}})
+
+    assert exc_info.value.code == "orca_contract_mismatch"
+
+
+@pytest.mark.anyio
+async def test_terminal_interrupt_sends_ctrl_c():
+    _, cmd = await _run(lambda: orca_cli.terminal_interrupt("t1"))
+    assert cmd == [
+        "orca", "terminal", "send", "--terminal", "t1", "--interrupt", "--json",
+    ]
+
+
+@pytest.mark.anyio
+async def test_terminal_send_dialog_enter_uses_the_interrupt_path():
+    """The only send the research saw get through codex's update dialog."""
+    _, cmd = await _run(lambda: orca_cli.terminal_send_dialog_enter("t1"))
+    assert cmd == [
+        "orca", "terminal", "send", "--terminal", "t1",
+        "--text", "", "--enter", "--interrupt", "--json",
+    ]
+
+
+@pytest.mark.anyio
+async def test_terminal_send_escape_writes_bare_esc_without_enter():
+    _, cmd = await _run(lambda: orca_cli.terminal_send_escape("t1"))
+    assert cmd == [
+        "orca", "terminal", "send", "--terminal", "t1", "--text", "\x1b", "--json",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# orchestration inbox + worker asks (plan 2.3)
+# ---------------------------------------------------------------------------
+
+def _msg(msg_id, msg_type, from_handle, seq, **extra) -> dict:
+    """One inbox row in the shape `orchestration inbox --json` returns."""
+    row = {
+        "id": msg_id, "run_id": "run_1", "from_handle": from_handle,
+        "to_handle": "run:run_1", "subject": "Question", "body": "", "type": msg_type,
+        "priority": "normal", "thread_id": None, "payload": "", "read": 0,
+        "sequence": seq, "created_at": "2026-10-11T07:31:20Z",
+        "sender_pane_key": None,
+    }
+    row.update(extra)
+    return row
+
+
+@pytest.mark.anyio
+async def test_orchestration_inbox_unwraps_messages():
+    payload = {"ok": True, "result": {"messages": [_msg("msg_1", "question", "dispatch:ctx_1", 1)],
+                                      "count": 1}}
+    messages, cmd = await _run(
+        lambda: orca_cli.orchestration_inbox(), stdout=json.dumps(payload).encode(),
+    )
+    assert cmd == ["orca", "orchestration", "inbox", "--json"]
+    assert [m["id"] for m in messages] == ["msg_1"]
+
+
+@pytest.mark.anyio
+async def test_orchestration_inbox_passes_terminal_and_limit():
+    payload = {"result": {"messages": [], "count": 0}}
+    messages, cmd = await _run(
+        lambda: orca_cli.orchestration_inbox(terminal="term-1", limit=50),
+        stdout=json.dumps(payload).encode(),
+    )
+    assert cmd == [
+        "orca", "orchestration", "inbox", "--limit", "50", "--terminal", "term-1", "--json",
+    ]
+    assert messages == []
+
+
+@pytest.mark.anyio
+async def test_orchestration_inbox_requires_message_list():
+    with pytest.raises(OrcaError):
+        await _run(lambda: orca_cli.orchestration_inbox(),
+                   stdout=json.dumps({"result": {"messages": "nope"}}).encode())
+
+
+def test_worker_asks_matches_the_workers_unanswered_questions_and_escalations():
+    payload = json.dumps({"taskId": "task_1", "dispatchId": "ctx_1"})
+    other = json.dumps({"taskId": "task_9", "dispatchId": "ctx_9"})
+    messages = [
+        # newest first, as Orca returns them
+        _msg("msg_r", "status", "term-coord", 9, thread_id="msg_answered"),  # the reply
+        _msg("msg_answered", "question", "dispatch:ctx_1", 8, thread_id="msg_answered"),
+        _msg("msg_other", "question", "dispatch:ctx_9", 7, thread_id="msg_other", payload=other),
+        _msg("msg_done", "worker_done", "term-w", 6, payload=payload),
+        _msg("msg_pane", "escalation", "term-w-old", 5, sender_pane_key="tab:w"),
+        _msg("msg_esc", "escalation", "term-w", 4, payload=payload),
+        _msg("msg_q", "question", "dispatch:ctx_1", 3, thread_id="msg_q",
+             body="Which branch\nshould I use?"),
+        _msg("msg_payload", "question", "dispatch:legacy", 2, payload=payload),
+    ]
+
+    asks = orca_cli.worker_asks(
+        messages, dispatch_id="ctx_1", terminal="term-w", pane_key="tab:w",
+    )
+
+    # Oldest first; replied, foreign and non-question rows dropped.
+    assert [a["id"] for a in asks] == ["msg_payload", "msg_q", "msg_esc", "msg_pane"]
+    assert asks[1]["type"] == "question"
+    assert asks[1]["body"] == "Which branch\nshould I use?"
+
+
+def test_worker_asks_tolerates_odd_rows():
+    messages = [
+        "not a row",
+        {"type": "question"},                       # no id
+        _msg("msg_1", "question", "", 1, payload="{bad json"),
+    ]
+    assert orca_cli.worker_asks(messages, dispatch_id="ctx_1", terminal="term-w") == []

@@ -6,6 +6,7 @@ import random
 import re
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -37,6 +38,10 @@ def state_dir(root: Path) -> Path:
 def state_file(root: Path) -> Path:
     """Return the path to OSW's project state file."""
     return state_dir(root) / "state.json"
+
+
+# The Jev mode is the machine-wide `OSW_JEV_MODE` environment variable
+# (operator decision 2026-10-11): OSW keeps no per-project Jev config.
 
 
 def agents_dir(root: Path) -> Path:
@@ -205,6 +210,78 @@ def list_agents(root: Path) -> dict[str, dict]:
         if data.get("agent_id"):
             agents[data["agent_id"]] = data
     return agents
+
+
+def find_agent_by_pane(root: Path, pane_key: str) -> dict | None:
+    """Return the agent record bound to a pane (`tabId:leafId`), or None.
+
+    The pane key outlives runtime-scoped terminal handles, so it is the
+    identity that tells whether a terminal is already managed.
+    """
+    if not pane_key:
+        return None
+    for agent in list_agents(root).values():
+        if (agent.get("pane_key") or agent.get("paneKey")) == pane_key:
+            return agent
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Stop requests: a sidecar next to the agent record. While a watcher runs
+# it is the record's only writer, so `osw stop` drops the request time
+# here instead; the watcher polls it and deletes it when it finalizes.
+# ---------------------------------------------------------------------------
+
+def stop_request_path(root: Path, agent_id: str) -> Path:
+    return agents_dir(root) / f"{agent_id}.stop"
+
+
+def write_stop_request(
+    root: Path, agent_id: str, requested_at: str | None = None,
+) -> str:
+    """Atomically write a stop request; returns the recorded ISO time."""
+    if requested_at is None:
+        requested_at = datetime.now(timezone.utc).isoformat()
+    path = stop_request_path(root, agent_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = Path(f.name)
+            f.write(requested_at)
+        _replace_with_retry(tmp_path, path)
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+    return requested_at
+
+
+def read_stop_request(root: Path, agent_id: str) -> str:
+    """The pending stop request's ISO time, or "" when there is none."""
+    try:
+        return stop_request_path(root, agent_id).read_text(
+            encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def clear_stop_request(root: Path, agent_id: str) -> bool:
+    """Remove a stop request. Returns True if a file was deleted."""
+    try:
+        stop_request_path(root, agent_id).unlink()
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def write_report(root: Path, agent_id: str, payload: dict) -> Path:

@@ -1,0 +1,44 @@
+{
+  "version": 2,
+  "entries": {
+    "ac6f5ce8-3804-43d7-ace9-6145309a175b:4e6b7212-276d-47a9-9d00-7511381d034d": {
+      "paneKey": "ac6f5ce8-3804-43d7-ace9-6145309a175b:4e6b7212-276d-47a9-9d00-7511381d034d",
+      "source": "omp",
+      "agentPresence": {"agent": "omp"},
+      "hookEventName": "agent_end",
+      "providerSession": {
+        "key": "session_id",
+        "id": "01a129dd-0b79-7613-82a5-6054d7e8034e",
+        "transcriptPath": "C:\\Users\\Administrator\\.omp\\agent\\sessions\\--D--bit_master-research-orca_cli-orca-osw--\\2026-10-11T07-28-34-681Z_01a129dd-0b79-7613-82a5-6054d7e8034e.jsonl"
+      },
+      "payload": {
+        "state": "done",
+        "prompt": "reply with exactly: V12B-P1 ok",
+        "agentType": "omp",
+        "model": "deepseek/deepseek-flash",
+        "modelSwitchCommand": "orca-model"
+      },
+      "receivedAt": 1791703726313,
+      "turnStartedAt": 1791703726310,
+      "launchTokenHash": "c63c4c30"
+    },
+    "9f1d2c3b-0000-4000-8000-000000000001:5e6f7a8b-0000-4000-8000-000000000002": {
+      "paneKey": "9f1d2c3b-0000-4000-8000-000000000001:5e6f7a8b-0000-4000-8000-000000000002",
+      "source": "kimi",
+      "hookEventName": "Stop",
+      "providerSession": {
+        "key": "session_id",
+        "id": "3b0c7f52-6a1e-4d8e-9c2a-7f1e2d3c4b5a"
+      },
+      "payload": {"state": "done", "prompt": "summarize README", "agentType": "kimi"},
+      "receivedAt": 1791703800000
+    },
+    "11111111-2222-4333-8444-555555555555:66666666-7777-4888-9999-000000000000": {
+      "paneKey": "11111111-2222-4333-8444-555555555555:66666666-7777-4888-9999-000000000000",
+      "source": "claude",
+      "hookEventName": "UserPromptSubmit",
+      "payload": {"state": "working", "prompt": "fix the bug", "agentType": "claude"},
+      "receivedAt": 1791703900000
+    }
+  }
+}

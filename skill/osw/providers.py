@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -55,6 +56,39 @@ class ProviderError(ValueError):
     pass
 
 
+# Providers OSW launches through Orca's supervised orchestration
+# (`orchestration worker-start`), mapped to their Orca agent id. Orca
+# owns terminal creation, readiness and prompt injection there, which
+# is exactly what gives the pane an agent launch authority; without it
+# Orca drops the pane's hook status posts and OSW has no completion
+# signal left for TUIs that never stop repainting (omp).
+SUPERVISED_PROVIDERS = {"omp": "omp"}
+
+
+def supervised_agent_id(provider: str) -> str | None:
+    """Orca agent id when OSW launches this provider supervised."""
+    return SUPERVISED_PROVIDERS.get(provider.strip())
+
+
+def validate_supervised_args(
+    provider: str,
+    model: str | None,
+    thinking: str | None,
+) -> None:
+    """Reject provider args the supervised launcher cannot express.
+
+    `worker-start` forwards only a model id (`--model`); provider
+    effort flags have no equivalent there, so a `--thinking` value
+    would be silently dropped — refuse it instead (kimi precedent).
+    """
+    if thinking:
+        raise ProviderError(
+            f"provider '{provider}' is launched through Orca's supervised "
+            "orchestration, which cannot pass a thinking/effort flag; "
+            "drop --thinking or pick another provider"
+        )
+
+
 def build_provider_command(
     provider: str,
     model: str | None = None,
@@ -65,7 +99,92 @@ def build_provider_command(
     Never includes the task prompt: the watcher sends the prompt as a
     separate, observable turn once the TUI is ready.
     """
+    args = _provider_args(provider.strip(), model, thinking)
+    return " ".join(_quote_command_arg(arg) for arg in args)
+
+
+def resume_command(
+    provider: str,
+    session_id: str,
+    model: str | None = None,
+    thinking: str | None = None,
+) -> str:
+    """Command that reopens a provider session with the launch flags.
+
+    Same autonomy and model arguments as `build_provider_command`, plus
+    each CLI's resume syntax (codex's is a subcommand, so it follows the
+    binary directly). kimi session ids carry a `session_` prefix.
+    """
+    args = resume_args(provider, session_id, model, thinking)
+    return " ".join(_quote_command_arg(arg) for arg in args)
+
+
+def resume_args(
+    provider: str,
+    session_id: str,
+    model: str | None = None,
+    thinking: str | None = None,
+) -> list[str]:
+    """argv of `resume_command`, for quoting into a particular shell."""
     provider = provider.strip()
+    session_id = (session_id or "").strip()
+    if not session_id:
+        raise ProviderError("a session id is required to resume a session")
+    args = _provider_args(provider, model, thinking)
+    if provider == "codex":
+        args = [args[0], "resume", session_id, *args[1:]]
+    elif provider == "kimi":
+        if not session_id.startswith("session_"):
+            session_id = f"session_{session_id}"
+        args += ["--session", session_id]
+    elif provider == "pi":
+        args += ["--session", session_id]
+    else:
+        args += ["--resume", session_id]
+    return args
+
+
+# Tokens every supported shell passes through unquoted.
+_BARE_ARG_RE = re.compile(r"^[A-Za-z0-9_\-./:=+\\]+$")
+
+
+def shell_command_line(args: list[str], shell: str) -> str:
+    """Quote argv as one line typed into a live `shell` prompt.
+
+    `shell` is `powershell` (pwsh and Windows PowerShell), `cmd` or
+    `posix` (bash, zsh, sh). cmd has no reliable escape for `"` or `%`,
+    so such arguments are refused rather than mangled; so is any newline
+    (the line must stay single-line) and any other shell.
+    """
+    if any("\r" in arg or "\n" in arg for arg in args):
+        raise ProviderError("command arguments must not contain newlines")
+    if shell == "posix":
+        return shlex.join(args)
+    if shell == "powershell":
+        parts = [
+            arg if _BARE_ARG_RE.match(arg) else "'" + arg.replace("'", "''") + "'"
+            for arg in args
+        ]
+        if parts and parts[0] != args[0]:
+            # A quoted string alone is an expression; `&` invokes it.
+            parts[0] = f"& {parts[0]}"
+        return " ".join(parts)
+    if shell == "cmd":
+        for arg in args:
+            if '"' in arg or "%" in arg:
+                raise ProviderError(f"cannot quote {arg!r} safely for cmd")
+        return " ".join(
+            arg if _BARE_ARG_RE.match(arg) else f'"{arg}"' for arg in args
+        )
+    raise ProviderError(f"unsupported shell '{shell}'")
+
+
+def _provider_args(
+    provider: str,
+    model: str | None,
+    thinking: str | None,
+) -> list[str]:
+    """argv for a provider TUI launch: binary, autonomy, model flags."""
     model = (model or "").strip() or None
     thinking = (thinking or "").strip() or None
     if provider not in SUPPORTED_PROVIDERS:
@@ -101,7 +220,7 @@ def build_provider_command(
         if thinking:
             flag = "--effort" if provider == "claude" else "--thinking"
             args += [flag, thinking]
-    return " ".join(_quote_command_arg(arg) for arg in args)
+    return args
 
 
 def ensure_workspace_trust(provider: str, root: Path) -> str:

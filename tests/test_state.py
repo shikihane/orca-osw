@@ -187,3 +187,54 @@ def test_pid_is_running_current_and_dead_process():
     assert state.pid_is_running(os.getpid()) is True
     assert state.pid_is_running(-1) is False
     assert state.pid_is_running(999999) is False
+
+
+def test_find_agent_by_pane_matches_stable_pane_identity(tmp_path):
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {"agent_id": "agent_001", "pane_key": "tab-a:leaf-1"})
+    state.write_agent(tmp_path, {"agent_id": "agent_002", "pane_key": "tab-a:leaf-2"})
+    state.write_agent(tmp_path, {"agent_id": "agent_003", "paneKey": "tab-b:leaf-3"})
+
+    assert state.find_agent_by_pane(tmp_path, "tab-a:leaf-2")["agent_id"] == "agent_002"
+    assert state.find_agent_by_pane(tmp_path, "tab-b:leaf-3")["agent_id"] == "agent_003"
+    assert state.find_agent_by_pane(tmp_path, "tab-x:leaf-9") is None
+    assert state.find_agent_by_pane(tmp_path, "") is None
+
+
+def test_find_agent_by_pane_without_state_dir(tmp_path):
+    assert state.find_agent_by_pane(tmp_path, "tab-a:leaf-1") is None
+
+
+def test_stop_request_sidecar_roundtrip(tmp_path):
+    state.init_state_dir(tmp_path)
+    path = state.stop_request_path(tmp_path, "agent_001")
+    assert path == state.agents_dir(tmp_path) / "agent_001.stop"
+
+    assert state.read_stop_request(tmp_path, "agent_001") == ""
+    written = state.write_stop_request(
+        tmp_path, "agent_001", "2026-10-11T22:00:00+00:00")
+    assert written == "2026-10-11T22:00:00+00:00"
+    assert path.read_text(encoding="utf-8") == "2026-10-11T22:00:00+00:00"
+    assert state.read_stop_request(tmp_path, "agent_001") == written
+
+    assert state.clear_stop_request(tmp_path, "agent_001") is True
+    assert not path.exists()
+    assert state.clear_stop_request(tmp_path, "agent_001") is False
+    assert state.read_stop_request(tmp_path, "agent_001") == ""
+
+
+def test_write_stop_request_defaults_to_now_iso(tmp_path):
+    from datetime import datetime
+
+    written = state.write_stop_request(tmp_path, "agent_001")
+    assert datetime.fromisoformat(written).tzinfo is not None
+    assert state.read_stop_request(tmp_path, "agent_001") == written
+
+
+def test_stop_request_sidecar_is_not_an_agent_record(tmp_path):
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {"agent_id": "agent_001", "state": "working"})
+    state.write_stop_request(tmp_path, "agent_001")
+
+    assert list(state.list_agents(tmp_path)) == ["agent_001"]
+    assert state.alloc_agent_id(tmp_path, prefix="agent") == "agent_002"

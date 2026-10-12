@@ -61,10 +61,16 @@ is reserved for panes that demonstrably worked on this turn before
 falling out of tracking — a pane Orca never tracked (e.g. one spawned
 so recently that ps has no entry yet) must wait out the slow
 stable-silence window instead.
+
+A record carrying `follow_turn: true` takes over the turn already
+running in the pane instead: no ready wait, no prompt, no handoff —
+just the task-phase completion detection, then the report and the
+caller notification.
 """
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import time
@@ -76,18 +82,50 @@ import anyio
 from osw.log import emit_event, enable_file_logging, get_logger, setup_logging
 from osw.orca_cli import (
     OrcaError,
+    orchestration_inbox,
+    orchestration_worker_retain,
+    orchestration_worker_show,
+    terminal_interrupt,
     terminal_list,
     terminal_read,
     terminal_send,
+    terminal_send_dialog_enter,
+    terminal_send_escape,
     terminal_show,
     terminal_wait,
+    worker_asks,
+    worker_settlement,
     worktree_ps,
 )
+from osw.ready_gate import (
+    COMPOSER_WAIT_MS,
+    GATE_POLL_SECS,
+    GATE_PROVIDERS,
+    gate_verdict,
+    normalized_hash,
+    sanitize_frame,
+)
+from osw import blockers
+from osw.jev import (
+    HOLD_BUDGET_MS,
+    HOLD_FALSE_HOLD_CAP_MS,
+    HOLD_MIN_REASK_MS,
+    HOLD_MIN_REMAINING_MS,
+    ask_blocker,
+    ask_ready,
+    enforce_active,
+    notify_class,
+    resolve_mode,
+    startup_should_hold,
+)
+from osw.sessions import session_for_pane
 from osw.state import (
     StateWriteError,
+    clear_stop_request,
     logs_dir,
     new_handoff_path,
     read_agent,
+    read_stop_request,
     write_agent,
     write_report,
 )
@@ -104,10 +142,60 @@ STUCK_NOTIFY_SECS = 300            # tracked agent frozen this long -> tell call
 CLOCK_SKEW_MS = 5_000              # tolerance comparing our clock vs Orca's
 TRACK_LOST_IDLE_WAIT_MS = 1_000    # quick TUI idle check before slow fallback
 RECEIPT_TIMEOUT_MS = 90_000        # tracked pane must acknowledge the prompt
+SUPERVISED_POLL_SECS = 3.0         # orchestration worker-show poll interval
+ASK_INBOX_LIMIT = 100              # newest inbox rows scanned for worker asks
+ASK_TEXT_MAX = 160                 # ask summary length in the notify line
+
+# Blocking screens (plan §2.2; policy in osw.blockers). A send Orca
+# refuses with `agent_prompt_blocked` never reached the agent, so it is
+# retried after the blocker is handled and the pane is ready again — at
+# most BLOCKED_SEND_LIMIT times, BLOCKED_RETRY_SECS apart.
+BLOCKED_SEND_LIMIT = 5
+BLOCKED_RETRY_SECS = 20.0
+BLOCKER_EXCERPT_CHARS = 120        # screen excerpt in the blocked notice
+BLOCKER_EXCERPT_LINES = 6          # bottom non-empty lines it is cut from
+
+# Symbolic whitelist keys -> name of the Orca send that presses them
+# (resolved at call time).
+BLOCKER_KEY_SENDERS = {
+    "enter": "terminal_send_dialog_enter",
+    "esc": "terminal_send_escape",
+    "interrupt": "terminal_interrupt",
+}
+HANDOFF_FALLBACK_TIMEOUT_SECS = 600.0  # wrap-up fallback: wait for the file
+HANDOFF_FALLBACK_POLL_SECS = 2.0   # wrap-up fallback: file stability cadence
+
+# Two-stage send for renderGate providers (design §12.4-1): Orca's
+# agent-prompt send waits for a cursor marker current Claude Code never
+# emits, so every claude/codex prompt pays the gate's full 8s timeout.
+# Affected providers instead write the text *without* Enter (raw path,
+# no gate), confirm it reached the composer via a bounded --screen poll,
+# then send Enter alone. A confirmation timeout still sends the Enter —
+# "force submit at deadline", the same semantics as Orca's gate, with
+# the cap at 2s instead of 8s — and the text is never resent.
+SPLIT_SEND_PROVIDERS = ("claude",)   # codex shares the gate; its TUI is unverified here
+SPLIT_SEND_CONFIRM_SECS = 2.0        # bounded composer-echo wait after the paste
+SPLIT_SEND_POLL_SECS = 0.5           # --screen poll interval inside that wait
+
+# Completion attribution guards (design §1.5): a fresh "done" is only
+# accepted after it survives all three — it must not belong to a foreign
+# agent session reporting states under this pane (prompt attribution),
+# it must persist across two polls, and the pane's output must have been
+# silent for COMPLETION_SILENCE_MS. Together they keep a nested
+# session's done (or any flickering done) from ending a turn that is
+# still running.
+COMPLETION_SILENCE_MS = 3_000
+
+# A stopped turn (`osw stop`, plan §1.8) is over once ps reports it
+# interrupted or done, or the pane has been output-silent this long:
+# claude and kimi stop for real, but ps keeps their pre-interrupt
+# "working" snapshot, so silence is the only signal there.
+STOP_SILENCE_MS = 5_000
 
 # Fixed, machine-generated wrap-up instruction (single line: multi-line
 # text gets truncated at newlines by orca.CMD --text on Windows). This
-# is the only self-authored text OSW ever injects into a worker.
+# and RESUME_TEMPLATE are the only self-authored texts OSW ever injects
+# into a worker.
 HANDOFF_TEMPLATE = (
     "Task wrap-up: the task above is finished. Write a concise English "
     "handoff document to {path} (markdown) covering: 1) what you did, "
@@ -117,6 +205,10 @@ HANDOFF_TEMPLATE = (
     "handoff before writing the file. Create the file even if the task "
     "was trivial, then stop; do not start any new work."
 )
+
+# Task prompt of a revived session whose interrupted task should go on
+# (record flag `resume_turn`, plan §1.7).
+RESUME_TEMPLATE = "continue"
 
 # kimi paints this status badge while its own background bash tasks are
 # still running; the TUI itself sits idle then, so output-silence alone
@@ -207,6 +299,92 @@ def _prompt_echo_units(text: str) -> list[str]:
     return units
 
 
+def _send_accepted(data: dict) -> bool:
+    """Whether Orca's send receipt accepted a raw input write.
+
+    `result.send.accepted` is a negative-only signal (design §12.3):
+    hosts that predate the field accepted the legacy raw input, so a
+    missing field counts as accepted. Only an explicit `False` means
+    the write did not land.
+    """
+    result = data.get("result")
+    send = result.get("send") if isinstance(result, dict) else None
+    if not isinstance(send, dict):
+        return True
+    return send.get("accepted") is not False
+
+
+def _find_agent_wait(value, depth: int = 0):
+    """The first `agentWait` value anywhere in an Orca error payload."""
+    if depth > 6:
+        return None
+    if isinstance(value, dict):
+        if value.get("agentWait"):
+            return value["agentWait"]
+        children = value.values()
+    elif isinstance(value, list):
+        children = value
+    else:
+        return None
+    for child in children:
+        found = _find_agent_wait(child, depth + 1)
+        if found:
+            return found
+    return None
+
+
+def _blocked_observation(exc: OrcaError) -> dict:
+    """Observation for `blockers.detect` from an `agent_prompt_blocked`
+    send error. Orca blocked the prompt even when it names no wait, so
+    the error code itself stands in as an (unnamed) reason."""
+    wait = _find_agent_wait(exc.payload)
+    return {"agentWait": wait or {"reason": exc.code or "agent_prompt_blocked"}}
+
+
+def _dialog_only(answer: dict | None) -> dict | None:
+    """A ready_state answer reduced to its `blocked_dialog` probability.
+
+    A booting TUI is the normal `blocked_startup` case and has its own
+    bounded hold; only a dialog judgment is evidence of a blocking
+    screen at a ready release.
+    """
+    if not answer:
+        return None
+    p = (answer.get("probabilities") or {}).get("blocked_dialog")
+    return {"probabilities": {"blocked_dialog": p}} if p is not None else None
+
+
+def _shares_run(a: str, b: str, width: int = 12) -> bool:
+    """Whether `a` and `b` share any `width`-char substring (stepped 4)."""
+    if len(a) < width or len(b) < width:
+        return False
+    for start in range(0, len(a) - width + 1, 4):
+        if a[start:start + width] in b:
+            return True
+    return False
+
+
+def _foreign_done(entry: dict, sent_flat: str) -> bool:
+    """Whether a fresh "done" belongs to a foreign agent session.
+
+    A nested agent launched inside this pane with the pane's inherited
+    ORCA_* hook environment reports its own states to Orca under this
+    pane (design §1.5). The tell is a ps `prompt` that is ours neither
+    verbatim nor by receipt prefix. Only pure-ASCII ps prompts are
+    judged: a CJK prompt may read back mangled on Windows, and a
+    partially mangled echo still shares long runs with what we sent —
+    text sharing no 12-char run with our prompt is what proves a
+    different session. Anything unreadable fails open to "not foreign";
+    the persistence and silence guards still apply on their own.
+    """
+    reported = one_line(str(entry.get("prompt") or ""))
+    if not reported or not sent_flat or not reported.isascii():
+        return False
+    if reported == sent_flat or reported.startswith(sent_flat[:32]):
+        return False
+    return not _shares_run(reported, sent_flat)
+
+
 def _unusable_echo_surface(tail: list[str], retained: int | None) -> str | None:
     """Why `tail` cannot host a conversation echo, or None if it can.
 
@@ -272,6 +450,15 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_iso(value: str) -> datetime | None:
+    """Parse an ISO timestamp (naive means UTC); None if unparseable."""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 def one_line(text: str, max_len: int = 0) -> str:
     """Collapse all whitespace runs into single spaces (Windows: any
     newline sent through orca.CMD --text truncates the message)."""
@@ -283,7 +470,8 @@ def one_line(text: str, max_len: int = 0) -> str:
 
 def format_completion_report(
     agent_id: str, terminal: str, report_file: str,
-    handoff_file: str = "", summary: str = "",
+    handoff_file: str = "", summary: str = "", outcome: str = "",
+    warning: str = "",
 ) -> str:
     """Single-line completion notification sent to the caller terminal.
 
@@ -292,6 +480,10 @@ def format_completion_report(
     in the JSON report and the handoff markdown.
     """
     message = f"# [osw] task-finished agent={agent_id} terminal={terminal}"
+    if outcome:
+        message += f" outcome={one_line(outcome, 40)}"
+    if warning:
+        message += f" warning={one_line(warning, 40)}"
     if report_file:
         message += f" report={report_file}"
     if handoff_file:
@@ -341,6 +533,27 @@ class Watcher:
         self.pane: str | None = self.agent.get("pane_key") or None
         self._state_dirty = False
         self._state_storage_error: StateWriteError | None = None
+        self._gate_since: float | None = None
+        self._gate_last: tuple[str, str] | None = None
+        self._gate_call_pending = False
+        self._hold: dict | None = None
+        self._ready_deadline = 0.0
+        self._notified_classes: set[str] = set()
+        self._task_group = None
+        self._stop_at = ""  # stop request time, once observed
+        # Blocking-screen handling (plan §2.2), per watcher run:
+        self._blockers_acted: set[str] = set()     # kinds keys went out for
+        self._blockers_stopped: set[str] = set()   # kinds no longer automated
+        self._blocker_notices: set[str] = set()    # notices already sent
+        self._blocker_shadowed: set[str] = set()   # shadow actions recorded
+        self._blocker_last: tuple[str, str] | None = None
+        self._update_lock_held = False
+        # Tool activity (plan §3.1): per turn, from ps `toolName` while
+        # the turn is working; the task turn's verdict goes in the report.
+        self._turn_tracked = False
+        self._turn_tools_seen = False
+        self._task_turn_ran = False
+        self._task_tools_observed: bool | None = None
 
     def _update(self, **fields) -> None:
         changed = False
@@ -405,9 +618,359 @@ class Watcher:
             data=data,
         )
 
+    def _discard_stale_stop_request(self) -> None:
+        """Drop a stop request older than this run's record.
+
+        `osw stop` writes the sidecar only while a watcher runs, but a
+        watcher that died before finalizing leaves it behind; it must
+        not interrupt the next task dispatched on this record. A request
+        written after the record was created belongs to this run (it
+        may land before the watcher process is up) and is kept.
+        """
+        requested = read_stop_request(self.root, self.agent_id)
+        if not requested:
+            return
+        requested_at = _parse_iso(requested)
+        created_at = _parse_iso(str(self.agent.get("created_at") or ""))
+        if requested_at is None or created_at is None \
+                or requested_at >= created_at:
+            return
+        try:
+            clear_stop_request(self.root, self.agent_id)
+        except OSError:
+            pass
+        self._event(
+            "stale_stop_request_discarded",
+            data={"requested_at": requested,
+                  "created_at": self.agent.get("created_at")},
+        )
+
+    def _stop_requested(self) -> bool:
+        """Whether `osw stop` asked to interrupt this agent.
+
+        Polls the `.stop` sidecar (the CLI must not write the record
+        while the watcher owns it) and mirrors the request time into the
+        record once.
+        """
+        if self._stop_at:
+            return True
+        requested = read_stop_request(self.root, self.agent_id)
+        if not requested:
+            return False
+        self._stop_at = requested
+        self._update(stop_requested_at=requested)
+        self._event("stop_request_observed", data={"requested_at": requested})
+        log.info("watcher(%s): stop requested at %s", self.agent_id, requested)
+        return True
+
+    async def _stop_settled(self) -> str:
+        """Why the stopped turn is over ("" while it still runs)."""
+        entry = None
+        if self.pane is not None:
+            try:
+                entry = await _ps_entry(self.pane)
+            except OrcaError:
+                entry = None
+        if entry is not None:
+            if entry.get("interrupted") is True:
+                return "ps_interrupted"
+            if entry.get("state") == "done":
+                return "ps_done"
+        if await self._output_silent(STOP_SILENCE_MS):
+            return "output_silent"
+        return ""
+
+    # ---- blocking screens (plan §2.2) -----------------------------------
+
+    @staticmethod
+    def _blocker_screen(frame: dict | None) -> tuple[str, str]:
+        """(sanitized frame text, one-line excerpt) of a --screen body."""
+        term = (frame or {}).get("result", {}).get("terminal", {})
+        tail = term.get("tail") if isinstance(term, dict) else None
+        if not isinstance(tail, list):
+            return "", ""
+        lines = sanitize_frame([str(line) for line in tail])
+        kept = [line.strip() for line in lines if line.strip()]
+        excerpt = one_line(
+            " | ".join(kept[-BLOCKER_EXCERPT_LINES:]), BLOCKER_EXCERPT_CHARS)
+        return "\n".join(lines), excerpt
+
+    async def _notify_blocked(
+        self, kind: str, excerpt: str, note: str = "", stopped: bool = False,
+    ) -> bool:
+        """One `# [osw] blocked` notice per blocker (plus one when
+        automatic handling stops). True when a notice went out."""
+        key = f"{kind}:stopped" if stopped else kind
+        if key in self._blocker_notices \
+                or (not stopped and f"{kind}:stopped" in self._blocker_notices):
+            return False
+        self._blocker_notices.add(key)
+        if stopped:
+            note = note or "still blocked after automatic handling; stopped"
+        self._event(
+            "blocker_notified",
+            data={"kind": kind, "stopped": stopped, "note": note},
+        )
+        line = (f"# [osw] blocked agent={self.agent_id} kind={kind}"
+                f" terminal={self.handle}")
+        if note:
+            line += f" ({note})"
+        line += f" screen={excerpt or '(unreadable)'}"
+        await self._notify(line)
+        return True
+
+    async def _send_blocker_keys(self, keys: list[str]) -> None:
+        for key in keys:
+            sender = globals()[BLOCKER_KEY_SENDERS[key]]
+            try:
+                await sender(self.handle)
+            except OrcaError as exc:
+                if exc.code != "terminal_handle_stale" \
+                        or not await self._rebind_terminal():
+                    raise
+                await sender(self.handle)
+
+    def _release_update_lock(self, reason: str) -> None:
+        if not self._update_lock_held:
+            return
+        provider = str(self.agent.get("provider") or "")
+        try:
+            blockers.release_update_lock(provider, self.agent_id)
+        except OSError:
+            pass
+        self._update_lock_held = False
+        self._event(
+            "blocker_lock_released",
+            data={"provider": provider, "reason": reason},
+        )
+
+    async def _check_blocker(
+        self,
+        observation: dict | None,
+        ready_answer: dict | None,
+        frame: dict | None,
+        *,
+        act: str = "send",
+        point: str = "",
+    ) -> str:
+        """Handle a blocking screen, if there is one (plan §2.2).
+
+        Discovery and policy live in `osw.blockers`: Orca's agentWait
+        first, else the ready_state answer; the kind from Orca, else a
+        `blocker_kind` judgment (never under mode off); then the mode
+        decides. `act` says what an `act` decision may do here: "send"
+        presses the whitelisted keys; "defer" leaves them to the
+        foreground send path (a background judgment must never type);
+        "notify" reports instead (the prompt is already in flight).
+
+        Returns "none", "acted", "waiting" (update lock held elsewhere),
+        "shadow", "deferred", "notified", or "stopped" (still blocked
+        after acting, or the keys could not be sent — automatic handling
+        of that kind is off for the rest of this run).
+        """
+        detection = blockers.detect(observation, ready_answer)
+        if detection is None:
+            return "none"
+        provider = str(self.agent.get("provider") or "")
+        mode = resolve_mode(self.root)
+        if frame is None:
+            frame = await self._read_gate_frame()
+        text, excerpt = self._blocker_screen(frame)
+        answer = None
+        if not detection.kind and mode != "off" and frame is not None:
+            answer = await ask_blocker(
+                self.root, self.agent_id, provider, frame, mode)
+        kind = blockers.classify(detection, answer)
+        decision = blockers.decide(provider, kind, mode, text)
+        if kind in self._blockers_stopped:
+            decision = "notify"
+        if self._blocker_last != (kind, decision):
+            self._blocker_last = (kind, decision)
+            self._event(
+                "blocker_detected",
+                data={"source": detection.source, "signal": detection.signal,
+                      "p": detection.p, "kind": kind, "decision": decision,
+                      "point": point},
+            )
+        keys = list(blockers.WHITELIST.get((provider, kind), ()))
+
+        if decision == "shadow":
+            if kind not in self._blocker_shadowed:
+                self._blocker_shadowed.add(kind)
+                self._event(
+                    "blocker_shadow_action",
+                    data={"kind": kind, "keys": keys, "point": point},
+                )
+            # Plan §3.2: nothing is pressed, so the guardian must hear
+            # about the blocker exactly as under notify.
+            await self._notify_blocked(kind, excerpt)
+            return "shadow"
+        if decision == "notify":
+            await self._notify_blocked(kind, excerpt)
+            return "notified"
+
+        if act != "send":
+            self._event(
+                "blocker_action_deferred",
+                data={"kind": kind, "keys": keys, "point": point,
+                      "reason": ("background_judgment" if act == "defer"
+                                 else "prompt_in_flight")},
+            )
+            if act == "notify":
+                await self._notify_blocked(kind, excerpt)
+                return "notified"
+            return "deferred"
+        if kind in self._blockers_acted:
+            # Re-judged after acting and still blocked: stop automating.
+            self._blockers_stopped.add(kind)
+            self._release_update_lock("still_blocked")
+            self._event(
+                "blocker_still_blocked",
+                level="WARNING",
+                data={"kind": kind, "keys": keys, "point": point},
+            )
+            await self._notify_blocked(kind, excerpt, stopped=True)
+            return "stopped"
+        if kind == "update_prompt" and not self._update_lock_held:
+            if not blockers.acquire_update_lock(provider, self.agent_id):
+                if await self._notify_blocked(
+                        kind, excerpt,
+                        note="another pane is applying this update; waiting"):
+                    self._event("blocker_lock_busy", data={"provider": provider})
+                return "waiting"
+            self._update_lock_held = True
+            self._event("blocker_lock_acquired", data={"provider": provider})
+        try:
+            await self._send_blocker_keys(keys)
+        except OrcaError as exc:
+            self._blockers_stopped.add(kind)
+            self._release_update_lock("action_failed")
+            self._event(
+                "blocker_action_failed",
+                level="ERROR",
+                message=str(exc),
+                data={"kind": kind, "keys": keys, "point": point},
+            )
+            await self._notify_blocked(
+                kind, excerpt, note="sending the keys failed; stopped",
+                stopped=True)
+            return "stopped"
+        self._blockers_acted.add(kind)
+        self._event(
+            "blocker_action",
+            data={"kind": kind, "keys": keys, "source": detection.source,
+                  "signal": detection.signal, "point": point},
+        )
+        return "acted"
+
+    async def _terminal_object(self) -> dict | None:
+        try:
+            data = await terminal_show(self.handle)
+        except OrcaError:
+            return None
+        term = data.get("result", {}).get("terminal", {})
+        return term if isinstance(term, dict) else None
+
+    async def _blocker_probe(self, point: str) -> None:
+        """One blocker look at a pane that stopped responding (no
+        receipt, stall). The prompt is already in flight, so this only
+        reports: pressing keys now could act on a working agent."""
+        provider = str(self.agent.get("provider") or "")
+        frame = await self._read_gate_frame()
+        observation = await self._terminal_object()
+        mode = resolve_mode(self.root)
+        answer = None
+        if mode != "off" and frame is not None:
+            answer = await ask_ready(
+                self.root, self.agent_id, provider, frame, mode, point)
+        await self._check_blocker(
+            observation, answer, frame, act="notify", point=point)
+
+    def _note_turn_tools(self, phase: str) -> bool | None:
+        """Tool activity of the turn that just ended (plan §3.1).
+
+        True when ps reported a tool while the turn was working, False
+        when ps tracked the pane but never did, None when ps never
+        tracked it (nothing could be observed). The task turn's value
+        is kept for the report.
+        """
+        if self._turn_tools_seen:
+            tools: bool | None = True
+        elif self._turn_tracked:
+            tools = False
+        else:
+            tools = None
+        if phase == "task":
+            self._task_turn_ran = True
+            self._task_tools_observed = tools
+        return tools
+
+    def _record_session(self) -> None:
+        """Record the pane's provider session id after a turn settles.
+
+        Best effort: Orca's hook cache is not a public interface, so an
+        empty answer or any failure leaves the record (and the turn)
+        exactly as it was.
+        """
+        if not self.pane:
+            return
+        try:
+            session_id = session_for_pane(self.pane)
+        except Exception as exc:
+            self._event(
+                "session_lookup_failed",
+                level="WARNING",
+                message=str(exc),
+                data={"pane_key": self.pane},
+            )
+            return
+        if session_id:
+            self._update(session_id=session_id)
+
+    def _notify_target(self) -> tuple[str, str]:
+        """(terminal, pane_key) to notify, resolved fresh on every call.
+
+        A guardian that is an OSW agent is stored by id only and read
+        from its own record each time, so its current handle is used; an
+        inline guardian carries its terminal and pane key. Without a
+        resolvable guardian the caller terminal (no pane key) is used.
+        """
+        guardian = self.agent.get("guardian")
+        if isinstance(guardian, dict) and guardian.get("agent_id"):
+            guardian_id = str(guardian["agent_id"])
+            try:
+                record = read_agent(self.root, guardian_id)
+            except (OSError, ValueError):
+                record = None
+            if record and record.get("terminal"):
+                return str(record["terminal"]), str(record.get("pane_key") or "")
+            self._event(
+                "guardian_unresolved",
+                level="WARNING",
+                message="guardian agent record unreadable; "
+                        "falling back to caller terminal",
+                data={"guardian": guardian_id},
+            )
+        elif isinstance(guardian, dict) and guardian.get("terminal"):
+            return str(guardian["terminal"]), str(guardian.get("pane_key") or "")
+        return str(self.agent.get("caller_terminal") or ""), ""
+
+    async def _rebind_notify_target(self, pane_key: str) -> str:
+        """Current handle of the notify target's pane, or ""."""
+        try:
+            terminals = await terminal_list(f"path:{self.root}")
+        except OrcaError:
+            return ""
+        for terminal in terminals:
+            handle = terminal.get("handle")
+            if handle and \
+                    f"{terminal.get('tabId')}:{terminal.get('leafId')}" == pane_key:
+                return str(handle)
+        return ""
+
     async def _notify(self, line: str) -> None:
-        caller = self.agent.get("caller_terminal")
-        if not caller:
+        target, pane_key = self._notify_target()
+        if not target:
             # Never drop a completion notification silently: record an
             # ERROR event so the gap is visible in `osw logs`.
             log.warning(
@@ -422,15 +985,37 @@ class Watcher:
             )
             return
         try:
-            await terminal_send(caller, line)
+            await terminal_send(target, line)
+            return
         except OrcaError as exc:
-            log.warning("notify failed (caller=%s): %s", caller, exc)
-            self._event(
-                "notify_failed",
-                level="ERROR",
-                message=f"failed to notify caller terminal: {exc}",
-                data={"caller_terminal": caller, "line": line},
-            )
+            failure = exc
+        # Handles die with the Orca runtime; the pane key does not.
+        # Rebind once and retry once.
+        if failure.code == "terminal_handle_stale" and pane_key:
+            rebound = await self._rebind_notify_target(pane_key)
+            if rebound:
+                self._event(
+                    "notify_target_rebound",
+                    data={"previous": target, "current": rebound},
+                )
+                guardian = self.agent.get("guardian")
+                if isinstance(guardian, dict) and not guardian.get("agent_id"):
+                    # Inline guardian lives in this record; a guardian
+                    # agent's record belongs to its own watcher.
+                    self._update(guardian={**guardian, "terminal": rebound})
+                target = rebound
+                try:
+                    await terminal_send(target, line)
+                    return
+                except OrcaError as exc:
+                    failure = exc
+        log.warning("notify failed (caller=%s): %s", target, failure)
+        self._event(
+            "notify_failed",
+            level="ERROR",
+            message=f"failed to notify caller terminal: {failure}",
+            data={"caller_terminal": target, "line": line},
+        )
 
     async def _rebind_terminal(self) -> bool:
         """Refresh a runtime-scoped handle using the pane's stable identity."""
@@ -547,7 +1132,13 @@ class Watcher:
         return [str(line) for line in tail], retained
 
     async def _send_terminal(self, text: str) -> bool:
-        """Send `text`; True when Orca confirmed the prompt took effect.
+        """Send `text`; True when the send was confirmed as delivered.
+
+        Providers behind Orca's renderGate (SPLIT_SEND_PROVIDERS) take
+        the two-stage raw send: the gate never settles on current Claude
+        Code builds, so the legacy single-shot path costs a fixed ~8s on
+        every prompt (design §12.4-1). Everyone else keeps the legacy
+        path unchanged.
 
         Orca's send-time confirmation watches the TUI for a fresh
         non-working -> working edge within a short window. A TUI that is
@@ -558,17 +1149,99 @@ class Watcher:
         write failure: return False and let the receipt window below
         judge. Genuine write failures still raise.
         """
+        provider = str(self.agent.get("provider") or "")
+        if provider in SPLIT_SEND_PROVIDERS:
+            return await self._split_send(text)
         try:
-            await terminal_send(self.handle, text)
-            return True
+            data = await terminal_send(self.handle, text)
         except OrcaError as exc:
             if exc.code == "agent_prompt_stalled":
                 return False
             if exc.code != "terminal_handle_stale" \
                     or not await self._rebind_terminal():
                 raise
-        await terminal_send(self.handle, text)
+            data = await terminal_send(self.handle, text)
+        if _send_accepted(data) is False:
+            raise OrcaError(
+                "terminal send refused (accepted=false)",
+                returncode=1, code="send_not_accepted",
+            )
         return True
+
+    async def _split_send(self, text: str) -> bool:
+        """Two-stage send for renderGate providers (design §12.4-1).
+
+        Stage 1 writes the text without Enter (raw `sendTerminal` path,
+        no renderGate); stage 2 waits a bounded SPLIT_SEND_CONFIRM_SECS
+        for the composer echo; stage 3 sends Enter alone. On a
+        confirmation timeout the Enter is still sent and False is
+        returned — delivery is then judged by the receipt window, and
+        because the text is never resent, a slow render can at worst
+        submit an empty composer, never double-submit the prompt.
+        """
+        try:
+            first = await terminal_send(self.handle, text, enter=False)
+        except OrcaError as exc:
+            if exc.code != "terminal_handle_stale" \
+                    or not await self._rebind_terminal():
+                raise
+            first = await terminal_send(self.handle, text, enter=False)
+        if _send_accepted(first) is False:
+            raise OrcaError(
+                "terminal send refused (accepted=false)",
+                returncode=1, code="send_not_accepted",
+            )
+        confirmed = await self._await_composer_echo(text)
+        # Enter-only write: a stale handle retries just the Enter, never
+        # a second paste of the text.
+        try:
+            await terminal_send(self.handle, "", enter=True)
+        except OrcaError as exc:
+            if exc.code != "terminal_handle_stale" \
+                    or not await self._rebind_terminal():
+                raise
+            await terminal_send(self.handle, "", enter=True)
+        return confirmed
+
+    async def _await_composer_echo(self, text: str) -> bool:
+        """Bounded wait for the pasted text to reach the composer.
+
+        Reads the rendered frame (`--screen`) every SPLIT_SEND_POLL_SECS
+        until the sent prefix, the prompt's ASCII island, or Claude
+        Code's `[Pasted text` collapse marker is visible, or
+        SPLIT_SEND_CONFIRM_SECS elapses. A failing read shortens the
+        wait instead of blocking the Enter that follows.
+        """
+        units = _prompt_echo_units(text)
+        deadline = time.monotonic() + SPLIT_SEND_CONFIRM_SECS
+        while True:
+            try:
+                data = await self._terminal_read_screen()
+            except OrcaError:
+                return False
+            term = data.get("result", {}).get("terminal", {})
+            tail = term.get("tail")
+            if isinstance(tail, list):
+                hay = "".join(
+                    ch for ch in " ".join(str(line) for line in tail)
+                    if ch.isprintable() and not ch.isspace()
+                )
+                if "[Pastedtext" in hay:
+                    return True
+                if any("".join(unit.split()) in hay for unit in units):
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            await anyio.sleep(SPLIT_SEND_POLL_SECS)
+
+    async def _terminal_read_screen(self) -> dict:
+        try:
+            return await terminal_read(self.handle, screen=True)
+        except OrcaError as exc:
+            if exc.code != "terminal_handle_stale" \
+                    or not await self._rebind_terminal():
+                raise
+            return await terminal_read(self.handle, screen=True)
 
     async def _verify_prompt_echo(self, text: str) -> bool | None:
         """Re-read the terminal scrollback and check the sent prompt's
@@ -633,49 +1306,95 @@ class Watcher:
         return False
 
     async def run(self) -> None:
+        async with anyio.create_task_group() as task_group:
+            self._task_group = task_group
+            await self._run_turns()
+
+    async def _run_turns(self) -> None:
         self._update(watcher_pid=os.getpid(), state="starting")
         self._event("watcher_started", data={"pid": os.getpid()})
         log.info(
             "watcher(%s): started  terminal=%s  pid=%d",
             self.agent_id, self.handle, os.getpid(),
         )
+        self._discard_stale_stop_request()
 
-        self._event("ready_wait_started")
-        ready_source = await self._wait_ready()
-        if ready_source is None:
-            busy = await self._pane_alive()
-            reason = "pane_busy" if busy else "ready_failed"
-            error = ("agent still busy at the ready deadline"
-                     if busy else "ready timeout")
-            log.error("watcher(%s): ready-wait timed out (%s)",
-                      self.agent_id, reason)
-            self._event(
-                "ready_wait_failed",
-                level="ERROR",
-                message=("terminal never became ready; pane still busy"
-                         if busy else "terminal never became ready"),
+        if self.agent.get("launch_mode") == "supervised":
+            await self._run_supervised()
+            return
+
+        if self.agent.get("follow_turn"):
+            await self._run_follow()
+            return
+
+        # A resumed session (`osw revive`) continues its interrupted task
+        # with the fixed RESUME_TEMPLATE; the record keeps the original
+        # prompt for the report.
+        if self.agent.get("resume_turn"):
+            prompt = RESUME_TEMPLATE
+        else:
+            prompt = one_line(self.agent.get("prompt") or "")
+
+        # Ready, then the task send. A send Orca refused because a dialog
+        # owns the input (plan §2.2) never reached the agent: once the
+        # blocker is handled the pane is waited ready again and the
+        # prompt sent again, a bounded number of times.
+        blocked_sends = 0
+        while True:
+            self._event("ready_wait_started")
+            ready_source = await self._wait_ready()
+            if ready_source == "stop_requested":
+                # Stopped before the prompt went out: never send it.
+                await self._finalize("error", "interrupted")
+                return
+            if ready_source is None:
+                busy = await self._pane_alive()
+                reason = "pane_busy" if busy else "ready_failed"
+                error = ("agent still busy at the ready deadline"
+                         if busy else "ready timeout")
+                log.error("watcher(%s): ready-wait timed out (%s)",
+                          self.agent_id, reason)
+                self._event(
+                    "ready_wait_failed",
+                    level="ERROR",
+                    message=("terminal never became ready; pane still busy"
+                             if busy else "terminal never became ready"),
+                )
+                await self._finalize("error", reason, error=error)
+                return
+            # Ready again: an update this watcher applied is over.
+            self._release_update_lock("ready_restored")
+            self._event("ready_observed", data={"source": ready_source})
+            log.info(
+                "watcher(%s): ready (source=%s)  pane=%s",
+                self.agent_id, ready_source, self.pane or "(unknown)",
             )
-            await self._finalize("error", reason, error=error)
-            return
-        self._event("ready_observed", data={"source": ready_source})
-        log.info(
-            "watcher(%s): ready (source=%s)  pane=%s",
-            self.agent_id, ready_source, self.pane or "(unknown)",
-        )
+            if not prompt:
+                await self._finalize("done", "no_prompt")
+                return
 
-        prompt = one_line(self.agent.get("prompt") or "")
-        if not prompt:
-            await self._finalize("done", "no_prompt")
+            # ---- Phase 1: the task itself ----
+            source = await self._run_turn(prompt, phase="task")
+            if source != "blocked" or blocked_sends >= BLOCKED_SEND_LIMIT:
+                break
+            blocked_sends += 1
+            await anyio.sleep(BLOCKED_RETRY_SECS)
+        if source == "interrupted" or self._stop_requested():
+            # A stopped task gets no handoff turn.
+            await self._finalize("error", "interrupted")
             return
-
-        # ---- Phase 1: the task itself ----
-        source = await self._run_turn(prompt, phase="task")
+        if source in ("blocked", "blocked_stopped"):
+            await self._finalize("error", "blocked")
+            return
         if source in ("timeout", "terminal_lost", "send_failed", "no_receipt"):
             await self._finalize("error", source)
             return
         log.info("watcher(%s): task turn done (source=%s)", self.agent_id, source)
 
         # ---- Phase 2: handoff document ----
+        # The handoff send carries no Jev judgment (G6) but still passes
+        # the zero-cost Phase 0 gate.
+        await self._phase0_ready_wait()
         handoff = new_handoff_path(self.root, self.agent_id)
         self._update(handoff_path=str(handoff))
         instruction = HANDOFF_TEMPLATE.format(path=handoff)
@@ -686,6 +1405,16 @@ class Watcher:
             handoff_source = await self._run_turn(
                 instruction, phase="handoff", echo_receipt=attempt == 1,
             )
+            if handoff_source == "interrupted" or self._stop_requested():
+                if not _handoff_ok(handoff):
+                    self._update(handoff_path="")
+                await self._finalize("error", "interrupted")
+                return
+            if handoff_source in ("blocked", "blocked_stopped"):
+                if not _handoff_ok(handoff):
+                    self._update(handoff_path="")
+                await self._finalize("error", "blocked")
+                return
             if handoff_source in (
                 "timeout", "terminal_lost", "send_failed", "no_receipt",
             ):
@@ -703,6 +1432,619 @@ class Watcher:
         else:
             self._update(handoff_path="")
             await self._finalize("done", "handoff_missing")
+
+    # ---- follow: take over the turn already running in the pane ---------
+
+    async def _run_follow(self) -> None:
+        """Supervise a turn this watcher did not start (`follow_turn`).
+
+        Nothing is sent: no ready wait, no prompt, no handoff turn. The
+        takeover moment stands in for the send time and the ps prompt
+        seen at takeover for the sent text, so the completion guards
+        (foreign done, persistence, silence) apply unchanged. There is
+        no receipt or echo to verify for a prompt someone else typed.
+        A pane ps already reports "done" at takeover has no turn left
+        to follow: waiting for the next one would judge its new prompt
+        foreign and park the watcher until the hard deadline.
+        """
+        if self.pane is None:
+            self.pane = await _pane_key(self.handle)
+            if self.pane:
+                self._update(pane_key=self.pane)
+                self._event("pane_detected", data={"pane_key": self.pane})
+        followed_at_ms = time.time() * 1000
+        entry = None
+        if self.pane:
+            try:
+                entry = await _ps_entry(self.pane)
+            except OrcaError:
+                entry = None
+        ps_state = str((entry or {}).get("state") or "")
+        self._event("follow_started", data={"ps_state": ps_state or "untracked"})
+        if ps_state == "done":
+            self._record_session()
+            if self._stop_requested():
+                await self._finalize("error", "interrupted")
+                return
+            await self._finalize("done", "already_done")
+            return
+        self._update(state="working", phase="task", tool_name="")
+        # A pane with no done at takeover has no done baseline: the
+        # running turn's done is the first one to come.
+        source = await self._wait_turn_done(
+            followed_at_ms, 0,
+            sent_text=str((entry or {}).get("prompt") or ""),
+            receipt_hint=True, absorb_echo=False,
+        )
+        self._record_session()
+        tools = self._note_turn_tools("task")
+        self._event("turn_finished", data={
+            "phase": "task", "source": source, "tools_observed": tools})
+        if source == "interrupted" or self._stop_requested():
+            await self._finalize("error", "interrupted")
+            return
+        if source in ("timeout", "terminal_lost"):
+            await self._finalize("error", source)
+            return
+        await self._finalize("done", source)
+
+    # ---- supervised completion (Orca orchestration) ---------------------
+
+    async def _relay_worker_asks(self, dispatch_id: str) -> None:
+        """Tell the guardian about the worker's unanswered `ask` and
+        escalation messages, once per message id (plan §2.3).
+
+        The ids are recorded in `notified_asks` before notifying, so a
+        restarted watcher (e.g. after `guard`) never repeats one. An
+        inbox failure is transient, like a worker-show hiccup.
+        """
+        try:
+            messages = await orchestration_inbox(limit=ASK_INBOX_LIMIT)
+        except OrcaError as exc:
+            log.warning("watcher(%s): inbox failed: %s", self.agent_id, exc)
+            return
+        pane = self.pane or str(self.agent.get("pane_key") or "")
+        notified = [str(i) for i in (self.agent.get("notified_asks") or [])]
+        for message in worker_asks(messages, dispatch_id, self.handle, pane):
+            msg_id = str(message["id"])
+            if msg_id in notified:
+                continue
+            notified = [*notified, msg_id]
+            self._update(notified_asks=notified)
+            text = one_line(
+                str(message.get("body") or message.get("subject") or ""),
+                ASK_TEXT_MAX,
+            )
+            await self._notify(
+                f"# [osw] ask agent={self.agent_id} message={msg_id}"
+                f' reply="orca orchestration reply --id {msg_id} --body <text>"'
+                f" text={text}"
+            )
+            self._event(
+                "worker_ask_notified",
+                data={"message_id": msg_id, "type": message.get("type", "")},
+            )
+
+    async def _run_supervised(self) -> None:
+        """Completion for workers OSW launched through Orca orchestration.
+
+        The launch phase already waited for terminal readiness and
+        injected the task spec, and the worker reports `worker_done`
+        itself, so the watcher polls Orca's Dispatch lifecycle instead of
+        reading terminal output. That is the only signal that works for
+        a TUI whose status bar repaints about once a second: every
+        output-silence heuristic would wait forever.
+        """
+        dispatch_id = str(self.agent.get("dispatch_id") or "")
+        if not dispatch_id:
+            await self._finalize("error", "supervised_missing_dispatch")
+            return
+        self._update(state="working", phase="task")
+        await self._supervised_launch_judgment()
+        self._event(
+            "supervised_wait_started", data={"dispatch_id": dispatch_id},
+        )
+        outcome = ""
+        while time.monotonic() < self.deadline:
+            await anyio.sleep(SUPERVISED_POLL_SECS)
+            # Record a stop as soon as it lands; the Dispatch settling
+            # is still what ends the turn.
+            self._stop_requested()
+            try:
+                data = await orchestration_worker_show(dispatch_id)
+                settlement = worker_settlement(data)
+            except OrcaError as exc:
+                # Transient CLI/runtime hiccup: the deadline still rules.
+                log.warning(
+                    "watcher(%s): worker-show failed: %s",
+                    self.agent_id, exc,
+                )
+                continue
+            if settlement["settled"]:
+                outcome = settlement["outcome"]
+                break
+            await self._relay_worker_asks(dispatch_id)
+            if settlement["agent_wait"] \
+                    and "agent_wait" not in self._notified_classes:
+                self._notified_classes.add("agent_wait")
+                await self._notify(
+                    f"# [osw] agent-waiting agent={self.agent_id}"
+                    f" terminal={self.handle}"
+                    f" wait={one_line(settlement['agent_wait'], 80)}"
+                    " (answer it directly in that terminal)"
+                )
+            observed = int(settlement["last_observed_at"] or 0)
+            if observed and "stall" not in self._notified_classes:
+                frozen_ms = time.time() * 1000 - observed
+                if frozen_ms > STUCK_NOTIFY_SECS * 1000:
+                    self._notified_classes.add("stall")
+                    await self._notify(
+                        f"# [osw] agent-stalled agent={self.agent_id}"
+                        f" terminal={self.handle}"
+                        f" no-activity={int(frozen_ms / 1000)}s"
+                    )
+        else:
+            self._event(
+                "supervised_wait_timeout",
+                level="ERROR",
+                data={"dispatch_id": dispatch_id},
+            )
+            await self._finalize("error", "timeout")
+            return
+
+        succeeded = outcome in ("succeeded", "completed")
+        self._update(orchestration_outcome=outcome, phase="handoff")
+        self._event(
+            "supervised_settled",
+            data={"dispatch_id": dispatch_id, "outcome": outcome},
+        )
+        self._record_session()
+        log.info(
+            "watcher(%s): worker settled (outcome=%s)",
+            self.agent_id, outcome,
+        )
+
+        # The terminal stays live and owned by OSW until `osw del
+        # --close` releases it; record that next-owner decision with
+        # Orca so the Dispatch accounting settles too.
+        try:
+            await orchestration_worker_retain(dispatch_id)
+            self._event(
+                "supervised_retained", data={"dispatch_id": dispatch_id},
+            )
+        except OrcaError as exc:
+            self._event(
+                "supervised_retain_failed",
+                level="WARNING",
+                message=exc.message,
+            )
+
+        if self._stop_requested():
+            # A stopped worker gets no wrap-up turn either.
+            await self._finalize("error", "interrupted")
+            return
+
+        handoff = Path(str(self.agent.get("handoff_path") or "")) \
+            if self.agent.get("handoff_path") \
+            else new_handoff_path(self.root, self.agent_id)
+        self._update(handoff_path=str(handoff))
+        if not _handoff_ok(handoff):
+            await self._supervised_handoff_fallback(handoff)
+
+        if _handoff_ok(handoff):
+            await self._finalize(
+                "done" if succeeded else "error",
+                "orchestration" if succeeded else "orchestration_failed",
+            )
+        else:
+            self._update(handoff_path="")
+            await self._finalize(
+                "done" if succeeded else "error",
+                "handoff_missing" if succeeded else "orchestration_failed",
+            )
+
+    async def _supervised_launch_judgment(self) -> None:
+        """One Jev look at a supervised launch (operator override 2026-10-11).
+
+        Orca already injected the task, so nothing can be held; the
+        judgment is advisory and recorded, and a `blocked_startup`
+        verdict raises the early warning for the agent-readiness flake
+        observed on 2026-10-10 (the pane boots but readiness never fires).
+        """
+        mode = resolve_mode(self.root)
+        if mode not in ("shadow", "enforce"):
+            return
+        provider = str(self.agent.get("provider") or "")
+        try:
+            frame = await self._read_gate_frame()
+        except OrcaError:
+            frame = None
+        if frame is None:
+            return
+        term = frame.get("result", {}).get("terminal", {})
+        if not (term.get("source") == "screen"
+                and isinstance(term.get("tail"), list) and term.get("tail")):
+            return
+        if enforce_active(self.root, provider):
+            answer = await ask_ready(
+                self.root, self.agent_id, provider, frame,
+                "enforce", "supervised_launch")
+            await self._handle_answer(answer, provider)
+            if answer is not None and startup_should_hold(answer):
+                self._event(
+                    "jev_veto",
+                    data={"action": "advisory", "reason": "blocked_startup",
+                          "held_ms": 0, "calls": 1},
+                )
+                await self._notify(
+                    f"# [osw] jev-notice agent={self.agent_id}"
+                    f" terminal={self.handle} class=blocked_startup"
+                    " (supervised launch; judgment recorded, nothing blocked)"
+                )
+        else:
+            self._spawn_shadow(provider, frame, "supervised_launch")
+
+    async def _supervised_handoff_fallback(self, handoff: Path) -> None:
+        """The worker settled without writing the contract file.
+
+        Send the fixed wrap-up turn and judge by the file — non-empty and
+        size-stable across polls — never by output silence.
+        """
+        self._event("supervised_handoff_missing", level="WARNING")
+        log.warning(
+            "watcher(%s): handoff missing at settlement; sending wrap-up",
+            self.agent_id,
+        )
+        try:
+            await self._send_terminal(HANDOFF_TEMPLATE.format(path=handoff))
+        except OrcaError as exc:
+            self._event(
+                "supervised_wrapup_send_failed",
+                level="WARNING",
+                message=exc.message,
+            )
+            return
+        deadline = min(
+            self.deadline,
+            time.monotonic() + HANDOFF_FALLBACK_TIMEOUT_SECS,
+        )
+        last_size = -1
+        stable = 0
+        while time.monotonic() < deadline:
+            await anyio.sleep(HANDOFF_FALLBACK_POLL_SECS)
+            if not _handoff_ok(handoff):
+                continue
+            size = handoff.stat().st_size
+            if size == last_size:
+                stable += 1
+                if stable >= 2:
+                    return
+            else:
+                stable = 0
+                last_size = size
+
+    def _emit_gate_verdict(
+        self, verdict: str, provider: str, source: str, reason: str,
+    ) -> None:
+        key = (verdict, reason)
+        if key == self._gate_last:
+            return
+        self._gate_last = key
+        self._event(
+            "gate_verdict",
+            data={"verdict": verdict, "provider": provider,
+                  "source": source, "reason": reason},
+        )
+
+    async def _read_gate_frame(self) -> dict | None:
+        try:
+            return await self._terminal_read_screen()
+        except OrcaError:
+            return None
+
+    async def _api_retry_wait(self, data: dict) -> None:
+        """Tolerate an upstream-API retry (own verdict class).
+
+        The pane is alive and recovers on its own, so nothing is sent,
+        failed, or held: notify once, drop any pending composer wait and
+        re-arm the ready clock (the hard deadline still caps it). The
+        first recovery is judged by the normal gate on the next poll.
+        """
+        self._gate_since = None
+        self._gate_call_pending = False
+        self._ready_deadline = min(
+            self.deadline, time.monotonic() + READY_TIMEOUT_MS / 1000)
+        if "api_retry" in self._notified_classes:
+            return
+        self._notified_classes.add("api_retry")
+        self._event("gate_api_retry", data=data)
+        await self._notify(
+            f"# [osw] agent-retrying agent={self.agent_id}"
+            f" terminal={self.handle}"
+            " (upstream API is retrying; still waiting, no prompt sent)"
+        )
+
+    async def _gate_veto(self, source: str) -> bool:
+        """Deterministic gate + Jev veto at a ready release point.
+
+        Design §5.0/§5.1. Returns True to veto this release (the caller
+        re-enters the outer loop); False releases. Every release source
+        reaches this gate (including `tui_idle`), and since the operator
+        override of 2026-10-11 Jev is consulted on `ready` verdicts too —
+        advisory there, never a hold.
+
+        Order of decisions:
+        1. an active hold runs its own ordered checks (§5.1.2);
+        2. otherwise the deterministic verdict drives the Phase 0 flow:
+           `ready`/`abstain` release, `not_ready` starts the bounded
+           composer wait (≤COMPOSER_WAIT_MS, then releases with today's
+           behavior — never until the ready deadline, N3);
+        3. Jev is consulted only when the gate abstains or first says
+           `not_ready` (§5.1.1): shadow fires a background judgment,
+           enforce calls synchronously and may start a hold.
+        """
+        provider = str(self.agent.get("provider") or "")
+        mode = resolve_mode(self.root)
+        frame: dict | None = None
+        if provider in GATE_PROVIDERS or mode != "off":
+            frame = await self._read_gate_frame()
+        frame_usable = False
+        if frame is not None:
+            term = frame.get("result", {}).get("terminal", {})
+            frame_usable = (
+                term.get("source") == "screen"
+                and isinstance(term.get("tail"), list)
+                and bool(term.get("tail"))
+            )
+        if provider in GATE_PROVIDERS:
+            if frame is None:
+                verdict, reason = "abstain", "read_failed"
+            else:
+                verdict, reason = gate_verdict(provider, frame)
+            self._emit_gate_verdict(verdict, provider, source, reason)
+        else:
+            verdict, reason = "abstain", "provider_without_predicate"
+            self._emit_gate_verdict(verdict, provider, source, reason)
+
+        # ---- upstream API retry: tolerate, never send/fail/hold ----
+        if verdict == "api_retry":
+            await self._api_retry_wait({"reason": reason, "source": source})
+            return True
+
+        if self._hold is not None:
+            return await self._hold_check(source, provider, frame, verdict)
+
+        # ---- Phase 0 composer wait ----
+        wait_veto = False
+        if verdict == "ready":
+            if self._gate_since is not None:
+                waited_ms = int(
+                    (time.monotonic() - self._gate_since) * 1000)
+                self._gate_since = None
+                self._gate_call_pending = False
+                self._event(
+                    "gate_released",
+                    data={"reason": "composer_visible",
+                          "waited_ms": waited_ms},
+                )
+        elif verdict == "abstain":
+            self._gate_since = None
+            self._gate_call_pending = False
+        else:  # not_ready
+            now = time.monotonic()
+            if self._gate_since is None:
+                self._gate_since = now
+                self._gate_call_pending = True
+            waited_ms = int((now - self._gate_since) * 1000)
+            if waited_ms >= COMPOSER_WAIT_MS:
+                self._gate_since = None
+                self._event(
+                    "gate_released",
+                    data={"reason": "wait_expired", "waited_ms": waited_ms},
+                )
+            else:
+                wait_veto = True
+
+        # ---- Jev consultation (§5.1.1; operator override 2026-10-11) ----
+        # Jev is consulted on every gate invocation, including a `ready`
+        # verdict: leaving the typical path at zero calls made the mode a
+        # no-op in practice. A ready verdict can never start a hold (the
+        # deterministic predicate stays authoritative for release); its
+        # judgment is advisory and recorded.
+        if (mode in ("shadow", "enforce") and frame_usable
+                and (verdict in ("ready", "abstain")
+                     or (verdict == "not_ready" and self._gate_call_pending))):
+            self._gate_call_pending = False
+            if enforce_active(self.root, provider):
+                answer = await ask_ready(
+                    self.root, self.agent_id, provider, frame,
+                    "enforce", reason)
+                await self._handle_answer(answer, provider)
+                if answer is not None \
+                        and str(answer.get("choice") or "") == "api_retry":
+                    await self._api_retry_wait(
+                        {"reason": "jev_choice", "source": source})
+                    return True
+                # A dialog judgment is checked as a blocking screen
+                # (plan §2.2). Keys sent, or another pane holding the
+                # update lock, keep the prompt back; anything else stays
+                # advisory and releases as before.
+                blocked = await self._check_blocker(
+                    None, _dialog_only(answer), frame, point="ready")
+                if blocked in ("acted", "waiting"):
+                    return True
+                if (verdict != "ready"
+                        and answer is not None
+                        and startup_should_hold(answer)
+                        and self._hold_budget_ok()):
+                    self._start_hold(frame)
+                    return True
+            else:
+                self._spawn_shadow(provider, frame, reason)
+
+        if wait_veto and self._hold is None:
+            return True
+        return False
+
+    def _hold_budget_ok(self) -> bool:
+        """Enough ready budget left to start/continue a hold (§5.1.2)."""
+        return (self._ready_deadline - time.monotonic()
+                >= HOLD_MIN_REMAINING_MS / 1000)
+
+    def _start_hold(self, frame: dict) -> None:
+        term = frame.get("result", {}).get("terminal", {})
+        lines = [str(line) for line in (term.get("tail") or [])]
+        now = time.monotonic()
+        self._hold = {
+            "since": now,
+            "last_ask_at": now,
+            "last_norm_hash": normalized_hash(lines),
+            "static_since": now,
+            "calls": 1,
+        }
+        self._event(
+            "jev_veto",
+            data={"action": "held", "reason": "blocked_startup",
+                  "held_ms": 0, "calls": 1},
+        )
+
+    def _release_hold(self, reason: str, action: str = "released") -> None:
+        hold = self._hold or {}
+        held_ms = int(
+            (time.monotonic() - hold.get("since", time.monotonic())) * 1000)
+        calls = int(hold.get("calls", 0))
+        self._hold = None
+        self._event(
+            "jev_veto",
+            data={"action": action, "reason": reason,
+                  "held_ms": held_ms, "calls": calls},
+        )
+
+    async def _hold_check(
+        self, source: str, provider: str, frame: dict | None, verdict: str,
+    ) -> bool:
+        """Ordered hold checks (§5.1.2); True keeps holding."""
+        hold = self._hold
+        assert hold is not None
+        now = time.monotonic()
+        # 1. deterministic fast path
+        if verdict == "ready":
+            self._release_hold("fast_path")
+            return False
+        # 2. mode / provider hot-read (kill switch mid-hold)
+        if not enforce_active(self.root, provider):
+            self._release_hold("mode_off")
+            return False
+        # 3. re-ask only on fresh semantic content, ≥HOLD_MIN_REASK_MS apart
+        if frame is not None:
+            term = frame.get("result", {}).get("terminal", {})
+            lines = [str(line) for line in (term.get("tail") or [])]
+            norm = normalized_hash(lines)
+            if norm != hold["last_norm_hash"]:
+                hold["last_norm_hash"] = norm
+                hold["static_since"] = now
+                if (now - hold["last_ask_at"]) >= HOLD_MIN_REASK_MS / 1000:
+                    answer = await ask_ready(
+                        self.root, self.agent_id, provider, frame,
+                        "enforce", "hold_reask")
+                    hold["last_ask_at"] = now
+                    hold["calls"] += 1
+                    if answer is None or not startup_should_hold(answer):
+                        self._release_hold("reask_clear")
+                        return False
+            if (norm == hold["last_norm_hash"]
+                    and now - hold["static_since"]
+                    >= HOLD_FALSE_HOLD_CAP_MS / 1000):
+                # "Static" does not mean startup finished — the loading
+                # screen is static. This cap is the false-hold give-up.
+                self._release_hold("false_hold_cap")
+                return False
+        # 4. budget: min(HOLD_BUDGET_MS, ready_deadline − HOLD_MIN_REMAINING_MS)
+        budget = min(
+            HOLD_BUDGET_MS / 1000,
+            max(0.0, self._ready_deadline - now
+                - HOLD_MIN_REMAINING_MS / 1000),
+        )
+        if now - hold["since"] >= budget:
+            self._release_hold("forced", action="forced")
+            return False
+        return True
+
+    async def _handle_answer(self, answer: dict | None, provider: str) -> None:
+        """Advisory notices only (§5.1.4): one per class per watcher."""
+        if answer is None:
+            return
+        hit = notify_class(answer)
+        if hit is None:
+            return
+        cls, p = hit
+        if cls in self._notified_classes:
+            return
+        self._notified_classes.add(cls)
+        self._event(
+            "jev_notice",
+            data={"class": cls, "p": p, "provider": provider},
+        )
+        await self._notify(
+            f"# [osw] jev-notice agent={self.agent_id}"
+            f" terminal={self.handle} class={cls} p={p:.2f}"
+            " (advisory; prompt was sent as usual)"
+        )
+
+    def _spawn_shadow(
+        self, provider: str, frame: dict, gate_label: str,
+    ) -> None:
+        """Background shadow judgment (§5.1.5): never blocks the release."""
+        group = self._task_group
+        if group is None:
+            return
+        group.start_soon(
+            functools.partial(
+                self._shadow_ready_call, provider, frame, gate_label))
+
+    async def _shadow_ready_call(
+        self, provider: str, frame: dict, gate_label: str,
+    ) -> None:
+        try:
+            answer = await ask_ready(self.root, self.agent_id, provider, frame,
+                                     "shadow", gate_label)
+        except Exception:
+            return  # ask_ready recorded the degradation itself
+        # The ready release did not wait for this judgment, so it may only
+        # record or report a blocking screen; keys are left to the
+        # foreground send path, which Orca blocks on such a dialog.
+        try:
+            await self._check_blocker(
+                None, _dialog_only(answer), frame, act="defer",
+                point="ready_shadow")
+        except OrcaError:
+            pass
+
+    async def _phase0_ready_wait(self) -> None:
+        """Phase 0 gate before a send without Jev judgment (handoff, G6):
+        bounded composer wait, then proceed regardless."""
+        provider = str(self.agent.get("provider") or "")
+        if provider not in GATE_PROVIDERS:
+            return
+        started = time.monotonic()
+        deadline = started + COMPOSER_WAIT_MS / 1000
+        while True:
+            frame = await self._read_gate_frame()
+            if frame is None:
+                return
+            verdict, reason = gate_verdict(provider, frame)
+            self._emit_gate_verdict(verdict, provider, "handoff", reason)
+            if verdict not in ("not_ready", "api_retry"):
+                return
+            if time.monotonic() >= deadline:
+                self._event(
+                    "gate_released",
+                    data={"reason": "wait_expired",
+                          "waited_ms": int(
+                              (time.monotonic() - started) * 1000)},
+                )
+                return
+            await anyio.sleep(GATE_POLL_SECS)
 
     async def _wait_ready(self) -> str | None:
         """Wait until the worker terminal can accept the next prompt.
@@ -725,12 +2067,16 @@ class Watcher:
         own turn afterwards.
 
         Returns the readiness source ("ps_idle" / "tui_idle" /
-        "preview_marker" / "output_idle"), or None on timeout.
+        "preview_marker" / "output_idle"), "stop_requested" when a stop
+        request landed first, or None on timeout.
         """
-        deadline = time.monotonic() + READY_TIMEOUT_MS / 1000
+        self._ready_deadline = time.monotonic() + READY_TIMEOUT_MS / 1000
         dialog_notified = False
+        idle_ignored = False
         busy_notified = False
-        while time.monotonic() < deadline:
+        while time.monotonic() < self._ready_deadline:
+            if self._stop_requested():
+                return "stop_requested"
             if self.pane is None:
                 self.pane = await _pane_key(self.handle)
                 if self.pane:
@@ -746,13 +2092,16 @@ class Watcher:
                 # Tracked pane: "done" means ready; anything else (a
                 # turn still running on an adopted pane) means wait.
                 if entry.get("state") == "done":
+                    if await self._gate_veto("ps_idle"):
+                        await anyio.sleep(GATE_POLL_SECS)
+                        continue
                     return "ps_idle"
                 if entry.get("state") == "working":
                     # A pane mid-turn is proof of life, not a stuck
                     # startup: keep waiting (capped by the watcher's
                     # hard deadline) instead of failing a live agent as
                     # "never ready" after READY_TIMEOUT_MS.
-                    deadline = min(
+                    self._ready_deadline = min(
                         self.deadline,
                         time.monotonic() + READY_TIMEOUT_MS / 1000,
                     )
@@ -771,6 +2120,9 @@ class Watcher:
                         )
             else:
                 if await self._wait_tui_idle():
+                    if await self._gate_veto("tui_idle"):
+                        await anyio.sleep(GATE_POLL_SECS)
+                        continue
                     return "tui_idle"
                 try:
                     last, preview = await self._terminal_snapshot()
@@ -797,12 +2149,34 @@ class Watcher:
                 elif last:
                     silent_ms = time.time() * 1000 - last
                     if any(marker in preview for marker in READY_PREVIEW_MARKERS):
+                        if await self._gate_veto("preview_marker"):
+                            await anyio.sleep(GATE_POLL_SECS)
+                            continue
                         return "preview_marker"
                     if silent_ms >= READY_PREVIEW_SILENCE_MS and (
                             _composer_visible(preview)
                             or any(m in preview for m in READY_SCREEN_MARKERS)):
+                        if await self._gate_veto("preview_marker"):
+                            await anyio.sleep(GATE_POLL_SECS)
+                            continue
                         return "preview_marker"
-                    if silent_ms >= READY_IDLE_STABLE_MS:
+                    if silent_ms >= READY_IDLE_STABLE_MS and self._blockers_acted:
+                        # After keys were pressed on a blocking dialog,
+                        # silence is no proof of an agent: codex exits
+                        # to its shell after applying an update. Only
+                        # agent evidence (ps, tui-idle, markers) may
+                        # release; otherwise the ready deadline rules.
+                        if not idle_ignored:
+                            idle_ignored = True
+                            self._event(
+                                "ready_output_idle_ignored",
+                                message="silent pane after a dialog action; "
+                                        "waiting for agent evidence",
+                            )
+                    elif silent_ms >= READY_IDLE_STABLE_MS:
+                        if await self._gate_veto("output_idle"):
+                            await anyio.sleep(GATE_POLL_SECS)
+                            continue
                         return "output_idle"
             await anyio.sleep(POLL_SECS)
         return None
@@ -824,6 +2198,18 @@ class Watcher:
         except OrcaError:
             return False
         return bool(last) and time.time() * 1000 - last < 60_000
+
+    async def _output_silent(self, quiet_ms: int) -> bool:
+        """Whether the pane has been output-silent for `quiet_ms`.
+
+        An unreadable lastOutputAt counts as not silent: completion is
+        then deferred instead of accepted on blind faith.
+        """
+        try:
+            last = await self._last_output_at()
+        except OrcaError:
+            return False
+        return bool(last) and time.time() * 1000 - last >= quiet_ms
 
     async def _pane_done_state_started(self) -> int:
         """stateStartedAt of the pane's current "done" entry, or 0.
@@ -848,7 +2234,10 @@ class Watcher:
         """Send one prompt and wait for the turn to complete.
 
         Returns the completion source: "ps_done", "tui_idle",
-        "fallback_idle", or one of the failure modes
+        "fallback_idle", "interrupted" (a stop request ended the turn),
+        "blocked" (Orca refused the send because a dialog owns the
+        input; retry after ready), "blocked_stopped" (and automatic
+        handling gave up), or one of the failure modes
         "send_failed"/"timeout"/"terminal_lost"/"no_receipt".
 
         `echo_receipt=False` keeps a verified scrollback echo from
@@ -868,6 +2257,19 @@ class Watcher:
         try:
             confirmed = await self._send_terminal(text)
         except OrcaError as exc:
+            if exc.code == "agent_prompt_blocked":
+                # Orca refused the write: a dialog owns the input. The
+                # prompt never reached the agent, so after the blocker
+                # is handled the caller may safely send it again.
+                self._event(
+                    "turn_send_blocked",
+                    level="WARNING",
+                    message=str(exc),
+                    data={"phase": phase},
+                )
+                outcome = await self._check_blocker(
+                    _blocked_observation(exc), None, None, point="send")
+                return "blocked_stopped" if outcome == "stopped" else "blocked"
             log.error("watcher(%s): send failed: %s", self.agent_id, exc)
             self._event(
                 "turn_send_failed",
@@ -893,17 +2295,17 @@ class Watcher:
             # race, not hidden: the caller is always told, and the
             # turn still completes normally when the prompt landed.
             log.warning(
-                "watcher(%s): prompt written but effect unconfirmed "
-                "(agent_prompt_stalled); receipt window authoritative",
+                "watcher(%s): prompt written but delivery unconfirmed; "
+                "receipt window authoritative",
                 self.agent_id,
             )
             self._event(
                 "prompt_delivery_unconfirmed",
                 level="WARNING",
                 message=(
-                    "Orca could not confirm the prompt took effect "
-                    "(agent_prompt_stalled); the receipt window below "
-                    "is authoritative"
+                    "send confirmation not observed (agent_prompt_stalled "
+                    "or split-send composer echo missed); the receipt "
+                    "window below is authoritative"
                 ),
                 data={"phase": phase},
             )
@@ -964,16 +2366,31 @@ class Watcher:
             sent_at_ms, baseline_state_started, sent_text=text,
             receipt_hint=echo_receipt and echoed is True,
         )
+        self._record_session()
+        tools = self._note_turn_tools(phase)
         self._event(
             "turn_finished",
-            data={"phase": phase, "source": source},
+            data={"phase": phase, "source": source, "tools_observed": tools},
         )
         return source
 
     async def _wait_turn_done(
         self, sent_at_ms: float, baseline_state_started: int = 0,
         sent_text: str = "", receipt_hint: bool = False,
+        absorb_echo: bool = True,
     ) -> str:
+        """Wait for the turn that started at `sent_at_ms` to complete.
+
+        `absorb_echo=False` is for a followed turn: nothing was sent, so
+        the first output after the baseline is the agent's own.
+
+        Also records, for the caller, whether ps tracked the pane this
+        turn (`_turn_tracked`) and reported a tool while it was working
+        (`_turn_tools_seen`); a done row's `toolName` may be the previous
+        turn's and never counts.
+        """
+        self._turn_tracked = False
+        self._turn_tools_seen = False
         try:
             baseline_out = await self._last_output_at()
         except OrcaError:
@@ -985,7 +2402,8 @@ class Watcher:
         # scrollback echo already proves that; ps evidence adds to it.
         receipt = receipt_hint
         sent_flat = one_line(sent_text)
-        echo_absorbed = False
+        echo_absorbed = not absorb_echo
+        pending_done_started = 0  # a done must be observed twice to count
         misses = 0
         activity_observed = False
         ask_notified = False
@@ -995,6 +2413,15 @@ class Watcher:
         while time.monotonic() < self.deadline:
             await anyio.sleep(POLL_SECS)
             self._flush_state()
+
+            # A stopped turn ends on the first sign the agent is no
+            # longer working; normal completion evidence is moot then.
+            if self._stop_requested():
+                reason = await self._stop_settled()
+                if reason:
+                    self._event("stop_settled", data={"reason": reason})
+                    return "interrupted"
+                continue
 
             # Receipt check: a pane Orca tracks must acknowledge the
             # prompt (turn working, fresh done, or the prompt echoed in
@@ -1019,6 +2446,8 @@ class Watcher:
                     f" terminal={self.handle}"
                     " (input may have been swallowed; check that terminal)"
                 )
+                # Name what swallowed it, if a blocking screen did.
+                await self._blocker_probe("receipt")
                 return "no_receipt"
 
             if not echo_absorbed:
@@ -1042,6 +2471,7 @@ class Watcher:
 
             if entry is not None:
                 entry_seen = True
+                self._turn_tracked = True
                 misses = 0
                 if not receipt and sent_flat:
                     # Auxiliary receipt only: ps may mangle non-ASCII
@@ -1058,6 +2488,28 @@ class Watcher:
                 if (state == "done"
                         and state_started >= sent_at_ms - CLOCK_SKEW_MS
                         and state_started > baseline_state_started):
+                    # Completion guards (design §1.5): a foreign session
+                    # reporting under this pane must not end our turn,
+                    # the done must persist across two polls, and the
+                    # pane's output must have gone quiet first.
+                    if _foreign_done(entry, sent_flat):
+                        if pending_done_started != state_started:
+                            pending_done_started = state_started
+                            self._event(
+                                "foreign_done_ignored",
+                                message=(
+                                    "fresh done belongs to another agent "
+                                    "session in this pane (prompt mismatch);"
+                                    " ignored"
+                                ),
+                                data={"state_started_at": state_started},
+                            )
+                        continue
+                    if pending_done_started != state_started:
+                        pending_done_started = state_started
+                        continue
+                    if not await self._output_silent(COMPLETION_SILENCE_MS):
+                        continue
                     self._event(
                         "task_done_observed",
                         data={"source": "ps_done",
@@ -1074,6 +2526,8 @@ class Watcher:
                             data={"source": "ps_working"},
                         )
                     tool = entry.get("toolName") or ""
+                    if tool:
+                        self._turn_tools_seen = True
                     self._update(tool_name=tool)
                     if tool == "AskUserQuestion" and not ask_notified:
                         ask_notified = True
@@ -1092,6 +2546,7 @@ class Watcher:
                             f" terminal={self.handle}"
                             f" no-activity={int(frozen_ms / 1000)}s"
                         )
+                        await self._blocker_probe("stall")
                 continue
 
             if entry_seen:
@@ -1156,6 +2611,8 @@ class Watcher:
         self, final_state: str, source: str, error: str = ""
     ) -> None:
         finished_at = now_iso()
+        # Never leave the machine-wide update lock to its expiry.
+        self._release_update_lock("finalize")
 
         last_msg = ""
         if self.pane:
@@ -1169,6 +2626,7 @@ class Watcher:
         report_payload = {
             "version": 3,
             "event": "task_finished",
+            "jev": {"mode": resolve_mode(self.root)},
             "agent_id": self.agent_id,
             "terminal": self.handle,
             "state": final_state,
@@ -1180,6 +2638,36 @@ class Watcher:
             "last_assistant_message": last_msg,
             "error": error,
         }
+        if self.agent.get("launch_mode") == "supervised":
+            report_payload.update({
+                "launch_mode": "supervised",
+                "dispatch_id": self.agent.get("dispatch_id", ""),
+                "task_id": self.agent.get("task_id", ""),
+                "orchestration_outcome": self.agent.get(
+                    "orchestration_outcome", ""
+                ),
+            })
+        following = bool(self.agent.get("follow_turn"))
+        resuming = bool(self.agent.get("resume_turn"))
+        if following:
+            report_payload["follow_turn"] = True
+        if resuming:
+            report_payload["resume_turn"] = True
+        if self._stop_at:
+            report_payload["stop_requested_at"] = self._stop_at
+        # A task turn that ps tracked but never saw use a tool did no
+        # visible work (plan §3.1): flag it, but it stays `done` and is
+        # never resent — the handoff and workspace are the evidence.
+        warning = ""
+        if self._task_turn_ran:
+            report_payload["tools_observed"] = self._task_tools_observed
+            if final_state == "done" and self._task_tools_observed is False:
+                warning = "no_tool_activity"
+                self._event(
+                    "no_tool_activity",
+                    level="WARNING",
+                    message="task turn finished without any observed tool call",
+                )
         report_path = write_report(self.root, self.agent_id, report_payload)
         log.info("watcher(%s): report written to %s", self.agent_id, report_path)
         self._event(
@@ -1187,13 +2675,27 @@ class Watcher:
             data={"report": str(report_path), "state": final_state, "source": source},
         )
 
-        self._update(
-            state=final_state,
-            phase="",
-            completion_source=source,
-            report_file=str(report_path),
-            finished_at=finished_at,
-        )
+        settled = {
+            "state": final_state,
+            "phase": "",
+            "completion_source": source,
+            "report_file": str(report_path),
+            "finished_at": finished_at,
+        }
+        if following:
+            # The takeover is consumed: a later watcher on this record
+            # must run its own turn, not follow again.
+            settled["follow_turn"] = False
+        if resuming:
+            # Likewise the resume: the next task on this record sends
+            # its own prompt, not RESUME_TEMPLATE.
+            settled["resume_turn"] = False
+        self._update(**settled)
+        # The stop request (if any) is settled with this run.
+        try:
+            clear_stop_request(self.root, self.agent_id)
+        except OSError:
+            pass
 
         if final_state == "error":
             line = (
@@ -1206,6 +2708,8 @@ class Watcher:
                 self.agent_id, self.handle, str(report_path),
                 handoff_file=self.agent.get("handoff_path") or "",
                 summary=last_msg,
+                outcome=str(self.agent.get("orchestration_outcome") or ""),
+                warning=warning,
             )
         await self._notify(line)
         self._event(

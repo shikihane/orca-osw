@@ -29,10 +29,14 @@ def setup_logging(verbose: bool = False) -> None:
 
     level = logging.DEBUG if verbose else logging.INFO
 
+    # Console logs go to stderr: stdout carries command results, some of
+    # them machine-readable JSON (`list --json`, `enroll`, `guard`).
     try:
+        from rich.console import Console
         from rich.logging import RichHandler
 
         handler = RichHandler(
+            console=Console(stderr=True),
             show_time=True,
             show_path=False,
             rich_tracebacks=True,
