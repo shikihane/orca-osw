@@ -210,6 +210,8 @@ The guardian gets one `# [osw] blocked agent=<id> kind=<kind> terminal=<handle> 
 
 The watcher notes whether `worktree ps` reported a tool (`toolName`) while each turn was working; a done row's `toolName` can be the previous turn's and does not count. A task turn (or a followed turn) that ps tracked but that never showed a tool is reported with `tools_observed: false` and `warning=no_tool_activity` in the `task-finished` line. It stays `done` and is not resent; the agent may have answered in text only, so check the handoff and workspace. `tools_observed` is `true` when a tool was seen and `null` when ps never tracked the pane.
 
+If `worktree ps` shows the agent's prompt starting partway into what was sent, the head of the prompt was lost on the way in. The watcher sends `# [osw] prompt-truncated ... received_from=<n>` right away, and the report gets `prompt_truncated_at` and `warning=prompt_truncated`. Nothing is resent; dispatch the task again. Claude prompts are sent as a bracketed paste, because Claude Code on Windows otherwise keeps only the text after char 2048.
+
 ### Worker questions
 
 A supervised worker's unanswered orchestration messages of type `question` (from `orchestration ask`) and `escalation` reach the guardian once per message id as `# [osw] ask agent=<id> message=<msg-id> reply="orca orchestration reply --id <msg-id> --body <text>" text=<question>`; relayed ids are kept in `notified_asks`. On Windows, `orca.cmd` refuses `orchestration reply`; use the Orca installation's `resources\bin\orca.exe` for it.

@@ -94,6 +94,10 @@ Notifications to expect besides `task-finished` / `task-error`:
 - `task-finished ... warning=no_tool_activity` — the turn showed no tool
   call in Orca's view; it is still `done`, so verify the handoff and the
   workspace before accepting.
+- `# [osw] prompt-truncated agent=<id> ... received_from=<n>` (and
+  `task-finished ... warning=prompt_truncated`) — the agent got only the
+  prompt from char `<n>` on; it worked on a fragment and nothing was
+  resent. `stop` it, then send the full task again.
 - `task-error ... reason=blocked` — a dialog kept refusing the prompt.
 
 ## Invariants

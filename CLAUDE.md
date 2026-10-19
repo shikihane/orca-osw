@@ -122,6 +122,14 @@ Module responsibilities (keep code in its lane):
   with `false` gets `tools_observed: false` in the report, a
   `no_tool_activity` event and `warning=no_tool_activity` in the
   `task-finished` line — never a resend or a state change.
+  Prompt truncation: a ps `prompt` (Orca keeps its first 200 chars)
+  found inside the sent text past offset 0 (`_prompt_truncated_at`,
+  ASCII only) means the head never arrived; `_check_truncation` records
+  `prompt_truncated`, notifies `# [osw] prompt-truncated ...
+  received_from=<n>` once per turn even on tracked panes, and a task
+  turn's report gets `prompt_truncated_at` plus
+  `warning=prompt_truncated` (outranks `no_tool_activity`) — never a
+  resend or a state change.
 - `skill/osw/orca_cli.py` — thin async wrapper around `orca ... --json` via
   `anyio.run_process`; raises `OrcaError`. Caller-terminal detection prints a
   UUID marker and finds which terminal's preview contains it (`terminal show`
@@ -290,7 +298,9 @@ state.
   single-shot send stalls the full 8s. OSW sends claude in two stages
   instead (`watcher.SPLIT_SEND_PROVIDERS`): raw text write without
   `--enter`, a bounded `terminal read --screen` echo wait, then `--enter`
-  alone.
+  alone. The raw write must be a bracketed paste (`watcher._paste_payload`,
+  as Orca's agent-prompt send does): unbracketed, Claude Code on Windows
+  keeps only the text after char 2048. Slash commands stay unbracketed.
 - `orca worktree ps --json` fields per agent: `state`, `prompt`, `toolName`,
   `lastAssistantMessage`, `paneKey`, `stateStartedAt`, `updatedAt`.
 

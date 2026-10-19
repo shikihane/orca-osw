@@ -198,6 +198,8 @@ OSW 自己只会向终端输入四类内容：收尾指令 `watcher.HANDOFF_TEMP
 
 watcher 记录每一轮在 `working` 期间 `worktree ps` 是否报告过工具调用（`toolName`）；`done` 条目上的 `toolName` 可能是上一轮留下的，不计入。ps 追踪到了、但从未出现工具调用的任务轮（包括被接手的那一轮），report 写 `tools_observed: false`，`task-finished` 通知行追加 `warning=no_tool_activity`。状态仍为 `done`，不会自动重发；agent 可能只是用文字作答，请核对 handoff 和工作区。看到工具调用时为 `true`，ps 从未追踪该面板时为 `null`。
 
+如果 `worktree ps` 显示 agent 收到的 prompt 是从已发送文本的中间开始的，说明 prompt 开头在传输中丢了。watcher 会立即发出 `# [osw] prompt-truncated ... received_from=<n>`，report 写入 `prompt_truncated_at` 和 `warning=prompt_truncated`。不会自动重发，请重新派发任务。发给 Claude 的 prompt 以 bracketed paste 形式写入，否则 Windows 上的 Claude Code 只保留第 2048 个字符之后的内容。
+
 ### worker 提问转发
 
 supervised worker 未回复的编排消息（`orchestration ask` 产生的 `question` 类型，以及 `escalation`）会按消息 id 各转给监护方一次：`# [osw] ask agent=<id> message=<消息 id> reply="orca orchestration reply --id <消息 id> --body <文本>" text=<问题>`；已转发的 id 记录在 `notified_asks`。Windows 上 `orca.cmd` 不允许执行 `orchestration reply`，请改用 Orca 安装目录下的 `resources\bin\orca.exe`。

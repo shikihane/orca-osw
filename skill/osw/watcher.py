@@ -175,9 +175,22 @@ HANDOFF_FALLBACK_POLL_SECS = 2.0   # wrap-up fallback: file stability cadence
 # then send Enter alone. A confirmation timeout still sends the Enter —
 # "force submit at deadline", the same semantics as Orca's gate, with
 # the cap at 2s instead of 8s — and the text is never resent.
+#
+# The text goes out as one bracketed paste, as Orca's own agent-prompt
+# send writes it: unbracketed, Claude Code takes the raw keystrokes for
+# a paste and on Windows keeps only what follows char 2048 (reproduced
+# with Claude Code 2.1.281 on Orca 1.4.221; a 9052-char bracketed paste
+# arrives whole). Slash commands stay raw — pasted, they are plain text.
 SPLIT_SEND_PROVIDERS = ("claude",)   # codex shares the gate; its TUI is unverified here
 SPLIT_SEND_CONFIRM_SECS = 2.0        # bounded composer-echo wait after the paste
 SPLIT_SEND_POLL_SECS = 0.5           # --screen poll interval inside that wait
+PASTE_START = "\x1b[200~"
+PASTE_END = "\x1b[201~"
+
+# A ps `prompt` (the first ~200 chars of what the agent received) found
+# inside the sent text at an offset > 0 means the head never arrived.
+# The probe must be long enough that a chance match is impossible.
+TRUNCATION_PROBE_CHARS = 32
 
 # Completion attribution guards (design §1.5): a fresh "done" is only
 # accepted after it survives all three — it must not belong to a foreign
@@ -387,6 +400,36 @@ def _foreign_done(entry: dict, sent_flat: str) -> bool:
     return not _shares_run(reported, sent_flat)
 
 
+def _paste_payload(text: str) -> str:
+    """`text` as one bracketed paste; slash commands stay raw.
+
+    ESC bytes are dropped from the body so no embedded sequence can end
+    the paste early.
+    """
+    if text.startswith("/"):
+        return text
+    return PASTE_START + text.replace("\x1b", "") + PASTE_END
+
+
+def _prompt_truncated_at(entry: dict, sent_flat: str) -> int:
+    """Offset where the agent's received prompt starts inside what we
+    sent, when that is past the start; 0 otherwise.
+
+    ps keeps the head of the prompt the agent received. If that head is
+    found later in our text, everything before it was lost on the way
+    in. Only pure-ASCII ps prompts are judged (CJK may read back
+    mangled on Windows), and only with a probe long enough to rule out a
+    chance match; anything else proves nothing and yields 0.
+    """
+    reported = one_line(str(entry.get("prompt") or ""))
+    if len(reported) < TRUNCATION_PROBE_CHARS or not reported.isascii():
+        return 0
+    probe = reported[:TRUNCATION_PROBE_CHARS]
+    if not sent_flat or sent_flat.startswith(probe):
+        return 0
+    return max(sent_flat.find(probe), 0)
+
+
 def _unusable_echo_surface(tail: list[str], retained: int | None) -> str | None:
     """Why `tail` cannot host a conversation echo, or None if it can.
 
@@ -556,6 +599,10 @@ class Watcher:
         self._turn_tools_seen = False
         self._task_turn_ran = False
         self._task_tools_observed: bool | None = None
+        # Prompt truncation: offset the agent's prompt started at, per
+        # turn and for the task turn's report (0 = not truncated).
+        self._turn_truncated_at = 0
+        self._task_truncated_at = 0
 
     def _update(self, **fields) -> None:
         changed = False
@@ -1173,21 +1220,23 @@ class Watcher:
     async def _split_send(self, text: str) -> bool:
         """Two-stage send for renderGate providers (design §12.4-1).
 
-        Stage 1 writes the text without Enter (raw `sendTerminal` path,
-        no renderGate); stage 2 waits a bounded SPLIT_SEND_CONFIRM_SECS
-        for the composer echo; stage 3 sends Enter alone. On a
+        Stage 1 writes the text as a bracketed paste without Enter (raw
+        `sendTerminal` path, no renderGate); stage 2 waits a bounded
+        SPLIT_SEND_CONFIRM_SECS for the composer echo; stage 3 sends
+        Enter alone. On a
         confirmation timeout the Enter is still sent and False is
         returned — delivery is then judged by the receipt window, and
         because the text is never resent, a slow render can at worst
         submit an empty composer, never double-submit the prompt.
         """
+        payload = _paste_payload(text)
         try:
-            first = await terminal_send(self.handle, text, enter=False)
+            first = await terminal_send(self.handle, payload, enter=False)
         except OrcaError as exc:
             if exc.code != "terminal_handle_stale" \
                     or not await self._rebind_terminal():
                 raise
-            first = await terminal_send(self.handle, text, enter=False)
+            first = await terminal_send(self.handle, payload, enter=False)
         if _send_accepted(first) is False:
             raise OrcaError(
                 "terminal send refused (accepted=false)",
@@ -2387,11 +2436,42 @@ class Watcher:
         )
         self._record_session()
         tools = self._note_turn_tools(phase)
+        if phase == "task":
+            self._task_truncated_at = self._turn_truncated_at
         self._event(
             "turn_finished",
             data={"phase": phase, "source": source, "tools_observed": tools},
         )
         return source
+
+    async def _check_truncation(self, entry: dict, sent_flat: str) -> None:
+        """Alarm once per turn when ps shows only the prompt's tail.
+
+        Unlike the echo checks this is positive evidence, so it alarms
+        on tracked panes too. It never resends — the agent is already
+        working on the fragment — and the turn completes as usual; the
+        report carries the offset.
+        """
+        cut = _prompt_truncated_at(entry, sent_flat)
+        if not cut:
+            return
+        self._turn_truncated_at = cut
+        log.error(
+            "watcher(%s): agent received the prompt from char %d of %d",
+            self.agent_id, cut, len(sent_flat),
+        )
+        self._event(
+            "prompt_truncated",
+            level="ERROR",
+            message="agent received only the tail of the prompt",
+            data={"received_from": cut, "chars": len(sent_flat)},
+        )
+        await self._notify(
+            f"# [osw] prompt-truncated agent={self.agent_id}"
+            f" terminal={self.handle} received_from={cut}"
+            f" chars={len(sent_flat)}"
+            " (the head never reached the agent; not resent)"
+        )
 
     async def _wait_turn_done(
         self, sent_at_ms: float, baseline_state_started: int = 0,
@@ -2410,6 +2490,7 @@ class Watcher:
         """
         self._turn_tracked = False
         self._turn_tools_seen = False
+        self._turn_truncated_at = 0
         try:
             baseline_out = await self._last_output_at()
         except OrcaError:
@@ -2504,6 +2585,11 @@ class Watcher:
                         receipt = True
                 state = entry.get("state")
                 state_started = int(entry.get("stateStartedAt") or 0)
+                # Only a row from this turn: a stale one still carries
+                # the previous turn's prompt.
+                if sent_flat and not self._turn_truncated_at \
+                        and state_started >= sent_at_ms - CLOCK_SKEW_MS:
+                    await self._check_truncation(entry, sent_flat)
                 if (state == "done"
                         and state_started >= sent_at_ms - CLOCK_SKEW_MS
                         and state_started > baseline_state_started):
@@ -2687,6 +2773,11 @@ class Watcher:
                     level="WARNING",
                     message="task turn finished without any observed tool call",
                 )
+        # A truncated task prompt outranks the tool warning: it is the
+        # likely reason the turn did nothing.
+        if self._task_truncated_at:
+            report_payload["prompt_truncated_at"] = self._task_truncated_at
+            warning = "prompt_truncated"
         report_path = write_report(self.root, self.agent_id, report_payload)
         log.info("watcher(%s): report written to %s", self.agent_id, report_path)
         self._event(

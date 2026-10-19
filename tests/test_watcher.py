@@ -11,7 +11,10 @@ import pytest
 
 from osw import state
 from osw.orca_cli import OrcaError
-from osw.watcher import Watcher, _foreign_done, format_completion_report, main, one_line
+from osw.watcher import (
+    Watcher, _foreign_done, _prompt_truncated_at, format_completion_report,
+    main, one_line,
+)
 
 
 @pytest.fixture
@@ -2387,8 +2390,49 @@ async def test_split_send_writes_confirms_then_enters(tmp_path):
         {"enter": False}, {"enter": True},
     ]
     assert [c.args for c in sends.await_args_list] == [
-        ("term-a", "do the task now"), ("term-a", ""),
+        ("term-a", "[200~do the task now[201~"), ("term-a", ""),
     ]
+
+
+@pytest.mark.anyio
+async def test_split_send_long_prompt_is_one_bracketed_paste(tmp_path):
+    """A raw (unbracketed) write over 2048 chars reaches Claude Code as
+    keystrokes it mistakes for a paste, keeping only the text after
+    char 2048. The whole prompt must go out as one bracketed paste,
+    with embedded ESC bytes stripped so they cannot end it early."""
+    watcher = _claude_agent(tmp_path)
+    sends = AsyncMock(return_value={"result": {"send": {"accepted": True}}})
+    reads = AsyncMock(return_value={
+        "result": {"terminal": {"source": "screen",
+                                "tail": ["❯ [Pasted text #1]"]}},
+    })
+    prompt = "Repo X. ISSUE 1: " + "y" * 2400 + "[201~ tail"
+
+    with patch("osw.watcher.terminal_send", sends),          patch("osw.watcher.terminal_read", reads),          patch("osw.watcher.SPLIT_SEND_CONFIRM_SECS", 0.05),          patch("osw.watcher.SPLIT_SEND_POLL_SECS", 0):
+        confirmed = await watcher._send_terminal(prompt)
+
+    assert confirmed is True
+    written = sends.await_args_list[0].args[1]
+    assert written == (
+        "[200~" + prompt.replace("", "") + "[201~"
+    )
+    assert written.count("") == 2
+
+
+@pytest.mark.anyio
+async def test_split_send_types_slash_commands_raw(tmp_path):
+    """A pasted `/command` is plain text to Claude Code; slash commands
+    keep the raw write so they still run."""
+    watcher = _claude_agent(tmp_path)
+    sends = AsyncMock(return_value={"result": {"send": {"accepted": True}}})
+    reads = AsyncMock(return_value={
+        "result": {"terminal": {"source": "screen", "tail": ["❯ /compact"]}},
+    })
+
+    with patch("osw.watcher.terminal_send", sends),          patch("osw.watcher.terminal_read", reads),          patch("osw.watcher.SPLIT_SEND_CONFIRM_SECS", 0.05),          patch("osw.watcher.SPLIT_SEND_POLL_SECS", 0):
+        await watcher._send_terminal("/compact")
+
+    assert sends.await_args_list[0].args == ("term-a", "/compact")
 
 
 @pytest.mark.anyio
@@ -2468,6 +2512,94 @@ def test_foreign_done_helper_rules():
     # CJK or empty ps prompts are never judged
     assert not _foreign_done({"prompt": "任务（实现）"}, "do the task")
     assert not _foreign_done({}, "do the task")
+
+
+def test_prompt_truncated_at_helper_rules():
+    sent = "".join(f"[{i:04d}]" for i in range(0, 2400, 6))
+    # ps keeps the first 200 chars of what the agent received
+    assert _prompt_truncated_at({"prompt": sent[:200]}, sent) == 0
+    assert _prompt_truncated_at({"prompt": sent[2048:2248]}, sent) == 2048
+    # someone else's prompt, a CJK (maybe mangled) one, or a too-short
+    # fragment proves nothing
+    assert _prompt_truncated_at(
+        {"prompt": "Reply with exactly one word: OK"}, sent) == 0
+    assert _prompt_truncated_at(
+        {"prompt": "任务" + sent[2048:2100]}, sent) == 0
+    assert _prompt_truncated_at({"prompt": sent[2048:2060]}, sent) == 0
+    assert _prompt_truncated_at({}, sent) == 0
+
+
+@pytest.mark.anyio
+async def test_truncated_prompt_is_reported_even_on_a_tracked_pane(tmp_path):
+    """ps shows the agent received only the prompt's tail: alarm the
+    caller once, never resend, and let the turn complete normally."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "caller_terminal": "term-caller",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 2
+
+    sent = "".join(f"[{i:04d}]" for i in range(0, 2400, 6))
+    entry = _ps_result("tab-a:leaf-b", "done", int(time.time() * 1000))
+    entry[0]["agents"][0]["prompt"] = sent[2048:2248]
+    show = AsyncMock(return_value={"result": {"terminal": {
+        "lastOutputAt": int(time.time() * 1000) - 10_000,
+    }}})
+    send = AsyncMock(return_value={})
+
+    with patch("osw.watcher.terminal_show", show),          patch("osw.watcher.worktree_ps", AsyncMock(return_value=entry)),          patch("osw.watcher.terminal_send", send),          patch("osw.watcher.POLL_SECS", 0):
+        result = await watcher._wait_turn_done(
+            time.time() * 1000 - 1000, sent_text=sent,
+        )
+
+    assert result == "ps_done"
+    assert watcher._turn_truncated_at == 2048
+    alarms = [c.args for c in send.await_args_list]
+    assert len(alarms) == 1
+    assert alarms[0][0] == "term-caller"
+    assert "prompt-truncated agent=agent_001" in alarms[0][1]
+    assert "received_from=2048" in alarms[0][1]
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8")
+    assert events.count('"event": "prompt_truncated"') == 1
+
+
+@pytest.mark.anyio
+async def test_stale_ps_row_is_not_judged_for_truncation(tmp_path):
+    """A row from before the send still carries the previous turn's
+    prompt, which may well appear inside the new one."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 0.05
+
+    previous = "Investigate the boot-time guard in the recorder service"
+    entry = _ps_result("tab-a:leaf-b", "done",
+                       int(time.time() * 1000) - 600_000)
+    entry[0]["agents"][0]["prompt"] = previous
+    show = AsyncMock(return_value={"result": {"terminal": {
+        "lastOutputAt": int(time.time() * 1000) - 10_000,
+    }}})
+
+    with patch("osw.watcher.terminal_show", show),          patch("osw.watcher.worktree_ps", AsyncMock(return_value=entry)),          patch("osw.watcher.POLL_SECS", 0):
+        await watcher._wait_turn_done(
+            time.time() * 1000,
+            sent_text="Follow-up on: " + previous + ", now add tests",
+        )
+
+    assert watcher._turn_truncated_at == 0
 
 
 @pytest.mark.anyio
@@ -4913,18 +5045,19 @@ async def test_stale_tool_name_on_a_done_row_is_not_activity(tmp_path):
     assert watcher._turn_tools_seen is False
 
 
-def _fake_wait(task_tracked, task_tools):
+def _fake_wait(task_tracked, task_tools, task_truncated_at=0):
     """A _wait_turn_done stand-in setting the per-turn observation flags:
     the task turn as given, the handoff turn with tools (it writes a file)."""
     async def fake(self, sent_at_ms, baseline=0, sent_text="", **_):
         handoff = sent_text.startswith("Task wrap-up:")
         self._turn_tracked = True if handoff else task_tracked
         self._turn_tools_seen = True if handoff else task_tools
+        self._turn_truncated_at = 0 if handoff else task_truncated_at
         return "ps_done"
     return fake
 
 
-async def _run_task_with(tmp_path, tracked, tools):
+async def _run_task_with(tmp_path, tracked, tools, truncated_at=0):
     watcher = _turn_agent(tmp_path)
     sends = AsyncMock(return_value=True)
     notify = AsyncMock(return_value={})
@@ -4932,7 +5065,8 @@ async def _run_task_with(tmp_path, tracked, tools):
          patch.object(Watcher, "_phase0_ready_wait", AsyncMock()), \
          patch.object(Watcher, "_send_terminal", sends), \
          patch.object(Watcher, "_verify_prompt_echo", AsyncMock(return_value=None)), \
-         patch.object(Watcher, "_wait_turn_done", _fake_wait(tracked, tools)), \
+         patch.object(Watcher, "_wait_turn_done",
+                      _fake_wait(tracked, tools, truncated_at)), \
          patch("osw.watcher._handoff_ok", lambda path: True), \
          patch("osw.watcher.terminal_send", notify), \
          patch("osw.watcher.worktree_ps", AsyncMock(return_value=[])):
@@ -4955,6 +5089,17 @@ async def test_task_turn_without_tool_activity_is_flagged_not_resent(tmp_path):
     assert len(finished) == 1 and "warning=no_tool_activity" in finished[0]
     assert sends.await_count == 2          # task + handoff, never a resend
     assert "no_tool_activity" in _event_names(tmp_path)
+
+
+@pytest.mark.anyio
+async def test_truncated_task_prompt_is_flagged_in_the_report(tmp_path):
+    agent, report, finished, sends = await _run_task_with(
+        tmp_path, tracked=True, tools=False, truncated_at=2048)
+
+    assert agent["state"] == "done"
+    assert report["prompt_truncated_at"] == 2048
+    assert len(finished) == 1 and "warning=prompt_truncated" in finished[0]
+    assert sends.await_count == 2          # task + handoff, never a resend
 
 
 @pytest.mark.anyio

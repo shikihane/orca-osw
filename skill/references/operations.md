@@ -308,7 +308,13 @@ agent may have only answered in text. The report then has
 `tools_observed: false`; the state is still `done` and nothing is resent —
 check the handoff and the workspace before accepting. `tools_observed` is
 `true` when a tool was seen and `null` when ps never tracked the pane, in
-which case nothing is claimed. A
+which case nothing is claimed.
+`prompt-truncated ... received_from=<n>` (and `warning=prompt_truncated`,
+which outranks `no_tool_activity`) means `worktree ps` showed the agent's
+prompt starting at char `<n>` of what was sent: the head never arrived.
+The report has `prompt_truncated_at: <n>`; the state is still `done` and
+nothing is resent — the result answers a fragment, so dispatch the task
+again. A
 followed turn (`guard`) sends no handoff; `already_done` means the turn had
 already finished when the watcher took over.
 
