@@ -2230,9 +2230,11 @@ async def test_send_stalled_proceeds_to_turn_supervision(tmp_path):
     """`agent_prompt_stalled` means the write landed but Orca saw no
     fresh idle->working edge within its short window (the prompt
     arrived at a TUI that was not ready for it yet). Not a send
-    failure: the turn proceeds to the receipt window, which is
-    authoritative — but the caller is always told, never silently
-    swallowed."""
+    failure: the turn proceeds to the receipt window. On a ps-tracked
+    pane that window is authoritative (a swallowed prompt fails closed
+    as no_receipt with its own notification), so the unconfirmed send
+    is only logged — the caller is not alarmed for a prompt that may
+    well have landed."""
     state.init_state_dir(tmp_path)
     state.write_agent(tmp_path, {
         "agent_id": "agent_001",
@@ -2263,12 +2265,12 @@ async def test_send_stalled_proceeds_to_turn_supervision(tmp_path):
     sent = [call.args[1] for call in send.await_args_list]
     assert sent[0] == "do the task"  # prompt sent once, never resent
     assert sent.count("do the task") == 1
-    assert any("prompt-delivery-unconfirmed" in line for line in sent[1:])
+    assert not any("prompt-delivery-unconfirmed" in line for line in sent)
     events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
         encoding="utf-8"
     )
     assert events.count('"event": "prompt_delivery_unconfirmed"') == 1
-    assert '"level": "WARNING"' in events
+    assert '"level": "WARNING"' not in events
     assert '"event": "turn_send_failed"' not in events
 
 
@@ -2310,6 +2312,7 @@ async def test_send_stalled_on_untracked_pane_notifies(tmp_path):
         encoding="utf-8"
     )
     assert events.count('"event": "prompt_delivery_unconfirmed"') == 1
+    assert '"level": "WARNING"' in events
     assert '"event": "turn_send_failed"' not in events
 
 

@@ -294,6 +294,7 @@ reply with the Orca installation's `resources\bin\orca.exe` instead.
 | `agent-waiting` | Answer the worker directly in its terminal. |
 | `agent-busy` | Informational: the pane was still finishing previous work at dispatch; the ready wait is extended and the prompt goes out once the pane becomes ready. |
 | `agent-stalled` | Inspect `logs`, then inspect the terminal before intervening. |
+| `prompt-delivery-unconfirmed` | Sent only for a pane `worktree ps` does not track: the prompt was written but its send confirmation was not observed. Check that terminal. On tracked panes this is only logged; the receipt window decides, and a swallowed prompt fails as `no_receipt` with its own notification. |
 | `blocked` | A dialog owns the worker's input (`kind=`, `screen=` excerpt). Answer it in that terminal unless OSW is handling it; `stopped` means automatic handling gave up. |
 | `ask` | A supervised worker asked a question; answer with the given `orchestration reply` command. |
 | `task-finished` | Open the report and handoff; move the task to acceptance. |

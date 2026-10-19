@@ -49,10 +49,12 @@ Orca's send-time effect confirmation is held to the same standard:
 `agent_prompt_stalled` means the write landed but Orca saw no fresh
 idle->working edge within its short window — typical for a prompt
 arriving at a TUI that is already "working" (a fresh Claude Code
-session still on its startup turn). The turn proceeds to the receipt
-window, which is authoritative; only genuine write failures
-(`terminal_not_writable`, unrecoverable stale handle, a permission
-modal swallowing the input) fail the send.
+session still on its startup turn) — and so is a split send whose
+composer-echo wait elapsed. The turn proceeds to the receipt window,
+which is authoritative: like the echo miss, an unconfirmed send
+alarms the caller only on a pane ps does not track. Only genuine
+write failures (`terminal_not_writable`, unrecoverable stale handle,
+a permission modal swallowing the input) fail the send.
 
 CLIs Orca does not recognize (no `agents` entry in `worktree ps`)
 fall back to lastOutputAt idle detection. That fallback never counts
@@ -2284,37 +2286,54 @@ class Watcher:
             data={"phase": phase, "chars": len(text)},
         )
         if not confirmed:
-            # The write landed but Orca's effect confirmation timed
-            # out (agent_prompt_stalled): a fresh TUI (or one still on
-            # its startup turn) accepted the prompt without a fresh
-            # idle->working edge within Orca's short window, so Orca
-            # could not confirm delivery even though the write
-            # succeeded. Not a send failure — the receipt window below
-            # is authoritative and fails closed as no_receipt if the
-            # prompt truly never arrived. This is a known Orca-side
-            # race, not hidden: the caller is always told, and the
-            # turn still completes normally when the prompt landed.
-            log.warning(
-                "watcher(%s): prompt written but delivery unconfirmed; "
-                "receipt window authoritative",
-                self.agent_id,
-            )
-            self._event(
-                "prompt_delivery_unconfirmed",
-                level="WARNING",
-                message=(
-                    "send confirmation not observed (agent_prompt_stalled "
-                    "or split-send composer echo missed); the receipt "
-                    "window below is authoritative"
-                ),
-                data={"phase": phase},
-            )
-            await self._notify(
-                f"# [osw] prompt-delivery-unconfirmed agent={self.agent_id}"
-                f" terminal={self.handle}"
-                " (Orca send-confirm timed out; prompt was written,"
-                " turn continues under receipt supervision)"
-            )
+            # The write landed but its confirmation was not observed:
+            # Orca's effect confirmation timed out (agent_prompt_stalled
+            # — a TUI still on its startup turn accepted the prompt
+            # without a fresh idle->working edge), or the split send's
+            # bounded composer-echo wait elapsed before a long paste
+            # rendered. Not a send failure. Same policy as the echo
+            # miss below: on a ps-tracked pane the receipt window is
+            # authoritative and a genuinely swallowed prompt fails
+            # closed as no_receipt with its own notification, so this
+            # is only logged; a pane ps does not track has no receipt
+            # window, so the caller is told there.
+            if self.pane is None:
+                log.warning(
+                    "watcher(%s): prompt written but delivery unconfirmed",
+                    self.agent_id,
+                )
+                self._event(
+                    "prompt_delivery_unconfirmed",
+                    level="WARNING",
+                    message=(
+                        "send confirmation not observed (agent_prompt_"
+                        "stalled or split-send composer echo missed); "
+                        "pane is not ps-tracked"
+                    ),
+                    data={"phase": phase},
+                )
+                await self._notify(
+                    f"# [osw] prompt-delivery-unconfirmed agent={self.agent_id}"
+                    f" terminal={self.handle}"
+                    " (send confirmation not observed; prompt was written,"
+                    " check that terminal)"
+                )
+            else:
+                log.info(
+                    "watcher(%s): prompt written but delivery unconfirmed; "
+                    "receipt window authoritative",
+                    self.agent_id,
+                )
+                self._event(
+                    "prompt_delivery_unconfirmed",
+                    message=(
+                        "send confirmation not observed (agent_prompt_"
+                        "stalled or split-send composer echo missed); "
+                        "pane is ps-tracked, so the receipt window is "
+                        "authoritative"
+                    ),
+                    data={"phase": phase},
+                )
         # Belt-and-suspenders against a swallowed prompt (modal dialog,
         # login screen): the text must be visible in the terminal's
         # scrollback afterwards. A miss only alarms — it never resends:
