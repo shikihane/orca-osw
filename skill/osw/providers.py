@@ -22,6 +22,7 @@ KNOWN_AGENT_CLIS = [
     "omp",
     "kimi",
     "grok",
+    "dsh-tui",
     "gemini",
     "aider",
     "goose",
@@ -38,7 +39,7 @@ def _quote_command_arg(value: str) -> str:
     return subprocess.list2cmdline([value])
 
 
-SUPPORTED_PROVIDERS = ("claude", "codex", "pi", "omp", "kimi", "grok")
+SUPPORTED_PROVIDERS = ("claude", "codex", "pi", "omp", "kimi", "grok", "dsh")
 PROVIDER_AUTONOMY_FLAGS = {
     "claude": ("--dangerously-skip-permissions",),
     "codex": ("--dangerously-bypass-approvals-and-sandbox",),
@@ -49,11 +50,30 @@ PROVIDER_AUTONOMY_FLAGS = {
     # it records the folder grant (~/.grok/trusted_folders.toml), so grok
     # needs no ensure_workspace_trust pre-record.
     "grok": ("--always-approve", "--trust"),
+    # DSH-TUI takes no approval flag at launch: its permission preset
+    # (read-only / workspace-write / danger-full-access) is a DSH setting,
+    # switched in the TUI with /permission. The launch carries none, and
+    # `_provider_args` refuses --model/--thinking for the same reason.
+    "dsh": (),
 }
 
 
 class ProviderError(ValueError):
     pass
+
+
+# Orca agent names that differ from the OSW provider they stand for.
+# DSH is the one divergence observed: Orca's `worktree ps` rows and hook
+# status name the TUI launcher (`dsh-tui`, its detectCmd), while the
+# provider OSW launches and tracks is `dsh`. Enrolling such a pane or
+# passing the Orca name to `new` must land on the supported provider.
+PROVIDER_ALIASES = {"dsh-tui": "dsh"}
+
+
+def normalize_provider(name: str) -> str:
+    """OSW provider for an Orca/CLI agent name (or the name itself)."""
+    key = (name or "").strip().lower()
+    return PROVIDER_ALIASES.get(key, key)
 
 
 # Providers OSW launches through Orca's supervised orchestration
@@ -67,7 +87,7 @@ SUPERVISED_PROVIDERS = {"omp": "omp"}
 
 def supervised_agent_id(provider: str) -> str | None:
     """Orca agent id when OSW launches this provider supervised."""
-    return SUPERVISED_PROVIDERS.get(provider.strip())
+    return SUPERVISED_PROVIDERS.get(normalize_provider(provider))
 
 
 def validate_supervised_args(
@@ -113,7 +133,9 @@ def resume_command(
 
     Same autonomy and model arguments as `build_provider_command`, plus
     each CLI's resume syntax (codex's is a subcommand, so it follows the
-    binary directly). kimi session ids carry a `session_` prefix.
+    binary directly). kimi session ids carry a `session_` prefix; dsh
+    resumes with the launcher's `--resume` flag after its target, which
+    the launcher accepts in any position.
     """
     args = resume_args(provider, session_id, model, thinking)
     return " ".join(_quote_command_arg(arg) for arg in args)
@@ -126,7 +148,7 @@ def resume_args(
     thinking: str | None = None,
 ) -> list[str]:
     """argv of `resume_command`, for quoting into a particular shell."""
-    provider = provider.strip()
+    provider = normalize_provider(provider)
     session_id = (session_id or "").strip()
     if not session_id:
         raise ProviderError("a session id is required to resume a session")
@@ -185,6 +207,7 @@ def _provider_args(
     thinking: str | None,
 ) -> list[str]:
     """argv for a provider TUI launch: binary, autonomy, model flags."""
+    provider = normalize_provider(provider)
     model = (model or "").strip() or None
     thinking = (thinking or "").strip() or None
     if provider not in SUPPORTED_PROVIDERS:
@@ -192,6 +215,9 @@ def _provider_args(
         raise ProviderError(
             f"unsupported provider '{provider}' (expected one of: {expected})"
         )
+
+    if provider == "dsh":
+        return _dsh_args(model, thinking)
 
     args = [provider, *PROVIDER_AUTONOMY_FLAGS[provider]]
     if provider == "codex":
@@ -221,6 +247,29 @@ def _provider_args(
             flag = "--effort" if provider == "claude" else "--thinking"
             args += [flag, thinking]
     return args
+
+
+def _dsh_args(model: str | None, thinking: str | None) -> list[str]:
+    """argv for the DSH-TUI launch.
+
+    `dsh-tui` is the DeepSeek Harness TUI launcher: it resolves its own
+    profile (`~/.dsh/profiles/dsh-tui`) and forwards everything else to
+    the app. It is the entry Orca itself launches and recognises
+    (`dsh-tui .`, agent id `dsh`), so OSW starts the same pane identity.
+    The trailing `.` is the workspace target the launcher accepts.
+
+    DSH exposes no launch flag for model, effort or approvals — those
+    live in DSH settings and change live in the TUI (`/model`,
+    `/permission`) — so a --model/--thinking value here could only be
+    dropped silently. Refuse it instead, as kimi does for effort.
+    """
+    if model or thinking:
+        raise ProviderError(
+            "provider 'dsh' has no model or effort launch flag; its model, "
+            "effort and permission preset live in DSH settings and change "
+            "inside the TUI (/model, /permission) — drop --model/--thinking"
+        )
+    return ["dsh-tui", "."]
 
 
 def ensure_workspace_trust(provider: str, root: Path) -> str:
@@ -331,6 +380,10 @@ def probe_variants(name: str, path: str | None = None) -> list[dict]:
     instead of typing. codex always lists bare first because its
     discovered variants pin a reasoning effort, never the defaults.
     """
+    if name == "dsh":
+        # `new dsh` launches the TUI launcher, not the `dsh` harness, so
+        # that is the binary whose presence matters here.
+        return dsh_variants() if (path or shutil.which("dsh-tui")) else []
     exe = path or shutil.which(name)
     if exe is None:
         return []
@@ -350,6 +403,16 @@ def probe_variants(name: str, path: str | None = None) -> list[dict]:
     if name == "grok":
         return parse_grok_models(_run_capture([exe, "models"])) or bare
     return bare
+
+
+def dsh_variants() -> list[dict]:
+    """The single selectable dsh launch: DSH's own default model.
+
+    DSH's TUI entry takes no model or effort flag, so listing variants
+    would advertise flags the launch cannot carry. The model is picked
+    inside the TUI (`/model`) and persisted by DSH itself.
+    """
+    return [{"name": "dsh-default", "command": "dsh-tui ."}]
 
 
 # The valid values of codex's model_reasoning_effort config key.

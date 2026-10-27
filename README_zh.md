@@ -62,13 +62,14 @@ python skill/osw.py status
 
 ### 选项
 
-- `new` 的 provider 支持 `claude`、`codex`、`pi`、`omp`、`kimi`、`grok`。
+- `new` 的 provider 支持 `claude`、`codex`、`pi`、`omp`、`kimi`、`grok`、`dsh`。
 - `--prefix` 生成语义化 agent id，例如 `research_001`、`code_001`、`test_001`、`debug_001`、`review_001`、`misc_001`；省略时使用 `agent_NNN`。
 - `use <agent-id>` 会复用这个确切的 agent id 和终端上下文；`--prefix` 只用于 `new` 或 `use <terminal-handle>`。
 - `--model` 原样传给 provider。
-- `--thinking` 按 provider 转换：`claude --effort`、`codex -c model_reasoning_effort=...`、`pi --thinking`、`grok --reasoning-effort`；`kimi` 的 effort 位于模型配置中，因此会拒绝该参数；`omp` 的受监督发射通道无法表达 effort，因此同样拒绝。
+- `--thinking` 按 provider 转换：`claude --effort`、`codex -c model_reasoning_effort=...`、`pi --thinking`、`grok --reasoning-effort`；`kimi` 的 effort 位于模型配置中，因此会拒绝该参数；`omp` 的受监督发射通道无法表达 effort，因此同样拒绝；`dsh` 的 TUI 入口既没有 model 也没有 effort 参数，因此 `--model` 与 `--thinking` 都会被拒绝。
 - `models omp` 读取 `omp models --json`；将其中的 `provider/model` selector 传给 `new omp --model`（作为 `--model` 转发给受监督发射）。
 - `new omp` 以受监督 Orca worker 运行：OSW 先把调用方终端绑定到项目的编排 Run（`state.json: orchestration_run_id`），再通过 `orca orchestration worker-start --agent omp` 发射——Orca 负责建终端、等就绪并注入任务 spec 本身。因此 `omp` 的任务轮不由 watcher 发送。OSW 使用比 Orca 默认 60s 更宽的就绪预算（`--timeout-ms 240000`）；若仍然失败，会报告失败阶段（`failedStage`/`lastError`）、释放 Orca 遗留的孤儿终端，并清掉占位 agent 记录。
+- `new dsh` 用 `dsh-tui .` 启动 DeepSeek Harness TUI——正是 Orca 自己启动并识别为 agent `dsh` 的入口。DSH 的启动命令没有 model、effort 或批准参数：这些都在 DSH 设置里，并在 TUI 内用 `/model`、`/permission` 改变，因此 `--model`/`--thinking` 直接拒绝而不是静默丢弃，OSW 也不添加自主权参数。DSH 自己的启动提示（`正在启动 DSH…` / `Starting DSH…`）还在屏幕上时，就绪会被推迟：launchpad 在 harness 起来之前就画出输入框，此时发出的 prompt 会被丢弃。Orca 用终端标题（`✦ 🐋 <session>`）识别该面板，working/done 取自 DSH-TUI 的 Program Status Protocol 上报；两者都不报告工具名，因此报告写 `tools_observed: null`，而不是断言“没有工具调用”。装好 DSH 的 Orca hook 桥（`@deepseek-ai/dsh-hooks-claude-code` 及其运行时 peer，装进 `dsh-tui` profile）后，OSW 会在就绪等待阶段就记录会话 id——赶在第一回合的 Program Status 上报接管该面板记录之前；没装桥时 `revive` 需要 `--session <id>`。
 - OSW 默认添加 provider 的非阻塞/批准类启动参数：`claude --dangerously-skip-permissions`、`codex --dangerously-bypass-approvals-and-sandbox`、`pi --approve`、`omp --auto-approve`、`kimi --yolo`、`grok --always-approve --trust`。`omp` 记录的是等价的手动启动命令；受监督 worker 的实际 argv 跟随 Orca 自己的 agent 标签页设置。
 - `new` 和 `use` 支持 `--caller-terminal <句柄>`，指定接收完成报告的父终端。
 - `del --close` 同时让 Orca 关闭终端。
@@ -153,10 +154,10 @@ python skill/osw.py revive code_001              # 重启后恢复某个 agent
 python skill/osw.py stop code_001                # 中断当前一轮
 ```
 
-- **`enroll`** 扫描当前 worktree 的 `terminal list`，跳过执行者自己的终端和已有记录的面板，provider 取 `agentIdentity`（没有则取 ps 的 `agentType`），每个面板写一条 `enrolled` 记录，`origin: enroll`。OSW 无法启动的 provider 记为 `support: guard_only`（`support_reason: unsupported_provider`）。输出 `{"enrolled": [...], "skipped": [{terminal, reason}]}`。
+- **`enroll`** 扫描当前 worktree 的 `terminal list`，跳过执行者自己的终端和已有记录的面板，provider 取 `agentIdentity`（没有则取 ps 的 `agentType`），每个面板写一条 `enrolled` 记录，`origin: enroll`。OSW 无法启动的 provider 记为 `support: guard_only`（`support_reason: unsupported_provider`）。Orca 用启动器名（`dsh-tui`）标记 DSH 面板，`enroll` 会把它归一到 provider `dsh`。输出 `{"enrolled": [...], "skipped": [{terminal, reason}]}`。
 - **`guard [<id>...]`** 让执行者（`--caller-terminal`，否则 `ORCA_TERMINAL_HANDLE`）成为监护方；不带 id 时监护所有未被监护的 `enrolled`/`done`/`error` agent。有存活 watcher 时先终止它，再以跟踪方式重启；没有 watcher 但 ps 报 `working` 的面板会起一个跟踪 watcher；空闲 agent 只记录监护方。被跟踪的一轮结束后照常报告，但不发 handoff（watcher 接手时这一轮已结束则为 `already_done`）。`use` 未传 `--caller-terminal` 时继续通知监护方。
 - **`revive`** 不带 id 时输出 `{"revivable": [...], "not_revivable": [{agent_id, reason}]}`。`revive <id> [--session <sid>]` 要求 `support: full`、状态为 `lost`/`done`/`error`/`enrolled` 且没有存活 watcher。会话取 `--session`，否则取记录的 `session_id`，否则取该面板当前的会话；按 provider 的恢复语法（附带原有的自主权参数和模型参数）重新打开，agent id 不变。原面板确认是空 shell 时——仍在列表中、没有 `agentIdentity`、ps 条目不是 `working`、是 OSW 能转义的 shell（pwsh/PowerShell、cmd、POSIX）、且 Jev `ready_state` 判为 `shell_prompt`——直接在原面板输入恢复命令，`pane_key` 不变（`placement: in_place`）；否则（包括 `OSW_JEV_MODE=off`）新建终端（`placement: new_terminal`）。输出和 `agent_revived` 事件都带 `placement`。`lost`（中途被打断）的 agent 以 `resume_turn: true` 恢复：watcher 发送 `continue`，随后照常完成检测并发 handoff；其余情况恢复为 `enrolled`。
-- **`stop <id>`** 对 claude、codex、kimi、grok 发 Ctrl-C（`terminal send --interrupt`），对 pi、omp 发单个 Esc。有存活 watcher 时写旁路文件 `.orca/osw/agents/<id>.stop`；watcher 在 ps 报告该轮被中断或 done、或面板静默 5 秒后结束这一轮，记为 `error`、`completion_source: interrupted`，跳过 handoff，通知监护方并删除旁路文件。输出 `{"agent_id", "key", "watcher"}`。
+- **`stop <id>`** 对 claude、codex、kimi、grok、dsh 发 Ctrl-C（`terminal send --interrupt`），对 pi、omp 发单个 Esc。有存活 watcher 时写旁路文件 `.orca/osw/agents/<id>.stop`；watcher 在 ps 报告该轮被中断或 done、或面板静默 5 秒后结束这一轮，记为 `error`、`completion_source: interrupted`，跳过 handoff，通知监护方并删除旁路文件。输出 `{"agent_id", "key", "watcher"}`。
 
 记录新增字段（均可选，旧记录兼容）：
 

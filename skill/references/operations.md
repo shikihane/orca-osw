@@ -20,7 +20,8 @@ python <skill-dir>/osw.py init
 python <skill-dir>/osw.py models <provider> [--json]
 ```
 
-OSW supports `claude`, `codex`, `pi`, `omp`, `kimi`, and `grok` for `new`.
+OSW supports `claude`, `codex`, `pi`, `omp`, `kimi`, `grok`, and `dsh` for
+`new`.
 `omp` launches as a supervised Orca worker: OSW binds the calling terminal to
 the project's orchestration Run (`state.json: orchestration_run_id`) and runs
 `orca orchestration worker-start --agent omp`, so Orca creates the terminal,
@@ -34,7 +35,29 @@ rejects `--thinking`: its effort is configured per model alias, not on the
 command line. `grok` takes `--model` (a model id from `grok models`, such as
 `grok-4.3`) and maps `--thinking` to `--reasoning-effort`; it starts with
 `--always-approve --trust`, where `--trust` also grants folder trust for the
-launched workspace.
+launched workspace. `dsh` (DeepSeek Harness) launches the community TUI with
+`dsh-tui .` — the entry Orca starts and tracks as agent `dsh` — and adds no
+autonomy flag: DSH's permission preset is a setting changed in the TUI with
+`permission`. It takes neither `--model` nor `--thinking` (both refused),
+because the model, effort and permission preset live in DSH settings and
+change live with `/model`. `models dsh` therefore reports only the default
+launch. Readiness waits out DSH's boot notice (`正在启动 DSH…` /
+`Starting DSH…`): its launchpad draws a composer before the harness is up and
+drops a prompt sent in that window, so the gate reports
+`not_ready/harness_starting` and the release stays vetoed up to
+`BOOT_STARTING_WAIT_MS` (2 min) instead of the usual 5 s composer wait.
+Orca identifies the pane from its title (`✦ 🐋 <session>`) and takes
+working/done from DSH-TUI's Program Status Protocol (OSC 7501) reports, so
+completion arrives as `ps_done` while ps names no tool; the report carries
+`tools_observed: null` rather than claiming none.
+The pane's session id is recorded by the ready-phase lookup
+(`Watcher._wait_ready`) as soon as DSH's Orca hook bridge
+(`@deepseek-ai/dsh-hooks-claude-code` plus its runtime peers
+`dsh-hook-protocol`/`dsh-llm`/`cordis`, installed into the `dsh-tui`
+profile) reports it; the bridge only owns Orca's status record before the
+first turn, so a turn-end read alone would find nothing
+(see `docs/research/2026-10-27-dsh-hook-lane-identity.md`). Without the
+bridge, `revive` needs `--session <id>`.
 
 Supervised `omp` workers complete on Orca's Dispatch lifecycle (the watcher
 polls `orca orchestration worker-show`), not on `worktree ps` states: omp's
@@ -136,7 +159,9 @@ It skips the caller's own terminal and panes that already have a record, takes
 the provider from Orca's `agentIdentity` (falling back to the ps `agentType`),
 and writes one `enrolled` record per pane (`origin: enroll`, no watcher, no
 task, no guardian). Providers OSW cannot launch are recorded as
-`support: guard_only` with `support_reason: unsupported_provider`. Output:
+`support: guard_only` with `support_reason: unsupported_provider`. Orca names
+a DSH pane after its launcher (`dsh-tui`); that name is normalized to the
+provider `dsh`, so such a pane enrolls as `support: full`. Output:
 `{"enrolled": [<records>], "skipped": [{"terminal", "reason"}]}`, where a skip
 reason is `caller_terminal`, `no_pane_key`, `already_recorded`, `no_agent`, or
 `write_failed`.
@@ -159,10 +184,11 @@ session_id}], "not_revivable": [{agent_id, reason}]}`; reasons are
 and no live watcher. The session is `--session`, else the record's
 `session_id`, else the pane's current session. The resume command is
 `claude --resume <id>`, `codex resume <id>`, `pi --session <id>`,
-`kimi --session session_<id>`, `grok --resume <id>`, or `omp --resume <id>`,
-with the provider's usual autonomy and model flags. It is typed into the
-agent's original pane when that pane is a confirmed empty shell
-(`placement: in_place`, `pane_key` kept, only `terminal` updated): the pane
+`kimi --session session_<id>`, `grok --resume <id>`, `omp --resume <id>`, or
+`dsh-tui . --resume <id>`, with the provider's usual autonomy and model
+flags. It is typed into the agent's original pane when that pane is a
+confirmed empty shell (`placement: in_place`, `pane_key` kept, only
+`terminal` updated): the pane
 is still listed, shows no `agentIdentity`, its `worktree ps` row is not
 `working` (a cold restart restores a stale `done` row, so ps can only veto),
 its title names a known shell (pwsh/PowerShell, cmd, or a POSIX shell) so the
@@ -179,8 +205,8 @@ replaced by the executor. A revived `omp` that was mid-task is claimed with a
 new supervised Dispatch (`worker-start --terminal`) after its TUI comes up.
 
 `stop <id>` interrupts the agent's current turn: Ctrl-C (`terminal send
---interrupt`) for claude, codex, kimi, and grok; a bare Esc byte for pi and
-omp, which ignore Ctrl-C. A stale handle is re-resolved once by pane. With a
+--interrupt`) for claude, codex, kimi, grok, and dsh; a bare Esc byte for pi
+and omp, which ignore Ctrl-C. A stale handle is re-resolved once by pane. With a
 live watcher it also writes the stop sidecar `.orca/osw/agents/<id>.stop`
 (the request time): the watcher ends the turn once ps reports it interrupted
 or done, or the pane is output-silent for 5s, records `error` with

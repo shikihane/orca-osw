@@ -4,7 +4,7 @@ import json
 import os
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import anyio
 import pytest
@@ -2780,6 +2780,129 @@ async def test_gate_not_ready_waits_bounded_then_releases(tmp_path):
     assert '"reason": "wait_expired"' in events
 
 
+_DSH_ROOT = Path(__file__).parent / "fixtures" / "frames" / "dsh"
+
+
+def _dsh_frame(name: str) -> dict:
+    data = json.loads((_DSH_ROOT / f"{name}.json").read_text(encoding="utf-8"))
+    return {"result": {"terminal": {
+        "source": data["source"], "tail": data["tail"],
+    }}}
+
+
+_DSH_BOOT_FRAME = {"result": {"terminal": {"source": "screen", "tail": [
+    "                     ╭──────────────────────────────────────────────╮",
+    "                     │ ❯ 说点什么，或输入 / 看命令…                 │",
+    "                     ╰──────────────────────────────────────────────╯",
+    "                       deepseek-flash  ·  Max",
+    "                                                  ● 正在启动 DSH…",
+]}}}
+
+
+@pytest.mark.anyio
+async def test_gate_holds_a_booting_dsh_past_the_composer_wait(tmp_path):
+    # dsh's launchpad draws its composer before the harness is up, and a
+    # prompt sent then is typed and dropped, so the release stays vetoed
+    # past COMPOSER_WAIT_MS until the boot notice clears.
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "provider": "dsh",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 5
+
+    reads = AsyncMock(return_value=_DSH_BOOT_FRAME)
+    ps = AsyncMock(return_value=_ps_result(
+        "tab-a:leaf-b", "done", int(time.time() * 1000)))
+
+    with patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_read", reads), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.GATE_POLL_SECS", 0), \
+         patch("osw.watcher.COMPOSER_WAIT_MS", 10), \
+         patch("osw.watcher.BOOT_STARTING_WAIT_MS", 120):
+        source = await watcher._wait_ready()
+
+    assert source == "ps_idle"
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8")
+    assert '"reason": "harness_starting"' in events
+    assert '"event": "gate_released"' in events
+    assert '"gate_reason": "harness_starting"' in events
+
+
+@pytest.mark.anyio
+async def test_ready_captures_the_session_id_before_the_first_turn(tmp_path):
+    """dsh's hook lane owns the status record only while the pane is
+    booting/idle; the first turn hands it to the title lane, which drops
+    the session id. Read it during the ready wait."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "provider": "dsh",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 5
+    lookups = []
+
+    def lookup(pane_key):
+        lookups.append(pane_key)
+        return "sess-dsh" if len(lookups) else ""
+
+    reads = AsyncMock(return_value=_dsh_frame("idle_composer"))
+    ps = AsyncMock(return_value=_ps_result(
+        "tab-a:leaf-b", "done", int(time.time() * 1000)))
+
+    with patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_read", reads), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.session_for_pane", lookup):
+        source = await watcher._wait_ready()
+
+    assert source == "ps_idle"
+    assert state.read_agent(tmp_path, "agent_001")["session_id"] == "sess-dsh"
+    assert lookups == ["tab-a:leaf-b"]      # stopped once it had one
+
+
+@pytest.mark.anyio
+async def test_ready_never_overwrites_a_recorded_session(tmp_path):
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "provider": "dsh",
+        "session_id": "sess-old",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 5
+    lookup = Mock(return_value="sess-new")
+
+    reads = AsyncMock(return_value=_dsh_frame("idle_composer"))
+    ps = AsyncMock(return_value=_ps_result(
+        "tab-a:leaf-b", "done", int(time.time() * 1000)))
+
+    with patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_read", reads), \
+         patch("osw.watcher.POLL_SECS", 0), \
+         patch("osw.watcher.session_for_pane", lookup):
+        await watcher._wait_ready()
+
+    assert lookup.call_count == 0
+    assert state.read_agent(tmp_path, "agent_001")["session_id"] == "sess-old"
+
+
 @pytest.mark.anyio
 async def test_gate_abstains_without_frame_read_for_unknown_provider(tmp_path):
     state.init_state_dir(tmp_path)
@@ -5057,8 +5180,8 @@ def _fake_wait(task_tracked, task_tools, task_truncated_at=0):
     return fake
 
 
-async def _run_task_with(tmp_path, tracked, tools, truncated_at=0):
-    watcher = _turn_agent(tmp_path)
+async def _run_task_with(tmp_path, tracked, tools, truncated_at=0, provider=None):
+    watcher = _turn_agent(tmp_path, **({"provider": provider} if provider else {}))
     sends = AsyncMock(return_value=True)
     notify = AsyncMock(return_value={})
     with patch.object(Watcher, "_wait_ready", AsyncMock(return_value="ps_idle")), \
@@ -5121,6 +5244,19 @@ async def test_untracked_task_turn_leaves_tool_activity_unknown(tmp_path):
     assert agent["state"] == "done"
     assert report["tools_observed"] is None
     assert "warning=" not in finished[0]
+
+
+@pytest.mark.anyio
+async def test_dsh_title_lane_claims_no_tool_observation(tmp_path):
+    """Orca's dsh row is title-derived and never names a tool, so a
+    tracked turn still reports `tools_observed: null` and no warning."""
+    agent, report, finished, _ = await _run_task_with(
+        tmp_path, tracked=True, tools=False, provider="dsh")
+
+    assert agent["state"] == "done"
+    assert report["tools_observed"] is None
+    assert "warning=" not in finished[0]
+    assert "no_tool_activity" not in _event_names(tmp_path)
 
 
 @pytest.mark.anyio

@@ -16,6 +16,7 @@ from osw.providers import (
     codex_variants,
     ensure_workspace_trust,
     kimi_variants,
+    normalize_provider,
     parse_claude_aliases,
     parse_grok_models,
     parse_omp_models,
@@ -325,6 +326,49 @@ def test_build_provider_command_omits_optional_flags():
     assert build_provider_command("grok") == "grok --always-approve --trust"
 
 
+def test_dsh_is_scanned_as_an_agent_cli():
+    assert "dsh-tui" in KNOWN_AGENT_CLIS
+
+
+def test_normalize_provider_maps_orca_agent_names():
+    # Orca's ps row for a dsh pane names the launcher.
+    assert normalize_provider("dsh-tui") == "dsh"
+    assert normalize_provider(" DSH-TUI ") == "dsh"
+    assert normalize_provider("claude") == "claude"
+
+
+def test_build_provider_command_accepts_the_orca_dsh_name():
+    assert build_provider_command("dsh-tui") == "dsh-tui ."
+
+
+def test_build_provider_command_for_dsh():
+    # The launcher (not the `dsh` harness) is what Orca recognises; `.`
+    # is its workspace target, as in Orca's own `dsh-tui .` launchCmd.
+    assert build_provider_command("dsh") == "dsh-tui ."
+
+
+@pytest.mark.parametrize("kwargs", [{"model": "deepseek-flash"},
+                                    {"thinking": "high"}])
+def test_build_provider_command_dsh_rejects_model_and_thinking(kwargs):
+    with pytest.raises(ProviderError, match="no model or effort launch flag"):
+        build_provider_command("dsh", **kwargs)
+
+
+def test_probe_variants_for_dsh_lists_the_default_launch(monkeypatch):
+    monkeypatch.setattr("osw.providers.shutil.which",
+                        lambda name: "C:/bin/dsh-tui.cmd" if name == "dsh-tui" else None)
+    assert probe_variants("dsh") == [{"name": "dsh-default", "command": "dsh-tui ."}]
+
+
+def test_probe_variants_for_dsh_without_launcher(monkeypatch):
+    monkeypatch.setattr("osw.providers.shutil.which", lambda name: None)
+    assert probe_variants("dsh") == []
+
+
+def test_resume_args_for_dsh():
+    assert resume_args("dsh", "sid") == ["dsh-tui", ".", "--resume", "sid"]
+
+
 def test_build_provider_command_rejects_unknown_provider():
     with pytest.raises(ProviderError, match="unsupported provider 'gemini'"):
         build_provider_command("gemini")
@@ -401,6 +445,9 @@ def test_trust_unknown_provider_is_noop(tmp_path):
      "grok --always-approve --trust --resume 01a129ad-f296-70f3-8604-69cebcaa63e7"),
     ("omp", "01a129dd-0b79-7613-82a5-6054d7e8034e",
      "omp --auto-approve --resume 01a129dd-0b79-7613-82a5-6054d7e8034e"),
+    # The TUI launcher takes the resume flag after its workspace target.
+    ("dsh", "4024baec-099e-46b9-852b-31159b6c3513",
+     "dsh-tui . --resume 4024baec-099e-46b9-852b-31159b6c3513"),
 ])
 def test_resume_command_per_provider(provider, session, expected):
     assert resume_command(provider, session) == expected

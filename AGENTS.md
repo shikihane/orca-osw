@@ -80,7 +80,10 @@ bypass or Codex sandbox bypass. Before launch, `osw new` also pre-records
 workspace trust for claude/codex/kimi (via `ensure_workspace_trust` in
 `skill/osw/providers.py`) so the TUI skips its interactive "trust this
 directory?" prompt; grok instead launches with `--always-approve --trust`,
-where `--trust` grants folder trust for the workspace. Use them only in
+where `--trust` grants folder trust for the workspace. DSH gets neither: its
+launch (`dsh-tui .`) has no trust or approval flag, so its permission preset
+(`/permission`) and first-run setup stay the operator's choice, and OSW
+records no autonomy for it. Use them only in
 trusted, externally controlled
 workspaces. Do not commit generated `.orca/` runtime state, local logs, reports,
 or handoff files. Never launch a nested agent process inside a managed pane

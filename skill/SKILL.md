@@ -35,8 +35,12 @@ recovery (`enroll`, `guard`, `revive`, `stop`), diagnosis, or cleanup, read
 Inspect real model choices when the human needs options:
 
 ```text
-python <skill-dir>/osw.py models <claude|codex|pi|omp|kimi|grok>
+python <skill-dir>/osw.py models <claude|codex|pi|omp|kimi|grok|dsh>
 ```
+
+`dsh` (DeepSeek Harness) is launched as `dsh-tui .` and takes no
+`--model`/`--thinking`: its model, effort and permission preset are DSH
+settings changed inside the TUI (`/model`, `/permission`).
 
 Create a fresh worker:
 

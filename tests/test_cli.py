@@ -1595,11 +1595,14 @@ def _enroll_fixture(tmp_path):
         _term(tmp_path, "term-codex", "tab", "codex"),
         _term(tmp_path, "term-aider", "tab", "aider", identity="aider"),
         _term(tmp_path, "term-shell", "tab", "shell"),
+        # Orca names a DSH pane after the launcher; enroll maps it to `dsh`.
+        _term(tmp_path, "term-dsh", "tab", "dsh"),
         _term(tmp_path, "term-far", "tab", "far", identity="claude", worktree=other),
     ]
     ps = [{"agents": [
         {"paneKey": "tab:codex", "agentType": "codex", "state": "working"},
         {"paneKey": "tab:far", "agentType": "claude", "state": "done"},
+        {"paneKey": "tab:dsh", "agentType": "dsh-tui", "state": "done"},
     ]}]
     return terminals, ps
 
@@ -1638,7 +1641,7 @@ def test_enroll_registers_unrecorded_agent_terminals(tmp_path, monkeypatch):
     spawn.assert_not_called()
 
     assert [a["agent_id"] for a in out["enrolled"]] == [
-        "claude_001", "codex_001", "aider_001",
+        "claude_001", "codex_001", "aider_001", "dsh_001",
     ]
     assert out["skipped"] == [
         {"terminal": "term-me", "reason": "caller_terminal"},
@@ -1668,8 +1671,12 @@ def test_enroll_registers_unrecorded_agent_terminals(tmp_path, monkeypatch):
     assert aider["support_reason"] == "unsupported_provider"
     assert aider["session_id"] == ""
 
+    dsh = state_mod.read_agent(tmp_path, "dsh_001")
+    assert dsh["provider"] == "dsh"       # Orca's `dsh-tui` -> OSW `dsh`
+    assert dsh["support"] == "full"
+
     assert set(state_mod.list_agents(tmp_path)) == {
-        "code_001", "claude_001", "codex_001", "aider_001",
+        "code_001", "claude_001", "codex_001", "aider_001", "dsh_001",
     }
 
 
@@ -1704,7 +1711,7 @@ def test_enroll_twice_skips_everything_already_recorded(tmp_path, monkeypatch):
         first = json.loads(runner.invoke(app, ["enroll"]).stdout)
         second = json.loads(runner.invoke(app, ["enroll"]).stdout)
 
-    assert len(first["enrolled"]) == 4
+    assert len(first["enrolled"]) == 5
     assert second["enrolled"] == []
     assert {s["terminal"]: s["reason"] for s in second["skipped"]} == {
         "term-me": "caller_terminal",
@@ -1712,9 +1719,10 @@ def test_enroll_twice_skips_everything_already_recorded(tmp_path, monkeypatch):
         "term-claude": "already_recorded",
         "term-codex": "already_recorded",
         "term-aider": "already_recorded",
+        "term-dsh": "already_recorded",
         "term-shell": "no_agent",
     }
-    assert len(state_mod.list_agents(tmp_path)) == 4
+    assert len(state_mod.list_agents(tmp_path)) == 5
 
 
 def test_enroll_skips_terminal_without_pane_identity(tmp_path, monkeypatch):
@@ -2169,7 +2177,8 @@ def _invoke_stop(tmp_path, monkeypatch, record: dict, *, watcher: bool,
 
 @pytest.mark.parametrize("provider,key", [
     ("claude", "interrupt"), ("codex", "interrupt"), ("kimi", "interrupt"),
-    ("grok", "interrupt"), ("pi", "esc"), ("omp", "esc"),
+    ("grok", "interrupt"), ("dsh", "interrupt"),
+    ("pi", "esc"), ("omp", "esc"),
 ])
 def test_stop_sends_the_provider_interrupt_key(tmp_path, monkeypatch, provider, key):
     result, interrupt, escape = _invoke_stop(

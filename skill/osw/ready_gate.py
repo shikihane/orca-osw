@@ -22,7 +22,7 @@ from __future__ import annotations
 import hashlib
 import re
 
-GATE_PROVIDERS = ("claude", "kimi")  # providers with a deterministic predicate
+GATE_PROVIDERS = ("claude", "kimi", "dsh")  # providers with a deterministic predicate
 COMPOSER_WAIT_MS = 5000              # bounded composer wait, then today's behavior
 GATE_POLL_SECS = 0.5                 # screen re-read interval during that wait
 GATE_TAIL_LINES = 15                 # the predicate reads only the frame bottom
@@ -38,6 +38,13 @@ DIALOG_MARKERS = ("Trust this folder",)
 
 # Kept in sync with watcher.READY_PREVIEW_MARKERS.
 KIMI_PREVIEW_MARKERS = ("one will be created on your first message",)
+
+# DSH-TUI draws its launchpad composer before the harness finishes
+# booting, and a prompt sent in that window is typed into the box and
+# then dropped (observed: the text echoed once, Enter cleared it, no
+# turn and no session started). The footer names the boot in the UI's
+# own language.
+DSH_BOOT_MARKERS = ("正在启动 DSH", "Starting DSH")
 
 # Upstream-API retry notice (claude: "Waiting for API response · will
 # retry · check your network"). The pane is alive and recovers on its
@@ -95,6 +102,8 @@ def gate_verdict(provider: str, frame: dict) -> tuple[str, str]:
         return "abstain", "provider_without_predicate"
     if provider == "claude":
         return _claude_verdict(lines)
+    if provider == "dsh":
+        return _dsh_verdict(lines)
     return _kimi_verdict(lines)
 
 
@@ -116,6 +125,26 @@ def _claude_verdict(lines: list[str]) -> tuple[str, str]:
     if any(CLAUDE_WORKING_RE.search(line) for line in lines):
         return "not_ready", "turn_running"
     return "ready", "composer_visible"
+
+
+def _dsh_verdict(lines: list[str]) -> tuple[str, str]:
+    """DSH-TUI's composer sits in a box, so the box is the predicate.
+
+    The chat view renders `╭───╮` / `⌸ ❯ …` / `╰───╯` and the launchpad
+    `╭───╮` / `│ ❯ …` / `╰───╯`; the placeholder text after the glyph is
+    localized, so the sandwich — not the wording — is what counts. The
+    whale title and the status bar are up long before the composer
+    mounts, so neither proves readiness on its own.
+    """
+    if any(marker in line for line in lines for marker in DSH_BOOT_MARKERS):
+        return "not_ready", "harness_starting"
+    for index, line in enumerate(lines):
+        if "❯" not in line or index == 0 or index + 1 >= len(lines):
+            continue
+        if (lines[index - 1].strip().startswith("╭")
+                and lines[index + 1].strip().startswith("╰")):
+            return "ready", "composer_visible"
+    return "not_ready", "composer_missing"
 
 
 def _kimi_verdict(lines: list[str]) -> tuple[str, str]:

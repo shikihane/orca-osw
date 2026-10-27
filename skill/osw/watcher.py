@@ -138,6 +138,12 @@ POLL_SECS = 2.0                    # worktree ps poll interval
 READY_TIMEOUT_MS = 600_000         # max wait for the agent TUI to come up
 READY_IDLE_STABLE_MS = 30_000      # ready-phase fallback: silent this long = ready
 READY_PREVIEW_SILENCE_MS = 10_000  # composer marker also needs this much silence
+# A provider TUI whose composer mounts before the app is up (dsh's
+# launchpad) keeps the ready release vetoed until its boot notice
+# clears; past this the release falls back to today's behaviour, so a
+# profile that never boots still fails through the receipt window
+# instead of idling out the whole ready deadline.
+BOOT_STARTING_WAIT_MS = 120_000
 FALLBACK_IDLE_STABLE_MS = 60_000   # untracked CLI: silent this long = turn over
 HARD_TIMEOUT_SECS = 3600           # give up on the whole task after this
 STUCK_NOTIFY_SECS = 300            # tracked agent frozen this long -> tell caller
@@ -182,6 +188,12 @@ HANDOFF_FALLBACK_POLL_SECS = 2.0   # wrap-up fallback: file stability cadence
 # with Claude Code 2.1.281 on Orca 1.4.221; a 9052-char bracketed paste
 # arrives whole). Slash commands stay raw — pasted, they are plain text.
 SPLIT_SEND_PROVIDERS = ("claude",)   # codex shares the gate; its TUI is unverified here
+# Providers whose Orca lane reports state only. DSH's pane state is
+# derived from the terminal title (`✦ 🐋 <session>`), so ps shows
+# working/done but never a toolName; an empty tool list there says
+# nothing about the turn's work and must not be reported as
+# `tools_observed: false` / `no_tool_activity`.
+TOOL_LANE_LESS_PROVIDERS = ("dsh",)
 SPLIT_SEND_CONFIRM_SECS = 2.0        # bounded composer-echo wait after the paste
 SPLIT_SEND_POLL_SECS = 0.5           # --screen poll interval inside that wait
 PASTE_START = "\x1b[200~"
@@ -945,7 +957,9 @@ class Watcher:
         """
         if self._turn_tools_seen:
             tools: bool | None = True
-        elif self._turn_tracked:
+        elif (self._turn_tracked
+                and str(self.agent.get("provider") or "")
+                not in TOOL_LANE_LESS_PROVIDERS):
             tools = False
         else:
             tools = None
@@ -1829,7 +1843,10 @@ class Watcher:
         2. otherwise the deterministic verdict drives the Phase 0 flow:
            `ready`/`abstain` release, `not_ready` starts the bounded
            composer wait (≤COMPOSER_WAIT_MS, then releases with today's
-           behavior — never until the ready deadline, N3);
+           behavior — never until the ready deadline, N3; a
+           `harness_starting` verdict is the one exception: the TUI's
+           own boot notice is still up, so the wait runs to
+           BOOT_STARTING_WAIT_MS);
         3. Jev is consulted only when the gate abstains or first says
            `not_ready` (§5.1.1): shadow fires a background judgment,
            enforce calls synchronously and may start a hold.
@@ -1887,11 +1904,15 @@ class Watcher:
                 self._gate_since = now
                 self._gate_call_pending = True
             waited_ms = int((now - self._gate_since) * 1000)
-            if waited_ms >= COMPOSER_WAIT_MS:
+            limit_ms = (
+                BOOT_STARTING_WAIT_MS if reason == "harness_starting"
+                else COMPOSER_WAIT_MS)
+            if waited_ms >= limit_ms:
                 self._gate_since = None
                 self._event(
                     "gate_released",
-                    data={"reason": "wait_expired", "waited_ms": waited_ms},
+                    data={"reason": "wait_expired", "waited_ms": waited_ms,
+                          "gate_reason": reason},
                 )
             else:
                 wait_veto = True
@@ -2133,6 +2154,14 @@ class Watcher:
                 if self.pane:
                     self._update(pane_key=self.pane)
                     self._event("pane_detected", data={"pane_key": self.pane})
+            if self.pane and not self.agent.get("session_id"):
+                # Capture the provider session while the pane is still
+                # idle and the hook lane owns Orca's status record. dsh
+                # loses its id to the title lane on the first turn (the
+                # two lanes name different agents, so the hook lane's
+                # later events are dropped), and a turn-end read then
+                # finds nothing.
+                self._record_session()
             entry = None
             if self.pane:
                 try:
@@ -2763,6 +2792,8 @@ class Watcher:
         # A task turn that ps tracked but never saw use a tool did no
         # visible work (plan §3.1): flag it, but it stays `done` and is
         # never resent — the handoff and workspace are the evidence.
+        # A title-only lane (TOOL_LANE_LESS_PROVIDERS) reports None from
+        # _note_turn_tools, so there is nothing to claim either way.
         warning = ""
         if self._task_turn_ran:
             report_payload["tools_observed"] = self._task_tools_observed

@@ -7,8 +7,8 @@ See also `AGENTS.md` for repository guidelines shared across agent tools.
 ## What This Is
 
 OSW ("Orca Agent Supervisor") is a Python CLI that dispatches and supervises
-Orca-backed agent sessions (`claude`, `codex`, `pi`, `omp`, `kimi`, `grok`) in the
-current working directory. There is **no daemon**: `new`/`use` creates or
+Orca-backed agent sessions (`claude`, `codex`, `pi`, `omp`, `kimi`, `grok`,
+`dsh`) in the current working directory. There is **no daemon**: `new`/`use` creates or
 adopts an Orca terminal, writes one agent record, spawns one detached watcher
 process, and returns immediately. Orca itself is the source of truth for
 agent state.
@@ -30,7 +30,7 @@ pytest tests/test_cli.py -v                     # one file
 pytest tests/test_watcher.py::test_name -v      # one test
 
 python skill/osw.py init                        # init .orca/osw/ state in cwd
-python skill/osw.py models <claude|codex|pi|omp|kimi|grok>  # read-only model discovery
+python skill/osw.py models <claude|codex|pi|omp|kimi|grok|dsh>  # read-only model discovery
 python skill/osw.py new <provider> --prefix <role> --model <m> --thinking <t> "<task>"
 python skill/osw.py use <agent-id|terminal-handle> "<follow-up>"
 python skill/osw.py list --json
@@ -210,10 +210,23 @@ the prompt's own terminal echo never counts as output, and the quick
 tui-idle exit after tracking loss requires the pane to have been observed
 `working` this turn — a pane Orca never registered (e.g. one spawned
 moments ago, before ps catches up) rides the slow stable-silence path.
-Orca recognizes `claude`, `codex`, and `pi` TUIs (as of Orca 1.4.x); Kimi
-and Grok still work through the generic terminal-output fallback when
-untracked. Supervised `omp` workers do not use any of this: they complete on
-Orca's Dispatch lifecycle (below).
+Orca recognizes `claude`, `codex`, and `pi` TUIs (as of Orca 1.4.x), and
+current Orca builds also recognize DSH's `dsh-tui` pane — from its title
+(`✦ 🐋 <session>`), with working/done taken from DSH-TUI's Program Status
+Protocol (OSC 7501) reports — so it reports state but no tool names; OSW
+therefore reports `tools_observed: null` for `dsh`
+(`TOOL_LANE_LESS_PROVIDERS`) instead of "no tool call". DSH's launchpad
+draws its composer before the harness boots and drops a prompt sent then,
+so `ready_gate` reports `not_ready/harness_starting` while the boot notice
+(`正在启动 DSH…` / `Starting DSH…`) is up and `_gate_veto` holds the release
+to `BOOT_STARTING_WAIT_MS` instead of `COMPOSER_WAIT_MS`. The ready wait also
+captures the pane's provider session (`_record_session`) while the hook lane
+still owns Orca's status record: from the first turn's Program Status
+reports on, Orca drops the bridge's (`dsh` vs `dsh-tui`) events as a nested
+agent (see `docs/research/2026-10-27-dsh-hook-lane-identity.md`). Kimi and Grok
+still work through the generic terminal-output fallback when untracked.
+Supervised `omp` workers do not use any of this: they complete on Orca's
+Dispatch lifecycle (below).
 Tracked panes must additionally acknowledge each prompt within
 `RECEIPT_TIMEOUT_MS` (report `working`, finish the turn, or echo the
 prompt text in ps) — no acknowledgement means the input was swallowed by

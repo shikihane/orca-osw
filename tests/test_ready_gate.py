@@ -13,6 +13,15 @@ from osw.ready_gate import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "frames" / "claude"
+DSH_FIXTURES = Path(__file__).parent / "fixtures" / "frames" / "dsh"
+
+
+def _dsh_fixture(name: str) -> dict:
+    data = json.loads(
+        (DSH_FIXTURES / f"{name}.json").read_text(encoding="utf-8"))
+    return {"result": {"terminal": {
+        "source": data["source"], "tail": data["tail"],
+    }}}
 
 
 def _fixture(name: str) -> dict:
@@ -73,6 +82,35 @@ def test_gate_abstains_for_unpredicated_provider_and_bad_source():
     assert gate_verdict("claude", stream) == ("abstain", "no_usable_frame")
     empty = {"result": {"terminal": {"source": "screen", "tail": []}}}
     assert gate_verdict("claude", empty) == ("abstain", "no_usable_frame")
+
+
+def test_gate_on_real_dsh_fixtures():
+    # Captured from DSH-TUI 0.17.0 (dsh 0.2.1-rc.2) in an Orca pane.
+    assert gate_verdict("dsh", _dsh_fixture("launchpad_composer")) == \
+        ("ready", "composer_visible")
+    assert gate_verdict("dsh", _dsh_fixture("idle_composer")) == \
+        ("ready", "composer_visible")
+
+
+def test_gate_dsh_needs_the_composer_box_not_just_the_glyph():
+    # The whale title, status bar and glyph-free footer are up before the
+    # composer mounts; a `❯` outside a box is not DSH's composer.
+    frame = {"result": {"terminal": {"source": "screen", "tail": [
+        "        ✦ 🐋 DSH",
+        "❯ not a composer",
+        "  deepseek-flash · high · 完全访问",
+    ]}}}
+    assert gate_verdict("dsh", frame) == ("not_ready", "composer_missing")
+
+
+def test_gate_dsh_boot_notice_outranks_the_composer():
+    frame = {"result": {"terminal": {"source": "screen", "tail": [
+        "                     ╭──────────────────────────────╮",
+        "                     │ ❯ 说点什么，或输入 / 看命令… │",
+        "                     ╰──────────────────────────────╯",
+        "                                                  ● 正在启动 DSH…",
+    ]}}}
+    assert gate_verdict("dsh", frame) == ("not_ready", "harness_starting")
 
 
 def test_gate_flags_upstream_api_retry_for_any_provider():

@@ -35,6 +35,8 @@ python /path/to/orca-osw/skill/osw.py models codex
 python /path/to/orca-osw/skill/osw.py models pi
 python /path/to/orca-osw/skill/osw.py models omp
 python /path/to/orca-osw/skill/osw.py models kimi
+python /path/to/orca-osw/skill/osw.py models grok
+python /path/to/orca-osw/skill/osw.py models dsh
 ```
 
 这是只读操作，不会修改 `.orca/osw/state.json`。

@@ -35,6 +35,8 @@ python /path/to/orca-osw/skill/osw.py models codex
 python /path/to/orca-osw/skill/osw.py models pi
 python /path/to/orca-osw/skill/osw.py models omp
 python /path/to/orca-osw/skill/osw.py models kimi
+python /path/to/orca-osw/skill/osw.py models grok
+python /path/to/orca-osw/skill/osw.py models dsh
 ```
 
 This is read-only and does not change `.orca/osw/state.json`.

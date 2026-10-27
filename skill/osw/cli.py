@@ -53,6 +53,7 @@ from osw.providers import (
     ProviderError,
     build_provider_command,
     ensure_workspace_trust,
+    normalize_provider,
     probe_variants,
     resume_args,
     resume_command,
@@ -853,13 +854,14 @@ def init(
         typer.echo("  python osw.py models omp")
         typer.echo("  python osw.py models kimi")
         typer.echo("  python osw.py models grok")
+        typer.echo("  python osw.py models dsh")
 
 
 @app.command("models")
 def models(
     provider: str = typer.Argument(
         ...,
-        help="Provider to query: claude, codex, pi, omp, kimi, or grok",
+        help="Provider to query: claude, codex, pi, omp, kimi, grok, or dsh",
     ),
     json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
 ) -> None:
@@ -1396,9 +1398,9 @@ def enroll() -> None:
         leaf = terminal.get("leafId")
         pane_key = f"{tab}:{leaf}" if tab and leaf else ""
         ps_entry = ps_entries.get(pane_key) or {}
-        provider = str(
+        provider = normalize_provider(str(
             terminal.get("agentIdentity") or ps_entry.get("agentType") or ""
-        ).strip().lower()
+        ))
         if (self_pane and pane_key == self_pane) \
                 or (self_handle and handle == self_handle):
             reason = "caller_terminal"
@@ -2120,13 +2122,16 @@ def del_(
 
 
 # Interrupt key per provider (plan §1.8, research 2026-10-11 V1/V8):
-# Ctrl-C stops claude, codex, kimi and grok; pi and omp ignore it and
-# stop only on a bare Esc.
+# Ctrl-C stops claude, codex, kimi, grok and dsh (DSH-TUI: "Interrupt
+# while working", verified aborting a running tool call); pi and omp
+# ignore it and stop only on a bare Esc. Esc is not an option for dsh:
+# its ladder first clears the draft or a selection.
 STOP_KEYS = {
     "claude": "interrupt",
     "codex": "interrupt",
     "kimi": "interrupt",
     "grok": "interrupt",
+    "dsh": "interrupt",
     "pi": "esc",
     "omp": "esc",
 }
