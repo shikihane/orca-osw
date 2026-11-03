@@ -266,6 +266,20 @@ READY_SCREEN_MARKERS = (
     "claude-",
 )
 
+# TUIs whose readiness is painted into the terminal title, not into
+# their output. omp runs a turn as "⠋ π - <task>" and returns to
+# "OMP - <task>" / "OMP > <worktree>" once it sits at its composer, and
+# its status bar repaints continuously, so output silence never arrives
+# and Orca emits no tui-idle for it (that missing signal is what makes
+# a supervised omp launch time out). The title, read together with the
+# model/folder/context band the TUI paints under it, is the readiness
+# signal that exists. The spinner is a Braille cell in its first column.
+TITLE_IDLE_PROVIDERS = ("omp",)
+TITLE_WORKING_PREFIXES = (
+    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+)
+TITLE_READY_PREVIEW_MARKERS = ("> 📁 ",)
+
 # A modal first-run dialog is the classic prompt swallow: the composer
 # is not what receives keyboard input while one of these is up, so a
 # pane showing one is never ready no matter how silent its output is.
@@ -588,6 +602,9 @@ class Watcher:
         self.handle = self.agent["terminal"]
         self.deadline = time.monotonic() + HARD_TIMEOUT_SECS
         self.pane: str | None = self.agent.get("pane_key") or None
+        self._title_state_provider = str(
+            self.agent.get("provider") or ""
+        ).strip().lower() in TITLE_IDLE_PROVIDERS
         self._state_dirty = False
         self._state_storage_error: StateWriteError | None = None
         self._gate_since: float | None = None
@@ -1119,6 +1136,30 @@ class Watcher:
         except OrcaError:
             return False
 
+    async def _title_ready(self) -> bool:
+        """Whether a title-state provider (TITLE_IDLE_PROVIDERS) sits at
+        its composer: a title with no spinner in front, and the
+        model/folder/context band painted under it (which only appears
+        once the TUI has rendered, so a just-created pane whose title
+        Orca already named is not mistaken for a ready one).
+        """
+        try:
+            data = await terminal_show(self.handle)
+        except OrcaError as exc:
+            if exc.code != "terminal_handle_stale" \
+                    or not await self._rebind_terminal():
+                return False
+            try:
+                data = await terminal_show(self.handle)
+            except OrcaError:
+                return False
+        term = data.get("result", {}).get("terminal", {})
+        title = str(term.get("title") or "").strip()
+        preview = str(term.get("preview") or "")
+        return bool(title) \
+            and not title.startswith(TITLE_WORKING_PREFIXES) \
+            and any(m in preview for m in TITLE_READY_PREVIEW_MARKERS)
+
     async def _terminal_snapshot(self) -> tuple[int, str]:
         """(lastOutputAt, preview) for the pane, from one terminal show."""
         try:
@@ -1619,6 +1660,20 @@ class Watcher:
                 data = await orchestration_worker_show(dispatch_id)
                 settlement = worker_settlement(data)
             except OrcaError as exc:
+                if exc.code == "orca_contract_mismatch":
+                    # A field Orca renamed is not a hiccup: polling cannot
+                    # fix it, and the hard deadline would hide it for an
+                    # hour. Surface it as the task's failure now.
+                    self._event(
+                        "orca_contract_mismatch",
+                        level="ERROR",
+                        message=exc.message,
+                        data={"dispatch_id": dispatch_id},
+                    )
+                    await self._finalize(
+                        "error", "orca_contract_mismatch", exc.message,
+                    )
+                    return
                 # Transient CLI/runtime hiccup: the deadline still rules.
                 log.warning(
                     "watcher(%s): worker-show failed: %s",
@@ -2199,6 +2254,11 @@ class Watcher:
                             " prompt goes out when it becomes ready)"
                         )
             else:
+                if self._title_state_provider and await self._title_ready():
+                    if await self._gate_veto("title_idle"):
+                        await anyio.sleep(GATE_POLL_SECS)
+                        continue
+                    return "title_idle"
                 if await self._wait_tui_idle():
                     if await self._gate_veto("tui_idle"):
                         await anyio.sleep(GATE_POLL_SECS)
@@ -2643,7 +2703,14 @@ class Watcher:
                         pending_done_started = state_started
                         continue
                     if not await self._output_silent(COMPLETION_SILENCE_MS):
-                        continue
+                        # A title-state TUI (omp) never goes silent: its
+                        # status bar repaints while it sits idle, so the
+                        # silence guard would hold a finished turn until
+                        # the hard deadline. Its title is the same proof
+                        # the ready gate uses.
+                        if not (self._title_state_provider
+                                and await self._title_ready()):
+                            continue
                     self._event(
                         "task_done_observed",
                         data={"source": "ps_done",

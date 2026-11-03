@@ -492,7 +492,7 @@ async def test_orchestration_lifecycle_wrappers_build_expected_argv():
         (lambda: orca_cli.orchestration_run_use("run_1"),
          ["orchestration", "run-use", "--id", "run_1"]),
         (lambda: orca_cli.orchestration_worker_show("ctx_1"),
-         ["orchestration", "worker-show", "--dispatch", "ctx_1"]),
+         ["orchestration", "worker-show", "--dispatch", "ctx_1", "--full"]),
         (lambda: orca_cli.orchestration_worker_retain("ctx_1"),
          ["orchestration", "worker-retain", "--dispatch", "ctx_1"]),
         (lambda: orca_cli.orchestration_worker_release("ctx_1"),
@@ -577,6 +577,58 @@ def test_worker_settlement_requires_projection():
         orca_cli.worker_settlement({"result": {"dispatch": {}}})
 
     assert exc_info.value.code == "orca_contract_mismatch"
+
+
+def test_worker_settlement_reads_a_circuit_broken_dispatch_as_settled():
+    """Orca's own ladder ends a Dispatch completed/circuit_broken/failed."""
+    view = orca_cli.worker_settlement({"result": {
+        "dispatch": {"status": "circuit_broken"},
+        "worker": {"state": "failed", "stage": "launch_failed"},
+        "projection": {"outcome": "failed", "liveness": {"verdict": "exited"}},
+    }})
+
+    assert view["settled"] is True
+    assert view["outcome"] == "failed"
+
+
+def test_worker_settlement_leaves_a_context_only_worker_running():
+    """`unsupervised` alone says nothing: only its Dispatch status settles it."""
+    view = orca_cli.worker_settlement({"result": {
+        "dispatch": {"status": "dispatched"},
+        "worker": {"state": "unsupervised", "stage": "context_only"},
+        "projection": {"liveness": {"verdict": "unverifiable"}},
+    }})
+
+    assert view["settled"] is False
+
+
+def test_worker_settlement_names_the_reason_a_worker_waits_on():
+    view = orca_cli.worker_settlement({"result": {
+        "dispatch": {"status": "dispatched"},
+        "worker": {"state": "ready", "stage": "turn_started"},
+        "projection": {},
+        "observation": {"agentWait": {"reason": "agent-update-prompt",
+                                      "source": "pane"}},
+    }})
+
+    assert view["agent_wait"] == "agent-update-prompt"
+
+
+def test_worker_start_receipt_reads_the_concise_terminal_field():
+    """A start without --full carries the handle as a derived field."""
+    receipt = orca_cli.worker_start_receipt({"result": {
+        "dispatchId": "ctx_1", "taskId": "task_1", "runId": "run_1",
+        "state": "ready", "terminal": "term-9", "effects": [],
+    }})
+
+    assert receipt["terminal"] == "term-9"
+
+    old_host = orca_cli.worker_start_receipt({"result": {
+        "dispatchId": "ctx_1", "taskId": "task_1", "runId": "run_1",
+        "effects": [{"kind": "terminal", "role": "agent", "id": "term-7"}],
+    }})
+
+    assert old_host["terminal"] == "term-7"
 
 
 @pytest.mark.anyio
@@ -686,3 +738,30 @@ def test_worker_asks_tolerates_odd_rows():
         _msg("msg_1", "question", "", 1, payload="{bad json"),
     ]
     assert orca_cli.worker_asks(messages, dispatch_id="ctx_1", terminal="term-w") == []
+
+
+def test_worker_asks_reads_the_consolidated_inbox_view():
+    """Inbox rows name the sender in `from` and keep only payload ids."""
+    payload = {"taskId": "task_1", "dispatchId": "ctx_1"}
+
+    def row(msg_id, msg_type, sender, **extra):
+        return {"id": msg_id, "type": msg_type, "from": sender,
+                "to": "run:run_1", "handled": False, "payload": payload,
+                **extra}
+
+    messages = [                                    # newest first
+        row("msg_done", "worker_done", "term-w"),
+        row("msg_other", "question", "ctx_9",
+            payload={"dispatchId": "ctx_9"}),
+        row("msg_esc", "escalation", "term-w", subject="blocked"),
+        row("msg_q", "question", "ctx_1", body="Which branch?"),
+        row("msg_payload", "question", "term-legacy"),
+    ]
+
+    asks = orca_cli.worker_asks(
+        messages, dispatch_id="ctx_1", terminal="term-w",
+    )
+
+    # Oldest first, and a question raised by a terminal-less worker
+    # (`from` is the stripped Dispatch id) still belongs to it.
+    assert [a["id"] for a in asks] == ["msg_payload", "msg_q", "msg_esc"]

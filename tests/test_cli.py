@@ -266,6 +266,17 @@ def _worker_show_result() -> dict:
     }}
 
 
+def _supervised_lane(provider: str = "omp"):
+    """Force the supervised launch lane for one provider.
+
+    Current Orca cannot start a supervised worker for any provider OSW
+    ships (see providers.SUPERVISED_PROVIDERS: its tui-idle readiness
+    never fires), so the lane is reached through the persisted records
+    of older agents and through this switch in tests.
+    """
+    return patch("osw.cli.supervised_agent_id", return_value=provider)
+
+
 def test_new_supervised_omp_launches_through_worker_start(tmp_path, monkeypatch):
     """omp is launched by Orca's supervised orchestration.
 
@@ -281,7 +292,8 @@ def test_new_supervised_omp_launches_through_worker_start(tmp_path, monkeypatch)
     show = AsyncMock(return_value=_worker_show_result())
     spawn = Mock(return_value=6789)
 
-    with patch("osw.cli.orchestration_run_current", run_current), \
+    with _supervised_lane(), \
+         patch("osw.cli.orchestration_run_current", run_current), \
          patch("osw.cli.orchestration_run_create", run_create), \
          patch("osw.cli.orchestration_worker_start", start), \
          patch("osw.cli.orchestration_worker_show", show), \
@@ -336,7 +348,8 @@ def test_new_supervised_rebinds_foreign_caller_run(tmp_path, monkeypatch):
     start = AsyncMock(return_value=_supervised_start_result())
     show = AsyncMock(return_value=_worker_show_result())
 
-    with patch("osw.cli.orchestration_run_current", run_current), \
+    with _supervised_lane(), \
+         patch("osw.cli.orchestration_run_current", run_current), \
          patch("osw.cli.orchestration_run_use", run_use), \
          patch("osw.cli.orchestration_worker_start", start), \
          patch("osw.cli.orchestration_worker_show", show), \
@@ -362,7 +375,8 @@ def test_new_supervised_rejects_thinking(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
 
-    result = runner.invoke(app, ["new", "omp", "--thinking", "high", "task"])
+    with _supervised_lane():
+        result = runner.invoke(app, ["new", "omp", "--thinking", "high", "task"])
 
     assert result.exit_code == 1
     assert "supervised" in result.output
@@ -432,7 +446,8 @@ def test_new_supervised_recreates_run_when_stored_run_unusable(
     start = AsyncMock(return_value=_supervised_start_result())
     show = AsyncMock(return_value=_worker_show_result())
 
-    with patch("osw.cli.orchestration_run_current", run_current), \
+    with _supervised_lane(), \
+         patch("osw.cli.orchestration_run_current", run_current), \
          patch("osw.cli.orchestration_run_use", run_use), \
          patch("osw.cli.orchestration_run_create", run_create), \
          patch("osw.cli.orchestration_worker_start", start), \
@@ -457,7 +472,8 @@ def test_new_supervised_launch_failure_leaves_no_agent(tmp_path, monkeypatch):
         "worker-start refused", 1, code="consumer_fenced",
     ))
 
-    with patch("osw.cli.orchestration_run_current", run_current), \
+    with _supervised_lane(), \
+         patch("osw.cli.orchestration_run_current", run_current), \
          patch("osw.cli.orchestration_worker_start", start), \
          patch("osw.cli._spawn_watcher", Mock(return_value=1)):
         result = runner.invoke(app, ["new", "omp", "--no-notify", "task"])
@@ -491,7 +507,8 @@ def test_new_supervised_missing_terminal_fails_loudly(tmp_path, monkeypatch):
         "observation": {"status": "live"},
     }})
 
-    with patch("osw.cli.orchestration_run_current", run_current), \
+    with _supervised_lane(), \
+         patch("osw.cli.orchestration_run_current", run_current), \
          patch("osw.cli.orchestration_worker_start", start), \
          patch("osw.cli.orchestration_worker_show", show), \
          patch("osw.cli._spawn_watcher", Mock(return_value=1)):
@@ -524,7 +541,8 @@ def test_new_supervised_settlement_supplies_missing_terminal(
         "observation": {"status": "live"},
     }})
 
-    with patch("osw.cli.orchestration_run_current", run_current), \
+    with _supervised_lane(), \
+         patch("osw.cli.orchestration_run_current", run_current), \
          patch("osw.cli.orchestration_worker_start", start), \
          patch("osw.cli.orchestration_worker_show", show), \
          patch("osw.cli._spawn_watcher", Mock(return_value=1)):
@@ -561,7 +579,8 @@ def test_new_supervised_launch_failure_releases_orphan(
     ))
     release = AsyncMock(return_value={})
 
-    with patch("osw.cli.orchestration_run_current", run_current), \
+    with _supervised_lane(), \
+         patch("osw.cli.orchestration_run_current", run_current), \
          patch("osw.cli.orchestration_worker_start", start), \
          patch("osw.cli.orchestration_worker_release", release), \
          patch("osw.cli._spawn_watcher", Mock(return_value=1)):
@@ -2626,7 +2645,8 @@ def test_revive_lost_omp_claims_new_terminal_with_worker_start(tmp_path, monkeyp
             return _show_pane(tmp_path, "term-g", "tab", "g")
         return await identity(handle)
 
-    with patch("osw.cli.pid_is_running", return_value=False), \
+    with _supervised_lane(), \
+         patch("osw.cli.pid_is_running", return_value=False), \
          patch("osw.cli.terminal_create", create), \
          patch("osw.cli.terminal_show", AsyncMock(side_effect=show)), \
          patch("osw.cli.orchestration_worker_release", release), \
@@ -2669,7 +2689,8 @@ def test_revive_idle_omp_restores_session_without_dispatch(tmp_path, monkeypatch
 
     start = AsyncMock()
     release = AsyncMock()
-    with patch("osw.cli.pid_is_running", return_value=False), \
+    with _supervised_lane(), \
+         patch("osw.cli.pid_is_running", return_value=False), \
          patch("osw.cli.terminal_create", _created()), \
          patch("osw.cli.terminal_show", AsyncMock(return_value={})), \
          patch("osw.cli.orchestration_worker_release", release), \
@@ -2704,7 +2725,8 @@ def test_revive_omp_worker_start_failure_keeps_revived_terminal(tmp_path, monkey
 
     failure = OrcaError("agent not ready", 1, code="agent_unconfigured")
     spawn = Mock()
-    with patch("osw.cli.pid_is_running", return_value=False), \
+    with _supervised_lane(), \
+         patch("osw.cli.pid_is_running", return_value=False), \
          patch("osw.cli.terminal_create", _created()), \
          patch("osw.cli.terminal_show", _omp_identity_show(tmp_path)), \
          patch("osw.cli.orchestration_worker_release", AsyncMock(return_value={})), \
@@ -2735,7 +2757,8 @@ def test_revive_omp_that_never_comes_up_is_not_claimed(tmp_path, monkeypatch):
     ))
 
     start = AsyncMock()
-    with patch("osw.cli.pid_is_running", return_value=False), \
+    with _supervised_lane(), \
+         patch("osw.cli.pid_is_running", return_value=False), \
          patch("osw.cli.terminal_create", _created()), \
          patch("osw.cli.terminal_show", AsyncMock(return_value=_show_pane(tmp_path, "term-new", "tab", "new"))), \
          patch("osw.cli.orchestration_worker_start", start):
@@ -3135,7 +3158,8 @@ def test_revive_release_unknown_is_one_concise_warning(tmp_path, monkeypatch, ca
     }}
     failure = OrcaError(json.dumps(payload, indent=2), 1, payload=payload)
 
-    with patch("osw.cli.pid_is_running", return_value=False), \
+    with _supervised_lane(), \
+         patch("osw.cli.pid_is_running", return_value=False), \
          patch("osw.cli.terminal_create", _created()), \
          patch("osw.cli.orchestration_worker_release", AsyncMock(side_effect=failure)):
         result = runner.invoke(app, ["revive", "misc_001"])

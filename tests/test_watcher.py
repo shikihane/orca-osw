@@ -592,6 +592,71 @@ async def test_untracked_pane_without_tui_idle_ready_on_output_silence(tmp_path)
 
 
 @pytest.mark.anyio
+async def test_untracked_omp_pane_is_ready_on_an_idle_title(tmp_path):
+    """omp never goes output-silent and Orca emits no tui-idle for it, so
+    its title is the readiness signal: no spinner, composer band drawn."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "provider": "omp",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    show = AsyncMock(return_value={
+        "result": {"terminal": {
+            "tabId": "tab-a", "leafId": "leaf-b",
+            "title": "OMP > orca-osw",
+            "lastOutputAt": int(time.time() * 1000),  # repaints constantly
+            "preview": "Tip: /copy code\n"
+                       "π > ⟳ DeepSeek V4.1 Flash > 📁 D:\\proj > "
+                       "⑂ main ─1%──────┃────1M─",
+        }}
+    })
+    ps = AsyncMock(return_value=[{"agents": []}])
+    wait = AsyncMock(side_effect=OrcaError("timeout waiting for tui-idle", 1))
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_wait", wait), \
+         patch("osw.watcher.POLL_SECS", 0):
+        source = await watcher._wait_ready()
+
+    assert source == "title_idle"
+    # The title answered; no tui-idle call was needed.
+    wait.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_omp_mid_turn_title_is_not_ready(tmp_path):
+    """The spinner in front of the title means a turn is running."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "provider": "omp",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+
+    show = AsyncMock(return_value={
+        "result": {"terminal": {
+            "title": "⠋ π - do the task - orca-osw",
+            "lastOutputAt": int(time.time() * 1000),
+            "preview": "⠹ 0s > ◔ DeepSeek V4.1 Flash > 📁 D:\\proj > "
+                       "⑂ main ─1%──────┃────1M─",
+        }}
+    })
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.terminal_wait", AsyncMock()):
+        assert await watcher._title_ready() is False
+
+
+@pytest.mark.anyio
 async def test_untracked_pane_ready_on_preview_marker(tmp_path):
     """kimi's fresh-session ready screen names itself in the preview:
     ready at once, without waiting out any silence window."""
@@ -1387,6 +1452,40 @@ async def test_late_ps_registration_upgrades_to_ps_done(tmp_path):
 
     assert result == "ps_done"
     wait.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_omp_done_counts_on_an_idle_title_despite_repaints(tmp_path):
+    """omp's status bar never stops repainting, so the completion window
+    can never be silent; the title's missing spinner is the proof."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "provider": "omp",
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    watcher.pane = "tab-a:leaf-b"
+    watcher.deadline = time.monotonic() + 5
+
+    task_done = int(time.time() * 1000) + 10_000
+    ps = AsyncMock(return_value=_ps_result("tab-a:leaf-b", "done", task_done))
+
+    async def show(*args, **kwargs):
+        return {"result": {"terminal": {
+            "title": "OMP - do the task - proj",
+            "lastOutputAt": int(time.time() * 1000),   # repainting
+            "preview": "π > ◔ DeepSeek > 📁 D:\\proj > ⑂ main ─1%─┃─1M─",
+        }}}
+
+    with patch("osw.watcher.terminal_show", show), \
+         patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.POLL_SECS", 0):
+        result = await watcher._wait_turn_done(time.time() * 1000)
+
+    assert result == "ps_done"
 
 
 @pytest.mark.anyio
@@ -4655,6 +4754,37 @@ async def test_supervised_inbox_failure_is_transient(tmp_path):
     agent = state.read_agent(tmp_path, "misc_001")
     assert agent["state"] == "done"
     assert "notified_asks" not in agent
+
+
+@pytest.mark.anyio
+async def test_supervised_worker_show_contract_break_fails_at_once(tmp_path):
+    """A renamed worker-show field is not a hiccup: polling would hide it."""
+    state.init_state_dir(tmp_path)
+    _guarded_supervised_agent(tmp_path)
+    show = AsyncMock(side_effect=OrcaError(
+        "Orca contract mismatch for `orchestration worker-show`", 1,
+        code="orca_contract_mismatch",
+    ))
+    retain = AsyncMock(return_value={})
+    with patch("osw.watcher.orchestration_worker_show", show), \
+         patch("osw.watcher.orchestration_worker_retain", retain), \
+         patch("osw.watcher.orchestration_inbox", AsyncMock(return_value=[])), \
+         patch("osw.watcher.terminal_send", AsyncMock(return_value={})), \
+         patch("osw.watcher.SUPERVISED_POLL_SECS", 0.01):
+        await Watcher(tmp_path, "misc_001").run()
+
+    assert show.await_count == 1
+    assert retain.await_count == 0
+    agent = state.read_agent(tmp_path, "misc_001")
+    assert agent["state"] == "error"
+    assert agent["completion_source"] == "orca_contract_mismatch"
+    report = json.loads(
+        Path(agent["report_file"]).read_text(encoding="utf-8")
+    )
+    assert report["completion_source"] == "orca_contract_mismatch"
+    assert "orca_contract_mismatch" in [
+        e["event"] for e in _events(tmp_path)
+    ]
 
 
 # ---------------------------------------------------------------------------

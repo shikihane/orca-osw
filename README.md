@@ -9,7 +9,7 @@ A lightweight Python tool for managing Orca-backed agent sessions from the curre
 - **Directory-scoped** — each working directory is an independent management scope, even across git worktrees
 - **Detached watchers** — each managed agent gets a watcher process that monitors completion without blocking the CLI
 - **Automatic handoff** — detects task completion, sends a fixed wrap-up instruction with a pre-allocated handoff path, verifies the handoff markdown, notifies the caller terminal
-- **Supervised omp workers** — `new omp` launches through Orca's supervised orchestration: Orca creates the agent terminal and injects the task, the worker reports `worker_done` itself, and completion follows the Dispatch lifecycle instead of terminal output
+- **omp-aware readiness and completion** — omp never goes output-idle and Orca emits no `tui-idle` for it, so OSW reads its terminal title (a spinner in front means a turn is running) for both the ready gate and the turn-done verdict
 - **Takeover and recovery** — `enroll` records agent terminals OSW did not start, `guard` makes you their notification target and follows a running turn, `revive` reopens provider sessions after an Orca or PC restart, and `stop` interrupts a turn
 - **Compatibility guard** — probes the live Orca JSON contract and recovers runtime-scoped terminal handles after an Orca restart
 - **Minimal dependencies** — only `anyio`, `typer`, and optionally `rich` for colored logs
@@ -67,11 +67,11 @@ python skill/osw.py status
 - `--prefix` gives semantic agent ids such as `research_001`, `code_001`, `test_001`, `debug_001`, `review_001`, or `misc_001`; omit it for `agent_NNN`.
 - `use <agent-id>` reuses that exact agent id and terminal context; `--prefix` is only for `new` or `use <terminal-handle>`.
 - `--model` is passed through unchanged.
-- `--thinking` is translated per provider: `claude --effort`, `codex -c model_reasoning_effort=...`, `pi --thinking`, and `grok --reasoning-effort`; `kimi` rejects it because effort lives in its model configuration, `omp` rejects it because its supervised launch cannot pass an effort flag, and `dsh` rejects it (and `--model`) because its TUI entry has neither flag.
-- `models omp` reads `omp models --json`; pass one of its `provider/model` selectors to `new omp --model` (forwarded to the supervised launch as `--model`).
-- `new omp` runs as a supervised Orca worker: OSW binds the calling terminal to the project's orchestration Run (`state.json: orchestration_run_id`) and starts the worker with `orca orchestration worker-start --agent omp`, so Orca creates the terminal, waits for readiness and injects the task spec. The task turn is therefore never sent by the watcher for `omp`. OSW asks for a longer readiness budget than Orca's 60s default (`--timeout-ms 240000`); if the launch still fails, it reports the failed stage (`failedStage`/`lastError`), releases the orphan terminal Orca left behind, and removes the provisional agent record.
+- `--thinking` is translated per provider: `claude --effort`, `codex -c model_reasoning_effort=...`, `pi`/`omp --thinking`, and `grok --reasoning-effort`; `kimi` rejects it because effort lives in its model configuration, and `dsh` rejects it (and `--model`) because its TUI entry has neither flag.
+- `models omp` reads `omp models --json`; pass one of its `provider/model` selectors to `new omp --model` (forwarded to the TUI as `--model`).
+- `new omp` launches `omp --auto-approve` in an Orca terminal like every other provider: the readiness gate accepts the pane once its title has no spinner in front, the watcher sends the task prompt as its own turn, and the turn counts as done when Orca reports the pane `done` while the title stays idle. Neither signal can come from output silence — an omp status bar repaints continuously — and the supervised `orca orchestration worker-start --agent omp` lane is not used: Orca 1.4.246 waits for its own `tui-idle` readiness there, which an omp pane never emits (measured: failed at `agent_readiness` after both a 120s and a 240s budget, with the TUI sitting at its composer).
 - `new dsh` launches the DeepSeek Harness TUI with `dsh-tui .` — the entry Orca itself starts and tracks as agent `dsh`. DSH carries no model, effort or approval flag at launch: those live in DSH settings and change inside the TUI (`/model`, `/permission`), so `--model`/`--thinking` are refused rather than dropped, and OSW adds no autonomy flag. Readiness holds while DSH's own boot notice (`正在启动 DSH…` / `Starting DSH…`) is on screen: the launchpad draws its composer before the harness is up and drops a prompt sent then. Orca identifies the pane from its title (`✦ 🐋 <session>`) and takes working/done from DSH-TUI's Program Status Protocol reports; neither names a tool, so the report carries `tools_observed: null` instead of claiming none. With DSH's Orca hook bridge installed (`@deepseek-ai/dsh-hooks-claude-code` plus its runtime peers in the `dsh-tui` profile), OSW records the DSH session id during the ready wait — before the first turn's Program Status reports take over the pane record; without the bridge, `revive` needs `--session <id>`.
-- OSW adds the provider's non-blocking autonomy flag by default: `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`, `pi --approve`, `omp --auto-approve`, `kimi --yolo`, or `grok --always-approve --trust`. For `omp` this is recorded as the equivalent manual launch; the supervised worker's actual argv follows Orca's own agent-tab settings.
+- OSW adds the provider's non-blocking autonomy flag by default: `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`, `pi --approve`, `omp --auto-approve`, `kimi --yolo`, or `grok --always-approve --trust`.
 - `new` and `use` accept `--caller-terminal <handle>` to receive completion reports on a parent terminal.
 - `del --close` also asks Orca to close the terminal.
 - `list --json` outputs raw JSON.
@@ -108,9 +108,9 @@ OSW owns orchestration only: state initialization, Orca terminal creation/adopti
 ### Watcher Lifecycle
 
 ```
-wait until the pane is ready (`worktree ps` reports it done; tui-idle fallback for untracked CLIs)
+wait until the pane is ready (`worktree ps` reports it done; a title-state TUI like omp: no spinner in the title; tui-idle and preview markers for untracked CLIs)
  → send the task prompt
- → wait until Orca reports the turn done (`worktree ps`, correlated with the send time; idle fallback for untracked CLIs)
+ → wait until Orca reports the turn done (`worktree ps`, correlated with the send time; title-state TUIs skip the output-silence guard; idle fallback for untracked CLIs)
  → send the fixed wrap-up instruction with a pre-allocated handoff path
  → wait again, verify .orca/osw/handoffs/<agent>_<ts>.md exists (one retry)
  → write a JSON report and notify the caller terminal
@@ -123,38 +123,34 @@ explicit `--caller-terminal` handle.
 
 `new` starts the bare provider TUI only — the watcher always sends the task
 prompt as its own turn, so a briefly idle TUI at startup can never be
-mistaken for a completed task. The one exception is supervised `omp`:
-Orca injects the task spec at launch.
+mistaken for a completed task.
 
-### Supervised omp workers
+### omp: title-based readiness and completion
 
-`new omp` does not create a plain terminal. OSW binds the calling terminal to
-the project's orchestration Run and starts a supervised worker through
-`orca orchestration worker-start --agent omp`. The Dispatch lifecycle is a
-completion signal that depends neither on `worktree ps` nor on terminal
-silence. A manually launched omp is tracked by `worktree ps` only after its
-first turn, and at every turn end Orca drops the pane's status reports
-(it reads OSC 133;D as "command finished"); the row comes back only through
-the local `~/.omp/agent/extensions/orca-status-watchdog.ts` extension, about
-2s later, and without it omp tracking is unreliable. An omp status bar also
-repaints about once a second, so every output-idle heuristic would wait
-forever.
+omp is the one provider whose state is painted into the terminal title and
+nowhere else: `⠋ π - <task>` while a turn runs, `OMP - <task>` (or
+`OMP > <worktree>`) once it is back at its composer, over a
+model/folder/context band. Its status bar also repaints about once a second,
+so the pane is never output-silent, and Orca emits no `tui-idle` for it. OSW
+therefore reads the title:
 
-```
-Orca waits for terminal readiness and injects the task spec (which carries
-the handoff/report contract)
- → the worker does the task, writes the handoff markdown, and sends
-   `worker_done --report-path <handoff>` itself
- → the watcher polls `orca orchestration worker-show` until the Dispatch
-   settles, then verifies the handoff file (sending the standard wrap-up
-   turn as a fallback when the worker skipped the contract)
- → the report records `orchestration_outcome`; the worker terminal is kept
-   live with `worker-retain`; the caller is notified
-```
+- readiness: the pane counts as ready when the title carries no spinner and
+  the composer band is drawn (a just-created pane whose title Orca already
+  named has no band yet, so it is not mistaken for a ready one);
+- completion: a `done` row from `worktree ps`, held across two polls,
+  counts once the title has no spinner — the output-silence guard other
+  providers use can never pass here.
 
-`del --close` releases a settled supervised worker (`worker-release`) or
-stops a running one (`worker-stop`); a caller terminal already bound to a
-different Run is rebound, recorded as an `orchestration_run_rebound` event.
+Both rules are what make the classic send-and-watch lane work for omp.
+Orca's supervised lane (`orca orchestration worker-start --agent omp`) is
+not used: 1.4.246 waits for its own `tui-idle` readiness there, and an omp
+pane parks at its composer with the signal never firing (measured: two runs
+failing at `agent_readiness` after 120s and 240s budgets). A `terminal
+create` pane for the same TUI does report hook status and `worktree ps` rows
+per turn, which is all the watcher needs. Agents launched with that lane by
+older OSW versions keep their `dispatch_id` and are still supervised through
+`orca orchestration worker-show`; `del --close` releases or stops them
+(`worker-release` / `worker-stop`).
 
 ## Takeover and Recovery
 

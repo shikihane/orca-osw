@@ -507,9 +507,12 @@ async def orchestration_worker_start(
 def worker_start_receipt(data: dict) -> dict:
     """Validated `worker-start` receipt: lifecycle ids + agent terminal.
 
-    The agent terminal handle comes from the terminal effect the start
-    created; it is the pane later `terminal send` calls address (the
-    handoff fallback), while completion runs on the Dispatch id.
+    The agent terminal handle is the pane later `terminal send` calls
+    address (the handoff fallback), while completion runs on the
+    Dispatch id. Orca's concise receipt (what a start prints without
+    `--full`) carries it both as the derived `terminal` field and, on
+    older hosts, only as a terminal effect; `--full` is not an option
+    here because it also turns an unobserved turn start into exit 1.
     """
     result = _result_object(data, "orchestration worker-start")
     dispatch_id = str(result.get("dispatchId") or "")
@@ -520,9 +523,9 @@ def worker_start_receipt(data: dict) -> dict:
             "orchestration worker-start",
             "result.dispatchId and result.taskId to be present",
         )
-    handle = ""
+    handle = str(result.get("terminal") or "")
     effects = result.get("effects")
-    if isinstance(effects, list):
+    if not handle and isinstance(effects, list):
         for effect in effects:
             if (isinstance(effect, dict)
                     and effect.get("kind") == "terminal"
@@ -538,9 +541,23 @@ def worker_start_receipt(data: dict) -> dict:
 
 
 async def orchestration_worker_show(dispatch_id: str) -> dict:
+    """Full `worker-show` record: dispatch, worker, projection, observation.
+
+    Without `--full` Orca prints the agent-facing table of one-line
+    fields (state, stage, liveness, waitingOnHuman, lastError) and drops
+    the records themselves, so the settlement view below has nothing to
+    read. `--full` is the same payload the CLI has always returned.
+    """
     return await run_orca(
-        "orchestration", "worker-show", "--dispatch", dispatch_id,
+        "orchestration", "worker-show", "--dispatch", dispatch_id, "--full",
     )
+
+
+# Orca's settlement vocabulary, from the fleet outcome ladder it uses
+# for worker-list, worker-show and the fleet panel alike.
+SETTLED_DISPATCH_STATUSES = ("completed", "failed", "circuit_broken", "stopped")
+SETTLED_WORKER_STATES = ("succeeded", "failed", "stopped", "abandoned")
+SETTLED_WORKER_STAGES = ("settled", "assignment_settled")
 
 
 def worker_settlement(data: dict) -> dict:
@@ -569,10 +586,17 @@ def worker_settlement(data: dict) -> dict:
     dispatch_status = str(dispatch.get("status") or "")
     worker_state = str(worker.get("state") or "")
     worker_stage = str(worker.get("stage") or "")
+    # Orca's own settlement ladder (out/shared/orchestration-fleet-
+    # outcome-resolution.js): a Dispatch ends completed, failed or
+    # circuit_broken; the worker row ends succeeded, failed, stopped or
+    # abandoned. `unsupervised` is the pre-v3 worker state of a Dispatch
+    # that never had a supervised process — only its Dispatch status
+    # settles it. Stage names cover hosts that settle via the projection
+    # (`settled`, and the newer `assignment_settled`).
     settled = (
-        dispatch_status in ("completed", "failed", "stopped")
-        or worker_stage == "settled"
-        or worker_state in ("succeeded", "failed", "stopped", "abandoned")
+        dispatch_status in SETTLED_DISPATCH_STATUSES
+        or worker_stage in SETTLED_WORKER_STAGES
+        or worker_state in SETTLED_WORKER_STATES
     )
     outcome = str(
         projection.get("outcome")
@@ -580,9 +604,12 @@ def worker_settlement(data: dict) -> dict:
         or worker_state
         or dispatch_status
     )
-    agent_wait = ""
-    if isinstance(observation, dict) and observation.get("agentWait"):
-        agent_wait = str(observation.get("agentWait"))
+    wait = observation.get("agentWait") \
+        if isinstance(observation, dict) else None
+    if isinstance(wait, dict):
+        agent_wait = str(wait.get("reason") or "interactive prompt")
+    else:
+        agent_wait = str(wait or "")
     liveness = projection.get("liveness")
     liveness = liveness if isinstance(liveness, dict) else {}
     evidence = projection.get("evidence")
@@ -655,13 +682,16 @@ def worker_asks(
     terminal: str = "",
     pane_key: str = "",
 ) -> list[dict]:
-    """Unanswered questions and escalations one worker raised, oldest first.
+    """One worker's questions and escalations, oldest first.
 
-    A question comes `from_handle: dispatch:<id>`, an escalation from the
-    worker's terminal handle with its `sender_pane_key`; both carry the
-    Dispatch id in their JSON `payload`, and any of these identifies the
-    worker. A message counts as answered once another message joins its
-    thread (`thread_id` naming it), which is how a `reply` threads.
+    An inbox row names its sender in `from`: the worker's terminal
+    handle when it has one, its Dispatch id otherwise (Orca's view
+    strips the `dispatch:` prefix). Every message also carries the
+    Dispatch id in its JSON `payload`, and any of these identifies the
+    worker. Older hosts shipped the same facts as `from_handle`,
+    `sender_pane_key`, `thread_id` and `sequence`; those keys are read
+    when present, and a threaded reply still answers the message it
+    names.
     """
     rows = [m for m in messages if isinstance(m, dict) and m.get("id")]
     answered = {
@@ -670,18 +700,22 @@ def worker_asks(
     }
     senders = {terminal} if terminal else set()
     if dispatch_id:
-        senders.add(f"dispatch:{dispatch_id}")
+        senders.update({dispatch_id, f"dispatch:{dispatch_id}"})
     asks = []
     for message in rows:
         if message.get("type") not in ASK_MESSAGE_TYPES:
             continue
         if str(message["id"]) in answered:
             continue
-        if message.get("from_handle") in senders \
+        if message.get("from") in senders \
+                or message.get("from_handle") in senders \
                 or (pane_key and message.get("sender_pane_key") == pane_key) \
                 or (dispatch_id and _payload_dispatch_id(message) == dispatch_id):
             asks.append(message)
-    return sorted(asks, key=lambda m: int(m.get("sequence") or 0))
+    if any("sequence" in message for message in asks):
+        return sorted(asks, key=lambda m: int(m.get("sequence") or 0))
+    # No sequence numbers: the inbox is newest first.
+    return list(reversed(asks))
 
 
 async def orchestration_worker_release(dispatch_id: str) -> dict:

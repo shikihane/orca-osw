@@ -49,9 +49,10 @@ python <skill-dir>/osw.py new <provider> --prefix <role> --model <model> --think
 ```
 
 Use `research`, `code`, `test`, `debug`, `review`, or `misc` for `<role>`.
-`omp` dispatches run through Orca's supervised orchestration: Orca creates
-the terminal and injects the task, and the worker writes the handoff itself
-before reporting `worker_done`. Do not pass `--thinking` for `omp`.
+`omp` dispatches run in a normal Orca terminal like every other provider; the
+watcher sends the task turn and reads the pane title for readiness and
+completion (an omp status bar never goes output-idle). Write the handoff
+yourself when you are the worker — the watcher verifies it either way.
 Continue the same task context after the worker finishes:
 
 ```text

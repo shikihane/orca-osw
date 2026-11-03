@@ -9,7 +9,7 @@
 - **目录隔离** — 每个工作目录是独立的管理范围，即使跨 git worktree 也互不影响
 - **Detached watcher** — 每个受管 agent 都有独立 watcher 进程，监控完成状态且不阻塞 CLI
 - **自动交接** — 检测任务完成后发送固定的收尾指令（含预分配的交接文件路径），校验交接 markdown 已写入，通知调用方终端
-- **受监督的 omp worker** — `new omp` 走 Orca 的受监督编排：Orca 创建 agent 终端并注入任务，worker 自行上报 `worker_done`，完成判定跟随 Dispatch 生命周期而不是终端输出
+- **omp 标题态就绪与完成** — omp 从不进入输出空闲，Orca 也不为它发 `tui-idle`，因此 OSW 读取终端标题（前面有旋转符表示本轮正在运行）作为就绪判据与本轮完成判据
 - **接管与恢复** — `enroll` 登记不是 OSW 启动的 agent 终端，`guard` 让你成为它们的通知对象并跟踪进行中的一轮，`revive` 在 Orca 或 PC 重启后重新拉起 provider 会话，`stop` 中断当前一轮
 - **兼容性防线** — 检查 Orca 实时 JSON 契约，并在 Orca 重启后恢复运行时级终端句柄
 - **最少依赖** — 仅需 `anyio`、`typer`，可选 `rich` 获得彩色日志
@@ -66,11 +66,11 @@ python skill/osw.py status
 - `--prefix` 生成语义化 agent id，例如 `research_001`、`code_001`、`test_001`、`debug_001`、`review_001`、`misc_001`；省略时使用 `agent_NNN`。
 - `use <agent-id>` 会复用这个确切的 agent id 和终端上下文；`--prefix` 只用于 `new` 或 `use <terminal-handle>`。
 - `--model` 原样传给 provider。
-- `--thinking` 按 provider 转换：`claude --effort`、`codex -c model_reasoning_effort=...`、`pi --thinking`、`grok --reasoning-effort`；`kimi` 的 effort 位于模型配置中，因此会拒绝该参数；`omp` 的受监督发射通道无法表达 effort，因此同样拒绝；`dsh` 的 TUI 入口既没有 model 也没有 effort 参数，因此 `--model` 与 `--thinking` 都会被拒绝。
-- `models omp` 读取 `omp models --json`；将其中的 `provider/model` selector 传给 `new omp --model`（作为 `--model` 转发给受监督发射）。
-- `new omp` 以受监督 Orca worker 运行：OSW 先把调用方终端绑定到项目的编排 Run（`state.json: orchestration_run_id`），再通过 `orca orchestration worker-start --agent omp` 发射——Orca 负责建终端、等就绪并注入任务 spec 本身。因此 `omp` 的任务轮不由 watcher 发送。OSW 使用比 Orca 默认 60s 更宽的就绪预算（`--timeout-ms 240000`）；若仍然失败，会报告失败阶段（`failedStage`/`lastError`）、释放 Orca 遗留的孤儿终端，并清掉占位 agent 记录。
+- `--thinking` 按 provider 转换：`claude --effort`、`codex -c model_reasoning_effort=...`、`pi`/`omp --thinking`、`grok --reasoning-effort`；`kimi` 的 effort 位于模型配置中，因此会拒绝该参数；`dsh` 的 TUI 入口既没有 model 也没有 effort 参数，因此 `--model` 与 `--thinking` 都会被拒绝。
+- `models omp` 读取 `omp models --json`；将其中的 `provider/model` selector 传给 `new omp --model`（作为 `--model` 转发给 TUI）。
+- `new omp` 与其他 provider 一样，在 Orca 终端里启动 `omp --auto-approve`：标题前面没有旋转符且输入框状态栏已画出时视为就绪，任务提示由 watcher 作为独立一轮发送，Orca 报告该面板 `done` 且标题保持空闲时视为本轮完成。这两个信号都不可能来自"输出安静"——omp 状态栏持续重绘——也不再走受监督的 `orca orchestration worker-start --agent omp` 通道：Orca 1.4.246 在那里等待自己的 `tui-idle` 就绪信号，而 omp 面板永远不会发出（实测：120s 与 240s 两种就绪预算下都停在 `agent_readiness` 失败，此时 TUI 已停在输入框）。
 - `new dsh` 用 `dsh-tui .` 启动 DeepSeek Harness TUI——正是 Orca 自己启动并识别为 agent `dsh` 的入口。DSH 的启动命令没有 model、effort 或批准参数：这些都在 DSH 设置里，并在 TUI 内用 `/model`、`/permission` 改变，因此 `--model`/`--thinking` 直接拒绝而不是静默丢弃，OSW 也不添加自主权参数。DSH 自己的启动提示（`正在启动 DSH…` / `Starting DSH…`）还在屏幕上时，就绪会被推迟：launchpad 在 harness 起来之前就画出输入框，此时发出的 prompt 会被丢弃。Orca 用终端标题（`✦ 🐋 <session>`）识别该面板，working/done 取自 DSH-TUI 的 Program Status Protocol 上报；两者都不报告工具名，因此报告写 `tools_observed: null`，而不是断言“没有工具调用”。装好 DSH 的 Orca hook 桥（`@deepseek-ai/dsh-hooks-claude-code` 及其运行时 peer，装进 `dsh-tui` profile）后，OSW 会在就绪等待阶段就记录会话 id——赶在第一回合的 Program Status 上报接管该面板记录之前；没装桥时 `revive` 需要 `--session <id>`。
-- OSW 默认添加 provider 的非阻塞/批准类启动参数：`claude --dangerously-skip-permissions`、`codex --dangerously-bypass-approvals-and-sandbox`、`pi --approve`、`omp --auto-approve`、`kimi --yolo`、`grok --always-approve --trust`。`omp` 记录的是等价的手动启动命令；受监督 worker 的实际 argv 跟随 Orca 自己的 agent 标签页设置。
+- OSW 默认添加 provider 的非阻塞/批准类启动参数：`claude --dangerously-skip-permissions`、`codex --dangerously-bypass-approvals-and-sandbox`、`pi --approve`、`omp --auto-approve`、`kimi --yolo`、`grok --always-approve --trust`。
 - `new` 和 `use` 支持 `--caller-terminal <句柄>`，指定接收完成报告的父终端。
 - `del --close` 同时让 Orca 关闭终端。
 - `list --json` 输出原始 JSON。
@@ -105,9 +105,9 @@ OSW 只负责编排：初始化状态、创建或接管 Orca 终端、启动 det
 ### 观察者生命周期
 
 ```
-等待面板就绪（`worktree ps` 报告 done；未识别 CLI 回退到 tui-idle）
+等待面板就绪（`worktree ps` 报告 done；omp 这类标题型 TUI 看标题无旋转符；未识别 CLI 回退到 tui-idle / 预览标记）
  → 发送任务提示
- → 等待 Orca 报告该轮完成（`worktree ps`，与发送时间相关联；未识别 CLI 回退到空闲检测）
+ → 等待 Orca 报告该轮完成（`worktree ps`，与发送时间相关联；标题型 TUI 跳过"输出安静"判据；未识别 CLI 回退到空闲检测）
  → 发送固定收尾指令，附带预分配的交接文件路径
  → 再次等待，校验 .orca/osw/handoffs/<agent>_<ts>.md 已写入（重试一次）
  → 写入 JSON 报告并通知调用方终端
@@ -118,31 +118,28 @@ OSW 只负责编排：初始化状态、创建或接管 Orca 终端、启动 det
 显式传入 `--caller-terminal`。
 
 `new` 只启动裸 provider TUI——任务提示始终由 watcher 作为独立一轮发送，
-因此启动瞬间的 TUI 空闲状态不可能被误判为任务完成。唯一例外是受监督的
-`omp`：任务 spec 在发射时由 Orca 注入。
+因此启动瞬间的 TUI 空闲状态不可能被误判为任务完成。
 
-### 受监督的 omp worker
+### omp：按标题判断就绪与完成
 
-`new omp` 不再创建裸终端。OSW 先把调用方终端绑定到项目的编排 Run，再通过
-`orca orchestration worker-start --agent omp` 发射受监督 worker。Dispatch
-生命周期是**既不依赖 `worktree ps`、也不依赖终端静默**的完成信号。手动启动的
-omp 在完成第一轮之后才会被 `worktree ps` 追踪；而且每轮结束时 Orca 会因 OSC
-133;D（被当作"命令结束"）暂时丢弃该面板的状态上报，要靠本机扩展
-`~/.omp/agent/extensions/orca-status-watchdog.ts` 约 2 秒后补回，没有这个扩展时
-omp 的追踪不可靠。omp 状态栏还约每秒重绘一次，任何"输出安静"判据都会永远等待。
+omp 是唯一把状态只画在终端标题里的 provider：一轮运行时是
+`⠋ π - <任务>`，回到输入框后是 `OMP - <任务>`（或 `OMP > <工作区>`），下方是
+模型/目录/上下文状态栏。它的状态栏约每秒重绘一次，面板永远不会"输出安静"，
+Orca 也不会为它发出 `tui-idle`。因此 OSW 读标题：
 
-```
-Orca 等终端就绪并注入任务 spec（spec 自带交接/报告契约）
- → worker 完成任务、写出交接 markdown，并自行发送
-   `worker_done --report-path <handoff>`
- → watcher 轮询 `orca orchestration worker-show` 直到 Dispatch 结算，然后校验
-   交接文件（worker 未按契约执行时，回退发送标准收尾指令补齐）
- → 报告记录 `orchestration_outcome`；worker 终端以 `worker-retain` 保留；通知调用方
-```
+- 就绪：标题前面没有旋转符且输入框状态栏已画出（刚建好、Orca 已命名的面板
+  还没有状态栏，因此不会被误判为就绪）；
+- 完成：`worktree ps` 的 `done` 行连续两次看到、且标题不再带旋转符即算完成
+  ——其他 provider 用的"输出安静"判据在这里永远不可能成立。
 
-`del --close` 对已结算的受监督 worker 执行 `worker-release`，对仍在运行的
-执行 `worker-stop`；若调用方终端已绑定到其他 Run，会被重新绑定并记录
-`orchestration_run_rebound` 事件。
+这两条规则才让经典的发-观望通道对 omp 可用。Orca 的受监督通道
+（`orca orchestration worker-start --agent omp`）不再使用：1.4.246 在那里等待
+自己的 `tui-idle` 就绪信号，而 omp 面板停在输入框时该信号永不触发（实测：
+120s 与 240s 预算下都停在 `agent_readiness` 失败）。同一 TUI 的
+`terminal create` 面板每轮都会上报 hook 状态和 `worktree ps` 行，这正是
+watcher 需要的。更早版本 OSW 用该通道发射的 agent 仍保有 `dispatch_id`，
+继续通过 `orca orchestration worker-show` 受监督；`del --close` 对它们执行
+`worker-release` / `worker-stop`。
 
 ## 接管与恢复
 

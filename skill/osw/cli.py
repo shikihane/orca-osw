@@ -1961,11 +1961,15 @@ def revive(
         },
     )
 
-    if supervised_agent_id(provider):
+    if agent.get("launch_mode") == "supervised" or supervised_agent_id(provider):
         # Old Dispatches name dead handles; release, then claim the new
         # terminal with a fresh one. Only an interrupted task gets a
         # Dispatch now: worker-start always injects a task spec, and a
         # later `use` claims an idle supervised terminal the same way.
+        # A record from a provider the current Orca no longer supports
+        # for supervised launches (see providers.SUPERVISED_PROVIDERS)
+        # keeps nothing from that lane: the watcher runs it as a plain
+        # agent instead of polling a Dispatch that will never settle.
         old_dispatch = str(agent.get("dispatch_id") or "")
         if old_dispatch:
             try:
@@ -1975,15 +1979,21 @@ def revive(
                     "old dispatch %s not released (%s)",
                     old_dispatch, _release_summary(exc),
                 )
-        agent.update({
-            "launch_mode": "supervised",
-            "orchestration_agent": supervised_agent_id(provider),
-            "run_id": "",
-            "task_id": "",
-            "dispatch_id": "",
-            "handoff_path": "",
-        })
-        if was_running:
+        supervised_agent = supervised_agent_id(provider)
+        if supervised_agent:
+            agent.update({
+                "launch_mode": "supervised",
+                "orchestration_agent": supervised_agent,
+                "run_id": "",
+                "task_id": "",
+                "dispatch_id": "",
+                "handoff_path": "",
+            })
+        else:
+            for field in ("launch_mode", "orchestration_agent", "run_id",
+                          "task_id", "dispatch_id"):
+                agent.pop(field, None)
+        if was_running and supervised_agent:
             up = anyio.run(
                 _wait_agent_identity, handle, provider,
                 REVIVE_AGENT_START_TIMEOUT_SECS,

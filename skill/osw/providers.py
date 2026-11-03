@@ -77,12 +77,19 @@ def normalize_provider(name: str) -> str:
 
 
 # Providers OSW launches through Orca's supervised orchestration
-# (`orchestration worker-start`), mapped to their Orca agent id. Orca
-# owns terminal creation, readiness and prompt injection there, which
-# is exactly what gives the pane an agent launch authority; without it
-# Orca drops the pane's hook status posts and OSW has no completion
-# signal left for TUIs that never stop repainting (omp).
-SUPERVISED_PROVIDERS = {"omp": "omp"}
+# (`orchestration worker-start`), mapped to their Orca agent id.
+#
+# Empty on purpose. Orca 1.4.246 made an `--agent` launch wait for its
+# own tui-idle readiness, and omp — the only provider that was ever
+# launched this way — never satisfies it: its TUI repaints its status
+# bar continuously, so neither output silence nor a composer marker
+# arrives, and `terminal wait --for tui-idle` times out on a pane that
+# is visibly sitting at its composer (measured: 120s and 240s budget,
+# both `failedStage=agent_readiness`). A `terminal create` pane for the
+# same TUI does report hook status and `worktree ps` rows per turn, so
+# the classic lane is the one that works; `osw new` uses it for every
+# provider.
+SUPERVISED_PROVIDERS: dict[str, str] = {}
 
 
 def supervised_agent_id(provider: str) -> str | None:
