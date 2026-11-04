@@ -11,7 +11,7 @@ watcher wires these together:
   decide:    act / shadow / notify for (provider, kind) under the Jev
              mode; only whitelisted pairs are ever acted on, and only in
              `enforce`
-  lock:      one update per provider per machine at a time
+  lock:      one update per provider per host at a time
 
 The whitelist only takes a (provider, kind) pair whose screen has a
 recorded sample under tests/fixtures/frames/<provider>/<kind>.json, and
@@ -157,8 +157,13 @@ def decide(provider: str, kind: str, mode: str, frame_text: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Machine-wide update lock: one updating pane per provider
+# Update lock: one updating pane per provider per host
 # ---------------------------------------------------------------------------
+
+# Anything outside this class is replaced: the host part must be a name
+# both a Windows and a POSIX file system keep unchanged.
+_HOST_SLUG_UNSAFE = re.compile(r"[^a-z0-9_-]+")
+
 
 def update_lock_dir() -> Path:
     """User-level lock directory, shared by every project on the machine."""
@@ -166,8 +171,25 @@ def update_lock_dir() -> Path:
     return Path(base) / "osw" / "locks"
 
 
-def update_lock_path(provider: str, directory: Path | None = None) -> Path:
-    return (directory or update_lock_dir()) / f"update-{provider}.lock"
+def _host_slug(host: str) -> str:
+    """The host part of a lock file name; "" for this machine."""
+    slug = _HOST_SLUG_UNSAFE.sub("-", (host or "").strip().lower()).strip("-")
+    return "" if slug == "local" else slug
+
+
+def update_lock_path(
+    provider: str, directory: Path | None = None, host: str = "",
+) -> Path:
+    """Lock file for one provider on one host.
+
+    A local host keeps the historical name byte-for-byte, so a fleet
+    upgrade does not orphan the lock a local pane is already holding.
+    """
+    base = directory or update_lock_dir()
+    slug = _host_slug(host)
+    if not slug:
+        return base / f"update-{provider}.lock"
+    return base / f"update-{provider}--{slug}.lock"
 
 
 def _lock_expired(path: Path, now: float, ttl_secs: float) -> bool:
@@ -204,8 +226,9 @@ def acquire_update_lock(
     *,
     directory: Path | None = None,
     ttl_secs: float = UPDATE_LOCK_TTL_SECS,
+    host: str = "",
 ) -> bool:
-    """Take the machine-wide update lock for `provider`; False if held.
+    """Take the update lock for `provider` on `host`; False if held.
 
     The lock file itself is the lock (`open(..., "x")`). An expired lock
     — its holder crashed or never released — is broken by renaming it
@@ -214,7 +237,7 @@ def acquire_update_lock(
     refreshed in between is put back.
     """
     owner = owner or f"pid:{os.getpid()}"
-    path = update_lock_path(provider, directory)
+    path = update_lock_path(provider, directory, host)
     path.parent.mkdir(parents=True, exist_ok=True)
     now = time.time()
     if _create_lock(path, owner, now, ttl_secs):
@@ -242,10 +265,11 @@ def release_update_lock(
     owner: str = "",
     *,
     directory: Path | None = None,
+    host: str = "",
 ) -> bool:
     """Release the lock if `owner` holds it; True when a lock was removed."""
     owner = owner or f"pid:{os.getpid()}"
-    path = update_lock_path(provider, directory)
+    path = update_lock_path(provider, directory, host)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):

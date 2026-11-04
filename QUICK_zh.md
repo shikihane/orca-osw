@@ -122,3 +122,37 @@ python /path/to/orca-osw/skill/osw.py del agent_001 --close  # 同时关闭终�
 ```
 
 运行时 agent 记录位于 `.orca/osw/agents/`。使用 `models <provider>` 查看 provider 选项；OSW 不把模型配置写入 state。
+
+## 12. 在另一台主机上跑 agent
+
+机器登记一次，之后按名字派单：
+
+```bash
+python /path/to/orca-osw/skill/osw.py host add fnnas --ssh fnnas --worktree path:/srv/repo
+python /path/to/orca-osw/skill/osw.py host doctor fnnas --provider claude
+python /path/to/orca-osw/skill/osw.py new --on fnnas claude --prefix code "修复失败的测试"
+```
+
+`host doctor` 依次检查：该机能否通过 SSH 应答、那台机器的 Orca 是否已登记 workspace、是否有 worktree 匹配选择器、provider CLI 是否已安装。首个失败即停止，并打印该阶的错误码：`host_unreachable`、`host_permission_denied`、`remote_no_project`、`remote_no_worktree` 或 `provider_missing`。完整错误码列表与交接细节见 [README_zh.md](README_zh.md#跨主机运行)。
+
+派单走的是经典通道：OSW 在那台机器上创建终端（`terminal create --environment fnnas --worktree <选择器> --command "<provider 绝对路径> <自主权参数>"`），由本机 watcher 发送提示、读取面板，并通过 SSH 收取交接文件。远端 agent 没有 Dispatch id，Run 留在本机、远端用不到。Orca 的受监督 `worker-start --on` 通道不再使用：Orca 1.4.248 面对配对服务器时，就绪判定是 `host_indeterminate`——`worker-start` 停在 `agent_readiness` 达 240s，而远端面板明明停在输入框；对同一个空闲面板执行 `terminal wait --for tui-idle` 同样超时；`terminal send`/`read` 与 `worktree ps` 则都有应答。
+
+```
+# new --on 在远端实际执行的东西
+orca terminal create --environment fnnas --worktree <选择器> \
+     --command "/usr/local/bin/claude --dangerously-skip-permissions"
+```
+
+如果该账户从未运行过这个 provider，先在那个面板里手动启动一次：首次运行的主题/安全/绕过确认弹窗，任何就绪探测都清不掉。目录信任是例外——`new` 会通过 SSH 预写，因此那一步提示不会出现。
+
+那台机器只需要：本机可达的 `sshd` 且本机密钥已授权、Orca 里已登记的 workspace、以及 provider CLI。不需要安装 OSW、不需要常驻进程、不需要辅助脚本、也不需要克隆仓库。Orca 配对对运行是可选的——它用于在 Orca 界面里查看远端终端，也是派单的寻址方式。
+
+之后用 `<host>/<agent_id>` 寻址（`fnnas/code_001`；`local/` 可省略）。这一轮结束时，交接文件会被复制到本地 `.orca/osw/handoffs/`，并按与本地相同的规则判定，完成报告仍送到本机的监护方终端：
+
+```bash
+python /path/to/orca-osw/skill/osw.py list --all     # HOST 列，本地与远端同一张表
+python /path/to/orca-osw/skill/osw.py status --all   # 按主机统计
+python /path/to/orca-osw/skill/osw.py del fnnas/code_001 --close
+```
+
+`host list` 显示已登记主机以及它们当前是否可达；`host rm <name>` 删除记录。

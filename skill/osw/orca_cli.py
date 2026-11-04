@@ -7,10 +7,9 @@ import shutil
 import sys
 import time
 
-import anyio
+import anyio  # the single process runner lives in osw.hosts
 
 from osw.log import get_logger
-from osw.process import hidden_subprocess_kwargs
 
 log = get_logger("orca")
 
@@ -64,8 +63,19 @@ def resolve_orca_command() -> list[str]:
     return [path, *parts[1:]]
 
 
-async def run_orca(*args: str) -> dict:
-    cmd = [*resolve_orca_command(), *args]
+async def run_orca(*args: str, host: "Host | None" = None) -> dict:
+    """One Orca CLI call through the host seam.
+
+    The host owns command construction: a local host runs the local
+    CLI, a remote host runs the same local CLI against the paired
+    runtime (`--environment`). The Run and the inbox stay local, which
+    is what keeps completion reports and relayed questions on the path
+    local agents already use.
+    """
+    from osw.hosts import Host, local_host, run_process
+
+    host = host or local_host()
+    cmd = host.orca_argv(args)
     if "--json" not in cmd:
         cmd.append("--json")
 
@@ -73,11 +83,7 @@ async def run_orca(*args: str) -> dict:
 
     try:
         started = time.monotonic()
-        result = await anyio.run_process(
-            cmd,
-            check=False,
-            **hidden_subprocess_kwargs(),
-        )
+        result = await run_process(cmd)
     except FileNotFoundError:
         raise OrcaError(
             "Orca CLI not found. Make sure 'orca' is installed and on PATH.",
@@ -179,8 +185,8 @@ def _object_entries(values: list, command: str, entry_name: str) -> list[dict]:
     return values
 
 
-async def orca_status() -> dict:
-    return await run_orca("status")
+async def orca_status(*, host: "Host | None" = None) -> dict:
+    return await run_orca("status", host=host)
 
 
 async def compatibility_report() -> dict:
@@ -272,13 +278,15 @@ async def compatibility_report() -> dict:
     }
 
 
-async def worktree_current() -> dict:
-    return await run_orca("worktree", "current")
+async def worktree_current(*, host: "Host | None" = None) -> dict:
+    return await run_orca("worktree", "current", host=host)
 
 
-async def terminal_list(worktree: str = "active") -> list[dict]:
+async def terminal_list(
+    worktree: str = "active", *, host: "Host | None" = None,
+) -> list[dict]:
     data = await run_orca(
-        "terminal", "list", "--worktree", worktree,
+        "terminal", "list", "--worktree", worktree, host=host,
     )
     if isinstance(data, list):
         return _object_entries(data, "terminal list", "terminal")
@@ -290,7 +298,9 @@ async def terminal_list(worktree: str = "active") -> list[dict]:
     raise _contract_error("terminal list", "result.terminals to be a list")
 
 
-async def terminal_create(command: str, worktree: str = "active") -> dict:
+async def terminal_create(
+    command: str, worktree: str = "active", *, host: "Host | None" = None,
+) -> dict:
     return await run_orca(
         "terminal",
         "create",
@@ -298,10 +308,13 @@ async def terminal_create(command: str, worktree: str = "active") -> dict:
         worktree,
         "--command",
         command,
+        host=host,
     )
 
 
-async def terminal_send(handle: str, text: str, enter: bool = True) -> dict:
+async def terminal_send(
+    handle: str, text: str, enter: bool = True, *, host: "Host | None" = None,
+) -> dict:
     """Write `text` to the terminal; append Enter when `enter` is set.
 
     `enter=False` is the raw-write half of the two-stage send used for
@@ -315,16 +328,22 @@ async def terminal_send(handle: str, text: str, enter: bool = True) -> dict:
         args += ["--text", text]
     if enter:
         args.append("--enter")
-    return await run_orca(*args)
+    return await run_orca(*args, host=host)
 
 
-async def terminal_interrupt(handle: str) -> dict:
+async def terminal_interrupt(
+    handle: str, *, host: "Host | None" = None,
+) -> dict:
     """Send Ctrl-C (`\\x03`) to the terminal: the interrupt key for
     claude, codex, kimi and grok."""
-    return await run_orca("terminal", "send", "--terminal", handle, "--interrupt")
+    return await run_orca(
+        "terminal", "send", "--terminal", handle, "--interrupt", host=host,
+    )
 
 
-async def terminal_send_dialog_enter(handle: str) -> dict:
+async def terminal_send_dialog_enter(
+    handle: str, *, host: "Host | None" = None,
+) -> dict:
     """Press Enter on a CLI dialog Orca's prompt gate refuses to type into.
 
     Orca answers a plain send to codex's update dialog with
@@ -334,18 +353,21 @@ async def terminal_send_dialog_enter(handle: str) -> dict:
     """
     return await run_orca(
         "terminal", "send", "--terminal", handle,
-        "--text", "", "--enter", "--interrupt",
+        "--text", "", "--enter", "--interrupt", host=host,
     )
 
 
-async def terminal_send_escape(handle: str) -> dict:
+async def terminal_send_escape(
+    handle: str, *, host: "Host | None" = None,
+) -> dict:
     """Send a bare Esc byte, no Enter: the interrupt key for pi and omp,
     which ignore Ctrl-C (research 2026-10-11 V1/V8)."""
-    return await terminal_send(handle, "\x1b", enter=False)
+    return await terminal_send(handle, "\x1b", enter=False, host=host)
 
 
 async def terminal_wait(
-    handle: str, event: str = "tui-idle", timeout_ms: int = 300000
+    handle: str, event: str = "tui-idle", timeout_ms: int = 300000,
+    *, host: "Host | None" = None,
 ) -> dict:
     return await run_orca(
         "terminal",
@@ -356,16 +378,19 @@ async def terminal_wait(
         event,
         "--timeout-ms",
         str(timeout_ms),
+        host=host,
     )
 
 
-async def terminal_close(handle: str) -> dict:
-    return await run_orca("terminal", "close", "--terminal", handle)
+async def terminal_close(handle: str, *, host: "Host | None" = None) -> dict:
+    return await run_orca(
+        "terminal", "close", "--terminal", handle, host=host,
+    )
 
 
 async def terminal_read(
     handle: str, limit: int = 200, cursor: str | None = None,
-    screen: bool = False,
+    screen: bool = False, *, host: "Host | None" = None,
 ) -> dict:
     """Read terminal output; `screen=True` returns the rendered frame.
 
@@ -379,14 +404,16 @@ async def terminal_read(
         args += ["--cursor", cursor]
     if screen:
         args.append("--screen")
-    return await run_orca(*args)
+    return await run_orca(*args, host=host)
 
 
-async def terminal_show(handle: str | None = None) -> dict:
+async def terminal_show(
+    handle: str | None = None, *, host: "Host | None" = None,
+) -> dict:
     args = ["terminal", "show"]
     if handle:
         args += ["--terminal", handle]
-    data = await run_orca(*args)
+    data = await run_orca(*args, host=host)
     result = _result_object(data, "terminal show")
     if not isinstance(result.get("terminal"), dict):
         raise _contract_error(
@@ -395,21 +422,23 @@ async def terminal_show(handle: str | None = None) -> dict:
     return data
 
 
-async def detect_current_terminal(marker: str) -> str | None:
+async def detect_current_terminal(
+    marker: str, *, host: "Host | None" = None,
+) -> str | None:
     """Find the terminal whose preview contains *marker*.
 
     The caller prints the marker to its own terminal first; this is the
     only reliable way to identify "the terminal I am running in"
     (`orca terminal show` returns the UI-focused terminal instead).
     """
-    terminals = await terminal_list()
+    terminals = await terminal_list(host=host)
     for term in terminals:
         if marker in term.get("preview", ""):
             return term.get("handle") or None
     return None
 
 
-async def worktree_ps() -> list[dict]:
+async def worktree_ps(*, host: "Host | None" = None) -> list[dict]:
     """Orchestration summary across worktrees.
 
     Each worktree row carries an ``agents`` list: Orca's own structured
@@ -417,7 +446,7 @@ async def worktree_ps() -> list[dict]:
     (working/done), current prompt, toolName, lastAssistantMessage,
     stateStartedAt/updatedAt, and paneKey ("<tabId>:<leafId>").
     """
-    data = await run_orca("worktree", "ps")
+    data = await run_orca("worktree", "ps", host=host)
     if isinstance(data, dict):
         worktrees = data.get("result", {}).get("worktrees")
         if isinstance(worktrees, list):
@@ -436,36 +465,51 @@ async def worktree_ps() -> list[dict]:
 # output going quiet — the only signal that works for a TUI like omp
 # whose status bar repaints about once a second.
 
-async def orchestration_run_current() -> dict:
+async def orchestration_run_current(*, host: "Host | None" = None) -> dict:
     """The Run bound to the calling coordinator terminal (``run`` null
-    when this terminal is not bound to any Run)."""
-    data = await run_orca("orchestration", "run-current")
+    when this terminal is not bound to any Run).
+
+    Orca 1.4.248 answers with a flat ``result.runId``; older builds
+    answered with ``result.run``. Normalise to the documented ``run``
+    object so callers keep one shape.
+    """
+    data = await run_orca("orchestration", "run-current", host=host)
     result = _result_object(data, "orchestration run-current")
     run = result.get("run")
+    if run is None and result.get("runId"):
+        run = {"id": str(result["runId"])}
     if run is not None and not isinstance(run, dict):
         raise _contract_error(
             "orchestration run-current", "result.run to be an object or null"
         )
-    return result
+    return {**result, "run": run}
 
 
-async def orchestration_run_create(objective: str) -> dict:
+async def orchestration_run_create(
+    objective: str, *, host: "Host | None" = None,
+) -> dict:
     """Create a Run and bind the calling terminal to it."""
     data = await run_orca(
-        "orchestration", "run-create", "--objective", objective,
+        "orchestration", "run-create", "--objective", objective, host=host,
     )
     result = _result_object(data, "orchestration run-create")
     run = result.get("run")
+    if run is None and result.get("runId"):
+        run = {"id": str(result["runId"])}
     if not isinstance(run, dict) or not run.get("id"):
         raise _contract_error(
             "orchestration run-create", "result.run.id to be present"
         )
-    return result
+    return {**result, "run": run}
 
 
-async def orchestration_run_use(run_id: str) -> dict:
+async def orchestration_run_use(
+    run_id: str, *, host: "Host | None" = None,
+) -> dict:
     """Bind the calling terminal to an existing Run."""
-    return await run_orca("orchestration", "run-use", "--id", run_id)
+    return await run_orca(
+        "orchestration", "run-use", "--id", run_id, host=host,
+    )
 
 
 async def orchestration_worker_start(
@@ -476,6 +520,8 @@ async def orchestration_worker_start(
     model: str = "",
     terminal: str = "",
     timeout_ms: int = 0,
+    *,
+    host: "Host | None" = None,
 ) -> dict:
     """Start one supervised worker: fresh agent terminal, readiness wait
     and prompt injection are Orca's, not ours.
@@ -483,8 +529,8 @@ async def orchestration_worker_start(
     `--agent` and `--terminal` are mutually exclusive upstream: with a
     terminal handle the Dispatch reuses that already-proven worker
     terminal instead of launching a new agent. `timeout_ms` overrides
-    Orca's 60s readiness budget, which an omp cold start can exceed on
-    a loaded machine.
+    Orca's 60s readiness budget, which an omp cold start can exceed on a
+    loaded machine.
     """
     args = [
         "orchestration", "worker-start",
@@ -501,7 +547,7 @@ async def orchestration_worker_start(
         args += ["--model", model]
     if timeout_ms:
         args += ["--timeout-ms", str(timeout_ms)]
-    return await run_orca(*args)
+    return await run_orca(*args, host=host)
 
 
 def worker_start_receipt(data: dict) -> dict:
@@ -540,7 +586,9 @@ def worker_start_receipt(data: dict) -> dict:
     }
 
 
-async def orchestration_worker_show(dispatch_id: str) -> dict:
+async def orchestration_worker_show(
+    dispatch_id: str, *, host: "Host | None" = None,
+) -> dict:
     """Full `worker-show` record: dispatch, worker, projection, observation.
 
     Without `--full` Orca prints the agent-facing table of one-line
@@ -550,6 +598,7 @@ async def orchestration_worker_show(dispatch_id: str) -> dict:
     """
     return await run_orca(
         "orchestration", "worker-show", "--dispatch", dispatch_id, "--full",
+        host=host,
     )
 
 
@@ -632,14 +681,18 @@ def worker_settlement(data: dict) -> dict:
     }
 
 
-async def orchestration_worker_retain(dispatch_id: str) -> dict:
+async def orchestration_worker_retain(
+    dispatch_id: str, *, host: "Host | None" = None,
+) -> dict:
     """Record OSW's decision to keep a settled worker terminal live."""
     return await run_orca(
-        "orchestration", "worker-retain", "--dispatch", dispatch_id,
+        "orchestration", "worker-retain", "--dispatch", dispatch_id, host=host,
     )
 
 
-async def orchestration_inbox(terminal: str = "", limit: int = 0) -> list[dict]:
+async def orchestration_inbox(
+    terminal: str = "", limit: int = 0, *, host: "Host | None" = None,
+) -> list[dict]:
     """Messages from `orchestration inbox`, newest first.
 
     `--terminal` filters by *recipient* handle; without it the inbox
@@ -652,7 +705,9 @@ async def orchestration_inbox(terminal: str = "", limit: int = 0) -> list[dict]:
         args += ["--limit", str(limit)]
     if terminal:
         args += ["--terminal", terminal]
-    result = _result_object(await run_orca(*args), "orchestration inbox")
+    result = _result_object(
+        await run_orca(*args, host=host), "orchestration inbox",
+    )
     messages = result.get("messages")
     if not isinstance(messages, list):
         raise _contract_error("orchestration inbox", "result.messages to be a list")
@@ -718,15 +773,19 @@ def worker_asks(
     return list(reversed(asks))
 
 
-async def orchestration_worker_release(dispatch_id: str) -> dict:
+async def orchestration_worker_release(
+    dispatch_id: str, *, host: "Host | None" = None,
+) -> dict:
     """Release the terminal of one settled supervised worker."""
     return await run_orca(
-        "orchestration", "worker-release", "--dispatch", dispatch_id,
+        "orchestration", "worker-release", "--dispatch", dispatch_id, host=host,
     )
 
 
-async def orchestration_worker_stop(dispatch_id: str) -> dict:
+async def orchestration_worker_stop(
+    dispatch_id: str, *, host: "Host | None" = None,
+) -> dict:
     """Fence one Dispatch and stop its supervised agent terminal."""
     return await run_orca(
-        "orchestration", "worker-stop", "--dispatch", dispatch_id,
+        "orchestration", "worker-stop", "--dispatch", dispatch_id, host=host,
     )

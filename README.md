@@ -11,6 +11,7 @@ A lightweight Python tool for managing Orca-backed agent sessions from the curre
 - **Automatic handoff** — detects task completion, sends a fixed wrap-up instruction with a pre-allocated handoff path, verifies the handoff markdown, notifies the caller terminal
 - **omp-aware readiness and completion** — omp never goes output-idle and Orca emits no `tui-idle` for it, so OSW reads its terminal title (a spinner in front means a turn is running) for both the ready gate and the turn-done verdict
 - **Takeover and recovery** — `enroll` records agent terminals OSW did not start, `guard` makes you their notification target and follows a running turn, `revive` reopens provider sessions after an Orca or PC restart, and `stop` interrupts a turn
+- **Cross-host supervision** — register a machine once, dispatch with `--on <host>`, and collect the handoff locally: Orca pairing is the dispatch plane, SSH the data plane, and the remote side needs no OSW install
 - **Compatibility guard** — probes the live Orca JSON contract and recovers runtime-scoped terminal handles after an Orca restart
 - **Minimal dependencies** — only `anyio`, `typer`, and optionally `rich` for colored logs
   (`typesafe-sdk` is an optional extra used only when the Jev mode is not `off`)
@@ -24,6 +25,9 @@ A lightweight Python tool for managing Orca-backed agent sessions from the curre
 ```
 python -m pip install anyio typer rich
 ```
+
+For remote agents only: `ssh` and `sftp` on this machine, `sshd` reachable on
+the other machine, and this machine's key authorised for its account.
 
 ## Quick Start
 
@@ -48,16 +52,20 @@ python skill/osw.py status
 | `doctor [--json]` | Check runtime readiness and the live Orca response contract without writing OSW state |
 | `init` | Initialize `.orca/osw/` state directory |
 | `models <provider> [--json]` | Inspect provider model options without writing state |
-| `new <provider> [--prefix <prefix>] [--model <model>] [--thinking <value>] "<prompt>"` | Create a new agent terminal with a task |
-| `use <agent-id-or-terminal> [--prefix <prefix>] "<prompt>"` | Adopt an existing Orca terminal or continue from an OSW agent id |
-| `enroll` | Record this worktree's agent terminals that OSW did not start (`enrolled`, no watcher) |
+| `host add <name> --ssh <dest> --worktree <selector> [--environment <sel>] [--root <path>]` | Register a machine; nothing is probed or written on the far side |
+| `host list [--json]` | Registered hosts with a one-attempt reachability |
+| `host rm <name>` | Remove a host record and name the agents still referencing it |
+| `host doctor <host> [--provider <provider>] [--json]` | Probe connection → workspace → worktree → provider, stopping at the first failure |
+| `new <provider> [--on <host>] [--prefix <prefix>] [--model <model>] [--thinking <value>] "<prompt>"` | Create a new agent terminal with a task |
+| `use <agent-id-or-terminal> [--on <host>] [--prefix <prefix>] "<prompt>"` | Adopt an existing Orca terminal or continue from an OSW agent id |
+| `enroll [--on <host>]` | Record this worktree's agent terminals that OSW did not start (`enrolled`, no watcher) |
 | `guard [<agent_id>...] [--caller-terminal <handle>]` | Become the guardian (notification target) of agents; follow a running turn |
 | `revive [<agent_id> [--session <id>]]` | List resumable agents, or reopen one agent's provider session in a new terminal |
 | `stop <agent_id>` | Interrupt an agent's current turn |
 | `del <agent_id> [--close]` | Remove an agent from management |
-| `list [--json]` | List managed agents |
+| `list [--all] [--json]` | List managed agents |
 | `logs [--agent <agent_id>] [--tail N]` | Show OSW logs and events |
-| `status` | Show OSW state and agent counts |
+| `status [--all]` | Show OSW state and agent counts |
 | `jev status [--check]` | Show the global Jev switch, key/SDK/endpoint/proxy state; `--check` live-probes the endpoint |
 | — | **The mode is the global switch**: the machine-wide `OSW_JEV_MODE` environment variable (`enforce\|shadow\|off`; unset = `off`) is the only control — there is no per-project Jev config |
 
@@ -66,6 +74,8 @@ python skill/osw.py status
 - `new` accepts `claude`, `codex`, `pi`, `omp`, `kimi`, `grok`, or `dsh` as the provider.
 - `--prefix` gives semantic agent ids such as `research_001`, `code_001`, `test_001`, `debug_001`, `review_001`, or `misc_001`; omit it for `agent_NNN`.
 - `use <agent-id>` reuses that exact agent id and terminal context; `--prefix` is only for `new` or `use <terminal-handle>`.
+- `--on <host>` on `new`, `use` and `enroll` targets a registered host instead of this machine.
+- Agent references are `<host>/<agent_id>`: `fnnas/code_001` names an agent on that host, while `code_001` and `local/code_001` both name one here. An unregistered prefix is refused and the message lists the registered hosts — a typo never dispatches work elsewhere.
 - `--model` is passed through unchanged.
 - `--thinking` is translated per provider: `claude --effort`, `codex -c model_reasoning_effort=...`, `pi`/`omp --thinking`, and `grok --reasoning-effort`; `kimi` rejects it because effort lives in its model configuration, and `dsh` rejects it (and `--model`) because its TUI entry has neither flag.
 - `models omp` reads `omp models --json`; pass one of its `provider/model` selectors to `new omp --model` (forwarded to the TUI as `--model`).
@@ -93,15 +103,242 @@ Orca terminal handles are runtime-scoped. OSW persists the pane identity
 (`tabId:leafId`) when creating or adopting a terminal and uses it to rebind a
 stale handle after an Orca restart.
 
+## Cross-Host Operation
+
+OSW can supervise an agent whose terminal lives on another machine. A host is
+registered once and then addressed by name.
+
+### Two planes, one seam
+
+- **Dispatch plane** — Orca's pairing connection (`--environment <selector>`).
+  It creates the remote terminal and nothing else:
+  `terminal create --environment <host> --worktree <selector> --command
+  "<absolute provider path> <autonomy flags>"`. Readiness, prompt injection,
+  the turn lifecycle and the handoff stay with the local watcher — the same
+  classic lane a local agent uses. A remote agent has **no Dispatch id**, and
+  the Run stays local and is unused remotely.
+- **Data plane** — SSH: `ssh` for commands, `sftp` for file bytes (read,
+  write-then-rename, existence). No terminal is scraped to move bytes, so a
+  remote handoff is read at the same fidelity as a local one.
+
+**Why not Orca's supervised lane (measured 2026-11-04, Orca 1.4.248).** On a
+paired server the readiness verdict is `host_indeterminate`:
+`orchestration worker-start --on <host>` held at `agent_readiness` for 240s
+while the remote pane sat at its composer, and
+`terminal wait --for tui-idle` timed out on that same idle pane. `terminal
+send`, `terminal read` and `worktree ps` all answered. There is no ready
+signal on the far side to wait for, so the pane must be created and driven
+from here. Nobody re-enables the supervised lane for a remote host without a
+new measurement that shows a readiness signal firing there.
+
+Both planes, the host registry, agent-reference parsing and the error mapping
+live in `skill/osw/hosts.py`. The seam rule that keeps this from rotting:
+**nothing outside that module talks to Orca about another machine or touches a
+file on one.** Local calls stay byte-identical to a single-machine install, so
+the seam is invisible until a host is named.
+
+### Prerequisites on the remote host
+
+- `sshd` reachable from this machine, and this machine's key authorised for
+  that account. A refused key surfaces as `host_permission_denied`; authorise
+  it (`ssh-copy-id`) rather than debugging OSW.
+- A workspace already registered in Orca on that machine, plus the worktree
+  selector Orca uses for it — `path:/srv/repo`, or a `name:`/`branch:`/`id:`
+  selector.
+- The provider CLI installed for the SSH account. Doctor records its absolute
+  path, because a non-interactive SSH `PATH` is minimal, and remote launches
+  use that path.
+- `ssh` and `sftp` on *this* machine's `PATH`.
+- A provider that has never run for that account must be started once by hand
+  in that pane: it shows its first-run theme/security/bypass dialogs, and no
+  readiness probe can clear them. Directory trust is different — `new`
+  pre-records it over SSH, so the "trust this directory?" prompt does not
+  appear; onboarding does not.
+
+Deliberately **not** needed there: no OSW install, no resident process, no
+helper script, no clone or copy of the repository. OSW provisions nothing on
+the far side — Orca creates the terminal from a workspace that already exists.
+
+Orca pairing is optional for operation: it is how dispatch is addressed and how
+a remote terminal can be viewed in the Orca UI, but no file read or write
+depends on it. Losing a pairing costs you dispatch to that host, not OSW's
+ability to read a handoff or judge completion.
+
+### Hosts
+
+```bash
+python skill/osw.py host add fnnas --ssh fnnas --worktree path:/srv/repo
+python skill/osw.py host list
+python skill/osw.py host doctor fnnas
+python skill/osw.py host rm fnnas
+```
+
+`host add` writes one record to `.orca/osw/hosts.json` (beside `state.json`,
+not inside it): name, SSH destination, Orca environment selector (defaults to
+the name), workspace selector, and an optional `--root` for path joins. It
+probes nothing and writes nothing on the far side. Registering an existing
+name is refused with the existing record; `local` cannot be registered — it is
+this machine.
+
+`host list` prints name, SSH destination, environment, worktree and a
+one-attempt reachability: `reachable`, `unreachable` or `permission_denied`. A
+dead host is a row, never an error and never an omitted row.
+
+`host rm` removes the record and names any agent records that still reference
+it.
+
+### Doctor
+
+`host doctor <host> [--provider <provider>] [--json]` walks four rungs in order
+and stops at the first failure, so nobody is told to fix a provider on a host
+that has no workspace. It also accepts an unregistered destination
+(`host doctor myhost --ssh user@myhost --worktree path:/srv/repo`), which is
+usable before `host add`.
+
+| Rung | Check | Fails with |
+|---|---|---|
+| `connection` | one SSH command (`true`) answers | `host_unreachable`, `host_permission_denied` |
+| `workspace` | Orca on that host has a registered workspace | `remote_no_project` |
+| `worktree` | a worktree matches the recorded selector | `remote_no_worktree` |
+| `provider` | one `command -v` for the provider | `provider_missing` |
+
+Each failure prints its code and one next step. The `provider` rung records the
+absolute paths of the Orca CLI and of the provider CLI on the host record, and
+caches the remote home and platform, so later calls never depend on ambient
+configuration. Rungs after a failure are never probed, and no probe runs on any
+command path other than doctor.
+
+### Error codes
+
+Failures from the host seam are a closed set. Scripts and agents branch on the
+code, never on prose.
+
+| Code | Meaning |
+|---|---|
+| `host_unreachable` | ssh/sftp could not reach the host, timed out, or `ssh` is missing here |
+| `host_permission_denied` | this machine's SSH key is not authorised for that account |
+| `remote_no_project` | Orca has no workspace registered on that host |
+| `remote_no_worktree` | no worktree matches the recorded selector |
+| `provider_missing` | the provider CLI is not installed for the SSH account |
+| `remote_session_unknown` | the hook cache a resume would need could not be read there, or holds no entry for that pane |
+| `unknown_host` | the name is not registered; the message lists the registered ones |
+| `host_registry_invalid` | `.orca/osw/hosts.json` is unreadable or of an unknown format |
+
+Failures inside the seam that are neither transport nor probe related surface
+as `remote_read_failed`, `remote_write_failed` or `remote_command_failed`.
+
+### Register → doctor → dispatch → collect → clean up
+
+```bash
+# 1. register the machine once
+python skill/osw.py host add fnnas --ssh fnnas --worktree path:/srv/repo
+
+# 2. prove the rungs, in order
+python skill/osw.py host doctor fnnas --provider claude
+
+# 3. dispatch: create a pane on that host, driven from here
+python skill/osw.py new --on fnnas claude --prefix code "Fix the failing tests"
+
+# 4. watch the fleet from here
+python skill/osw.py list --all
+python skill/osw.py status --all
+
+# 5. the handoff is a local file once the turn finishes
+cat .orca/osw/handoffs/code_001_<ts>.md
+
+# 6. clean up
+python skill/osw.py del fnnas/code_001 --close
+```
+
+What each step guarantees:
+
+- **Dispatch.** `new --on <host>` needs the host's workspace selector (recorded
+  at `host add`, confirmed by doctor) and fails before anything is created when
+  it is missing or unknown — it never guesses a directory on the far side. It
+  then creates an Orca terminal on that host with `terminal create
+  --environment <host> --worktree <selector> --command "<absolute provider
+  path> <the same autonomy flags a local launch gets>"`, records the agent
+  locally with its `host`, and starts the same local watcher a local agent
+  gets. The watcher — not Orca — sends the prompt, reads the pane and decides
+  the turn ended. Workspace trust is pre-recorded there over SSH, and a failed
+  trust write degrades to the interactive prompt, which one Enter clears. The
+  Run and every log stay here, which is why a remote agent appears in no
+  Dispatch.
+- **Addressing.** The record carries `host`, so later commands know which
+  machine to talk to. Agent ids stay `<host>/<agent_id>` (`local/` may be
+  omitted), and a prefix that contradicts the record is refused rather than
+  silently ignored.
+- **Fleet view.** `list --all` shows local and remote agents in one table with
+  a `HOST` column (`--json` carries the host on every row); `status --all`
+  counts agents and running watchers per host. A host that is currently
+  unreachable is shown with an explicit unknown state, not its last known one.
+- **Handoff collection.** After settlement the remote pane receives the
+  standard wrap-up instruction naming a path on its own machine —
+  `<remote home>/.orca/osw/handoffs/<agent>_<ts>.md`, outside the repository, so
+  OSW never pollutes code it does not own. The watcher polls existence and byte
+  length over SSH until two reads agree, copies the bytes into the local
+  `.orca/osw/handoffs/`, and judges the file **there**, in the local handoffs
+  directory, with the usual exists-and-size-stable rule. The record keeps
+  `remote_handoff_path` and marks `evidence: ssh`. A remote agent that settles
+  without a handoff finishes `done` with `handoff_missing`, exactly like a
+  local one.
+- **Reporting.** The completion report and relayed worker questions reach the
+  guardian terminal here, on the existing notification path, unchanged.
+- **Clean-up.** `del <host>/<agent_id> --close` stops the watcher, asks Orca to
+  close that host's terminal, and removes the record; an already closed
+  terminal is not an error. `host rm` then drops the record.
+
+### Notes and limits
+
+- **Only the watcher writes an agent record.** `list`, `status`, `use` and
+  `revive` read records and may mark a dead watcher's agent `lost`; nothing
+  else writes one. Behaviour is identical across hosts.
+- **Provider path.** A remote `new` launches, and a remote `revive` re-types, the
+  absolute provider path recorded by `host doctor`, never the bare name,
+  because a paired runtime's shell need not resolve the provider from `PATH`.
+  Local launches and local resumes keep the bare name, byte-identical to
+  before; a host whose doctor never recorded a path falls back to the name.
+- **Remote revive needs a session id.** It reads that host's hook cache
+  (`~/.config/orca/agent-hooks/last-status.json`) over SSH. A host whose Orca
+  never records hook status has no id for any pane: measured on host pi, the
+  file exists with `version: 2` and zero entries, so `revive pi/<agent_id>`
+  fails with `remote_session_unknown` naming the pane and the cache path. It
+  fails rather than resuming a guess (pass `--session <sid>` to supply one),
+  and remote revive is not verified end to end.
+- **First run is the operator's.** OSW cannot clear a provider's first-run
+  theme/security/bypass dialogs on a host where that account never ran it; start
+  it once in that pane. Directory trust is written over SSH and needs no
+  operator step.
+- Host records live in `.orca/osw/hosts.json`; agent records keep their flat
+  layout under `.orca/osw/agents/`. `<host>/<agent_id>` is addressing, not
+  storage, so ids stay unique on this machine.
+- The blocker update lock is keyed per host: `update-<provider>.lock` for this
+  machine, `update-<provider>--<host>.lock` for a named one, so two hosts never
+  serialise against each other while panes on the same host still do.
+- POSIX remotes are the supported target; a Windows remote is best effort.
+- `guard` stays local — the guardian is a terminal on this machine.
+
 ## Architecture
 
 ```
-new/use
-  ├── create or adopt Orca terminal
-  ├── write .orca/osw/agents/agent_NNN.json
-  ├── spawn detached watcher(agent_NNN)
+new/use [--on <host>]
+  ├── resolve the host (this machine, or a registered one with a known selector)
+  ├── create or adopt Orca terminal — remote: `terminal create --environment
+  │   <host> --worktree <selector> --command "<abs provider path> <flags>"`
+  ├── write .orca/osw/agents/agent_NNN.json (record carries `host`)
+  ├── spawn detached watcher(agent_NNN) here — on every host
   └── return immediately
 ```
+
+The lane below that line is the same on both hosts: the watcher sends the
+prompt, reads the pane, judges the turn and collects the handoff — over SSH
+when the pane is remote. Orca is not asked to supervise a remote agent.
+
+Every Orca call and every read, write or existence check on an agent-visible
+file goes through `skill/osw/hosts.py`; no other module builds an `ssh` or
+`sftp` argument list, and none touches a file on another machine directly. On a
+single-machine install the seam resolves to the local implementation and
+behaviour is byte-identical to before.
 
 OSW owns orchestration only: state initialization, Orca terminal creation/adoption, detached watcher startup, logs, and completion reports. Provider command construction lives in `skill/osw/providers.py`.
 
@@ -178,12 +415,18 @@ New record fields (all optional; old records still load):
 | `follow_turn` | The watcher takes over the running turn; cleared when it finishes |
 | `resume_turn` | The watcher's task prompt is `continue`; cleared when it finishes |
 | `notified_asks` | Ids of supervised-worker questions already relayed to the guardian |
+| `host` | Registered host the agent runs on; absent means this machine |
+| `worktree_path` | Worktree path on that host (recorded for remote launches) |
+| `remote_handoff_path` | Handoff path on the agent's own host, when it was collected over SSH |
+| `evidence` | `ssh` when the handoff was copied from a remote host |
 
 New states: `enrolled` (recorded, no watcher) and `lost` (non-final, watcher process gone — set by `list`/`status`/`use`/`revive`). New completion sources: `already_done` and `interrupted`.
 
 Notifications resolve their target before every send: the guardian if one is recorded, else the caller terminal. A guardian agent whose record cannot be read falls back to the caller terminal (`guardian_unresolved` event); a stale guardian handle is re-resolved once by pane and the send retried once.
 
 Session ids come from Orca's agent-hook cache `%APPDATA%\orca\agent-hooks\last-status.json` (here `C:\Users\shiki\AppData\Roaming\orca\agent-hooks\last-status.json`). It is not a public Orca interface: OSW reads it only when its `version` matches (2), so on a different format the session id is simply empty.
+
+A remote revive reads the same cache on the agent's own host, at `~/.config/orca/agent-hooks/last-status.json`, over SSH. Measured on host pi (2026-11-04): the file exists with `version: 2` but holds **zero entries**, so no pane there has a provider session id and `revive pi/<agent_id>` fails loudly with `remote_session_unknown`, naming the pane and the cache path. A host whose Orca never records hook status cannot revive an agent by itself: OSW fails instead of resuming a guess (pass `--session <sid>` if you know the id). Remote revive has not been verified end to end.
 
 OSW itself only ever types four things into a terminal: the wrap-up instruction `watcher.HANDOFF_TEMPLATE`, the resume prompt `watcher.RESUME_TEMPLATE` (`continue`), whitelisted dialog keys (`osw.blockers.WHITELIST`), and the resume command `revive` types into a confirmed empty shell.
 
@@ -226,8 +469,9 @@ orca-osw/
     osw/
       cli.py          # typer CLI commands
       deps.py         # dependency checker
-      log.py          # structured events and file logging
-      orca_cli.py     # async Orca CLI wrapper
+      log.py            # structured events and file logging
+      hosts.py          # the host seam: local/SSH execution, host registry, refs, doctor
+      orca_cli.py       # async Orca CLI wrapper
       process.py      # hidden subprocess helpers (Windows)
       providers.py    # provider commands and model discovery
       sessions.py     # provider session ids from Orca's agent-hook cache
@@ -247,6 +491,7 @@ Created in the working directory where you run `init`:
   .orca/
     osw/
       state.json      # OSW project state
+      hosts.json      # registered machines (created by `host add`)
       agents/          # one JSON record per managed agent (+ <id>.stop requests)
       handoffs/        # worker handoff markdown files
       logs/

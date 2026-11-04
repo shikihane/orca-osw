@@ -81,6 +81,7 @@ from pathlib import Path
 
 import anyio
 
+from osw import hosts
 from osw.log import emit_event, enable_file_logging, get_logger, setup_logging
 from osw.orca_cli import (
     OrcaError,
@@ -172,6 +173,12 @@ BLOCKER_KEY_SENDERS = {
 }
 HANDOFF_FALLBACK_TIMEOUT_SECS = 600.0  # wrap-up fallback: wait for the file
 HANDOFF_FALLBACK_POLL_SECS = 2.0   # wrap-up fallback: file stability cadence
+# A remote worker reports `worker_done` only after writing its handoff, so
+# the settlement copy normally needs one stable pair of reads. Waiting a
+# whole hour for a file that never appeared would only delay the wrap-up
+# fallback, which is the remedy.
+REMOTE_HANDOFF_SETTLE_SECS = 30.0
+REMOTE_HANDOFF_POLL_SECS = 2.0     # remote handoff: file stability cadence
 
 # Two-stage send for renderGate providers (design §12.4-1): Orca's
 # agent-prompt send waits for a cursor marker current Claude Code never
@@ -568,10 +575,10 @@ def format_completion_report(
 # Orca observation helpers
 # ---------------------------------------------------------------------------
 
-async def _pane_key(handle: str) -> str | None:
+async def _pane_key(handle: str, host: hosts.Host) -> str | None:
     """Map a terminal handle to worktree ps's agent paneKey (tabId:leafId)."""
     try:
-        data = await terminal_show(handle)
+        data = await terminal_show(handle, host=host)
     except OrcaError:
         return None
     term = data.get("result", {}).get("terminal", {})
@@ -581,9 +588,9 @@ async def _pane_key(handle: str) -> str | None:
     return None
 
 
-async def _ps_entry(pane_key: str) -> dict | None:
+async def _ps_entry(pane_key: str, host: hosts.Host) -> dict | None:
     """Find the Orca agent-state entry for a pane, if Orca tracks it."""
-    for wt in await worktree_ps():
+    for wt in await worktree_ps(host=host):
         for entry in wt.get("agents") or []:
             if entry.get("paneKey") == pane_key:
                 return entry
@@ -600,6 +607,14 @@ class Watcher:
         self.agent = read_agent(root, agent_id)
         self.agent_id = agent_id
         self.handle = self.agent["terminal"]
+        # The machine this agent's Orca and files live on. A local record
+        # never consults the fleet registry, so a broken registry cannot
+        # stop this machine's work; a named host must resolve, because
+        # silently running it here would dispatch to the wrong machine.
+        if str(self.agent.get("host") or hosts.LOCAL_NAME) == hosts.LOCAL_NAME:
+            self.host = hosts.local_host()
+        else:
+            self.host = hosts.host_for_agent(root, self.agent)
         self.deadline = time.monotonic() + HARD_TIMEOUT_SECS
         self.pane: str | None = self.agent.get("pane_key") or None
         self._title_state_provider = str(
@@ -746,7 +761,7 @@ class Watcher:
         entry = None
         if self.pane is not None:
             try:
-                entry = await _ps_entry(self.pane)
+                entry = await _ps_entry(self.pane, self.host)
             except OrcaError:
                 entry = None
         if entry is not None:
@@ -801,19 +816,20 @@ class Watcher:
         for key in keys:
             sender = globals()[BLOCKER_KEY_SENDERS[key]]
             try:
-                await sender(self.handle)
+                await sender(self.handle, host=self.host)
             except OrcaError as exc:
                 if exc.code != "terminal_handle_stale" \
                         or not await self._rebind_terminal():
                     raise
-                await sender(self.handle)
+                await sender(self.handle, host=self.host)
 
     def _release_update_lock(self, reason: str) -> None:
         if not self._update_lock_held:
             return
         provider = str(self.agent.get("provider") or "")
         try:
-            blockers.release_update_lock(provider, self.agent_id)
+            blockers.release_update_lock(
+                provider, self.agent_id, host=self.host.name)
         except OSError:
             pass
         self._update_lock_held = False
@@ -910,7 +926,8 @@ class Watcher:
             await self._notify_blocked(kind, excerpt, stopped=True)
             return "stopped"
         if kind == "update_prompt" and not self._update_lock_held:
-            if not blockers.acquire_update_lock(provider, self.agent_id):
+            if not blockers.acquire_update_lock(
+                    provider, self.agent_id, host=self.host.name):
                 if await self._notify_blocked(
                         kind, excerpt,
                         note="another pane is applying this update; waiting"):
@@ -943,7 +960,7 @@ class Watcher:
 
     async def _terminal_object(self) -> dict | None:
         try:
-            data = await terminal_show(self.handle)
+            data = await terminal_show(self.handle, host=self.host)
         except OrcaError:
             return None
         term = data.get("result", {}).get("terminal", {})
@@ -985,14 +1002,32 @@ class Watcher:
             self._task_tools_observed = tools
         return tools
 
-    def _record_session(self) -> None:
+    async def _record_session(self) -> None:
         """Record the pane's provider session id after a turn settles.
 
         Best effort: Orca's hook cache is not a public interface, so an
         empty answer or any failure leaves the record (and the turn)
-        exactly as it was.
+        exactly as it was. A remote cache that cannot be read is named —
+        a missing id there is a transport fact, not "no session yet".
         """
         if not self.pane:
+            return
+        if not self.host.is_local:
+            from osw.sessions import session_on_host
+
+            try:
+                session_id = await session_on_host(
+                    self.host, self.pane, self.root)
+            except hosts.HostError as exc:
+                self._event(
+                    "remote_session_unknown",
+                    level="WARNING",
+                    message=exc.message,
+                    data={"pane_key": self.pane, "code": exc.code},
+                )
+                return
+            if session_id:
+                self._update(session_id=session_id)
             return
         try:
             session_id = session_for_pane(self.pane)
@@ -1098,11 +1133,18 @@ class Watcher:
         )
 
     async def _rebind_terminal(self) -> bool:
-        """Refresh a runtime-scoped handle using the pane's stable identity."""
+        """Refresh a runtime-scoped handle using the pane's stable identity.
+
+        The pane lives on the agent's own host, so the lookup asks that
+        host for its worktree. The notify target is the exception: a
+        guardian is a terminal on this machine, and
+        `_rebind_notify_target` stays local.
+        """
         if not self.pane:
             return False
         try:
-            terminals = await terminal_list(f"path:{self.root}")
+            terminals = await terminal_list(
+                self.host.worktree_selector(str(self.root)), host=self.host)
         except OrcaError:
             return False
         for terminal in terminals:
@@ -1124,14 +1166,16 @@ class Watcher:
         self, timeout_ms: int = TRACK_LOST_IDLE_WAIT_MS
     ) -> bool:
         try:
-            await terminal_wait(self.handle, "tui-idle", timeout_ms=timeout_ms)
+            await terminal_wait(
+                self.handle, "tui-idle", timeout_ms=timeout_ms, host=self.host)
             return True
         except OrcaError as exc:
             if exc.code != "terminal_handle_stale" \
                     or not await self._rebind_terminal():
                 return False
         try:
-            await terminal_wait(self.handle, "tui-idle", timeout_ms=timeout_ms)
+            await terminal_wait(
+                self.handle, "tui-idle", timeout_ms=timeout_ms, host=self.host)
             return True
         except OrcaError:
             return False
@@ -1144,13 +1188,13 @@ class Watcher:
         Orca already named is not mistaken for a ready one).
         """
         try:
-            data = await terminal_show(self.handle)
+            data = await terminal_show(self.handle, host=self.host)
         except OrcaError as exc:
             if exc.code != "terminal_handle_stale" \
                     or not await self._rebind_terminal():
                 return False
             try:
-                data = await terminal_show(self.handle)
+                data = await terminal_show(self.handle, host=self.host)
             except OrcaError:
                 return False
         term = data.get("result", {}).get("terminal", {})
@@ -1163,12 +1207,12 @@ class Watcher:
     async def _terminal_snapshot(self) -> tuple[int, str]:
         """(lastOutputAt, preview) for the pane, from one terminal show."""
         try:
-            data = await terminal_show(self.handle)
+            data = await terminal_show(self.handle, host=self.host)
         except OrcaError as exc:
             if exc.code != "terminal_handle_stale" \
                     or not await self._rebind_terminal():
                 raise
-            data = await terminal_show(self.handle)
+            data = await terminal_show(self.handle, host=self.host)
         term = data.get("result", {}).get("terminal", {})
         return int(term.get("lastOutputAt") or 0), str(term.get("preview") or "")
 
@@ -1177,12 +1221,14 @@ class Watcher:
 
     async def _terminal_read(self, limit: int, cursor: str | None = None) -> dict:
         try:
-            return await terminal_read(self.handle, limit=limit, cursor=cursor)
+            return await terminal_read(
+                self.handle, limit=limit, cursor=cursor, host=self.host)
         except OrcaError as exc:
             if exc.code != "terminal_handle_stale" \
                     or not await self._rebind_terminal():
                 raise
-            return await terminal_read(self.handle, limit=limit, cursor=cursor)
+            return await terminal_read(
+                self.handle, limit=limit, cursor=cursor, host=self.host)
 
     async def _echo_surface(
         self, limit: int
@@ -1257,14 +1303,14 @@ class Watcher:
         if provider in SPLIT_SEND_PROVIDERS:
             return await self._split_send(text)
         try:
-            data = await terminal_send(self.handle, text)
+            data = await terminal_send(self.handle, text, host=self.host)
         except OrcaError as exc:
             if exc.code == "agent_prompt_stalled":
                 return False
             if exc.code != "terminal_handle_stale" \
                     or not await self._rebind_terminal():
                 raise
-            data = await terminal_send(self.handle, text)
+            data = await terminal_send(self.handle, text, host=self.host)
         if _send_accepted(data) is False:
             raise OrcaError(
                 "terminal send refused (accepted=false)",
@@ -1286,12 +1332,14 @@ class Watcher:
         """
         payload = _paste_payload(text)
         try:
-            first = await terminal_send(self.handle, payload, enter=False)
+            first = await terminal_send(
+                self.handle, payload, enter=False, host=self.host)
         except OrcaError as exc:
             if exc.code != "terminal_handle_stale" \
                     or not await self._rebind_terminal():
                 raise
-            first = await terminal_send(self.handle, payload, enter=False)
+            first = await terminal_send(
+                self.handle, payload, enter=False, host=self.host)
         if _send_accepted(first) is False:
             raise OrcaError(
                 "terminal send refused (accepted=false)",
@@ -1301,12 +1349,14 @@ class Watcher:
         # Enter-only write: a stale handle retries just the Enter, never
         # a second paste of the text.
         try:
-            await terminal_send(self.handle, "", enter=True)
+            await terminal_send(
+                self.handle, "", enter=True, host=self.host)
         except OrcaError as exc:
             if exc.code != "terminal_handle_stale" \
                     or not await self._rebind_terminal():
                 raise
-            await terminal_send(self.handle, "", enter=True)
+            await terminal_send(
+                self.handle, "", enter=True, host=self.host)
         return confirmed
 
     async def _await_composer_echo(self, text: str) -> bool:
@@ -1342,12 +1392,12 @@ class Watcher:
 
     async def _terminal_read_screen(self) -> dict:
         try:
-            return await terminal_read(self.handle, screen=True)
+            return await terminal_read(self.handle, screen=True, host=self.host)
         except OrcaError as exc:
             if exc.code != "terminal_handle_stale" \
                     or not await self._rebind_terminal():
                 raise
-            return await terminal_read(self.handle, screen=True)
+            return await terminal_read(self.handle, screen=True, host=self.host)
 
     async def _verify_prompt_echo(self, text: str) -> bool | None:
         """Re-read the terminal scrollback and check the sent prompt's
@@ -1502,8 +1552,24 @@ class Watcher:
         # the zero-cost Phase 0 gate.
         await self._phase0_ready_wait()
         handoff = new_handoff_path(self.root, self.agent_id)
-        self._update(handoff_path=str(handoff))
-        instruction = HANDOFF_TEMPLATE.format(path=handoff)
+        remote = ""
+        if self.host.is_local:
+            self._update(handoff_path=str(handoff))
+            instruction = HANDOFF_TEMPLATE.format(path=handoff)
+        else:
+            # The worker writes on its own machine; a copy lands in the
+            # local handoffs directory so `done` means the same here
+            # (issue 07), exactly as the supervised lane does.
+            try:
+                remote = hosts.new_handoff_path(self.host, self.agent_id)
+                self._update(handoff_path=remote, remote_handoff_path=remote)
+                # The worker's directory is ours to create: the handoff
+                # lives outside its worktree, where nothing else has.
+                await self.host.ensure_dir(self.host.dirname(remote))
+            except hosts.HostError as exc:
+                await self._remote_handoff_seam_failed(exc)
+                return
+            instruction = HANDOFF_TEMPLATE.format(path=remote)
         for attempt in (1, 2):
             # The retry resends byte-identical text: attempt 1's echo
             # is still in the scrollback, so a verified echo on
@@ -1526,6 +1592,18 @@ class Watcher:
             ):
                 await self._finalize("error", handoff_source)
                 return
+            if remote:
+                # Two reads of one length prove the bytes are whole; a
+                # short transfer is never accepted as the document.
+                try:
+                    await self._collect_remote_handoff(
+                        remote, handoff,
+                        min(self.deadline,
+                            time.monotonic() + REMOTE_HANDOFF_SETTLE_SECS),
+                    )
+                except hosts.HostError as exc:
+                    await self._remote_handoff_seam_failed(exc)
+                    return
             if _handoff_ok(handoff):
                 break
             log.warning(
@@ -1554,7 +1632,7 @@ class Watcher:
         foreign and park the watcher until the hard deadline.
         """
         if self.pane is None:
-            self.pane = await _pane_key(self.handle)
+            self.pane = await _pane_key(self.handle, self.host)
             if self.pane:
                 self._update(pane_key=self.pane)
                 self._event("pane_detected", data={"pane_key": self.pane})
@@ -1562,13 +1640,13 @@ class Watcher:
         entry = None
         if self.pane:
             try:
-                entry = await _ps_entry(self.pane)
+                entry = await _ps_entry(self.pane, self.host)
             except OrcaError:
                 entry = None
         ps_state = str((entry or {}).get("state") or "")
         self._event("follow_started", data={"ps_state": ps_state or "untracked"})
         if ps_state == "done":
-            self._record_session()
+            await self._record_session()
             if self._stop_requested():
                 await self._finalize("error", "interrupted")
                 return
@@ -1582,7 +1660,7 @@ class Watcher:
             sent_text=str((entry or {}).get("prompt") or ""),
             receipt_hint=True, absorb_echo=False,
         )
-        self._record_session()
+        await self._record_session()
         tools = self._note_turn_tools("task")
         self._event("turn_finished", data={
             "phase": "task", "source": source, "tools_observed": tools})
@@ -1605,7 +1683,8 @@ class Watcher:
         inbox failure is transient, like a worker-show hiccup.
         """
         try:
-            messages = await orchestration_inbox(limit=ASK_INBOX_LIMIT)
+            messages = await orchestration_inbox(
+                limit=ASK_INBOX_LIMIT, host=self.host)
         except OrcaError as exc:
             log.warning("watcher(%s): inbox failed: %s", self.agent_id, exc)
             return
@@ -1657,7 +1736,8 @@ class Watcher:
             # is still what ends the turn.
             self._stop_requested()
             try:
-                data = await orchestration_worker_show(dispatch_id)
+                data = await orchestration_worker_show(
+                    dispatch_id, host=self.host)
                 settlement = worker_settlement(data)
             except OrcaError as exc:
                 if exc.code == "orca_contract_mismatch":
@@ -1718,7 +1798,7 @@ class Watcher:
             "supervised_settled",
             data={"dispatch_id": dispatch_id, "outcome": outcome},
         )
-        self._record_session()
+        await self._record_session()
         log.info(
             "watcher(%s): worker settled (outcome=%s)",
             self.agent_id, outcome,
@@ -1728,7 +1808,7 @@ class Watcher:
         # --close` releases it; record that next-owner decision with
         # Orca so the Dispatch accounting settles too.
         try:
-            await orchestration_worker_retain(dispatch_id)
+            await orchestration_worker_retain(dispatch_id, host=self.host)
             self._event(
                 "supervised_retained", data={"dispatch_id": dispatch_id},
             )
@@ -1744,6 +1824,9 @@ class Watcher:
             await self._finalize("error", "interrupted")
             return
 
+        # The supervised lane runs on this machine only: Orca cannot start
+        # a supervised worker on a paired server, so a remote record never
+        # reaches this path and the handoff is always the local file.
         handoff = Path(str(self.agent.get("handoff_path") or "")) \
             if self.agent.get("handoff_path") \
             else new_handoff_path(self.root, self.agent_id)
@@ -1804,11 +1887,57 @@ class Watcher:
         else:
             self._spawn_shadow(provider, frame, "supervised_launch")
 
+    async def _remote_handoff_seam_failed(
+        self, exc: hosts.HostError,
+    ) -> None:
+        """Name a transport failure of the handoff exchange (issue 07).
+
+        Nothing was copied, so the local copy is never claimed: the
+        agent finishes as an error rather than a fabricated success.
+        """
+        self._event(
+            "remote_handoff_read_failed",
+            level="ERROR",
+            message=exc.message,
+            data={"host": self.host.name},
+        )
+        await self._finalize("error", "remote_read_failed", exc.message)
+
+    async def _collect_remote_handoff(
+        self, remote: str, local: Path, deadline: float,
+    ) -> bool:
+        """Copy the remote handoff once two reads agree on its length.
+
+        A short read is a partial transfer, not a small document, so the
+        first non-empty read is never accepted on its own: only a second
+        non-zero read of the same length proves the bytes are whole.
+        Transport failures raise `HostError`; the caller names them.
+        """
+        previous = -1
+        while time.monotonic() < deadline:
+            if await self.host.exists(remote):
+                data = await self.host.read_file(remote)
+                size = len(data)
+                if size and size == previous:
+                    local.write_bytes(data)
+                    self._update(
+                        handoff_path=str(local),
+                        remote_handoff_path=remote,
+                        evidence="ssh",
+                    )
+                    return True
+                previous = size
+            else:
+                previous = -1
+            await anyio.sleep(REMOTE_HANDOFF_POLL_SECS)
+        return False
+
     async def _supervised_handoff_fallback(self, handoff: Path) -> None:
         """The worker settled without writing the contract file.
 
         Send the fixed wrap-up turn and judge by the file — non-empty and
-        size-stable across polls — never by output silence.
+        size-stable across polls — never by output silence. The supervised
+        lane is local-only, so the contract path is this machine's.
         """
         self._event("supervised_handoff_missing", level="WARNING")
         log.warning(
@@ -2205,7 +2334,7 @@ class Watcher:
             if self._stop_requested():
                 return "stop_requested"
             if self.pane is None:
-                self.pane = await _pane_key(self.handle)
+                self.pane = await _pane_key(self.handle, self.host)
                 if self.pane:
                     self._update(pane_key=self.pane)
                     self._event("pane_detected", data={"pane_key": self.pane})
@@ -2216,11 +2345,11 @@ class Watcher:
                 # two lanes name different agents, so the hook lane's
                 # later events are dropped), and a turn-end read then
                 # finds nothing.
-                self._record_session()
+                await self._record_session()
             entry = None
             if self.pane:
                 try:
-                    entry = await _ps_entry(self.pane)
+                    entry = await _ps_entry(self.pane, self.host)
                 except OrcaError:
                     entry = None
             if entry is not None:
@@ -2328,7 +2457,7 @@ class Watcher:
         or stuck startup when the ready wait times out."""
         if self.pane is not None:
             try:
-                entry = await _ps_entry(self.pane)
+                entry = await _ps_entry(self.pane, self.host)
             except OrcaError:
                 entry = None
             if entry is not None and entry.get("state") == "working":
@@ -2361,7 +2490,7 @@ class Watcher:
         if self.pane is None:
             return 0
         try:
-            entry = await _ps_entry(self.pane)
+            entry = await _ps_entry(self.pane, self.host)
         except OrcaError:
             return 0
         if entry is not None and entry.get("state") == "done":
@@ -2523,7 +2652,7 @@ class Watcher:
             sent_at_ms, baseline_state_started, sent_text=text,
             receipt_hint=echo_receipt and echoed is True,
         )
-        self._record_session()
+        await self._record_session()
         tools = self._note_turn_tools(phase)
         if phase == "task":
             self._task_truncated_at = self._turn_truncated_at
@@ -2654,7 +2783,7 @@ class Watcher:
             entry = None
             if self.pane is not None:
                 try:
-                    entry = await _ps_entry(self.pane)
+                    entry = await _ps_entry(self.pane, self.host)
                 except OrcaError:
                     continue
 
@@ -2818,7 +2947,7 @@ class Watcher:
         last_msg = ""
         if self.pane:
             try:
-                entry = await _ps_entry(self.pane)
+                entry = await _ps_entry(self.pane, self.host)
                 if entry:
                     last_msg = entry.get("lastAssistantMessage") or ""
             except OrcaError:

@@ -86,6 +86,63 @@ python <skill-dir>/osw.py stop <agent-id>
 
 `list`/`status` show a mid-task agent whose watcher died as `lost`.
 
+## Cross-host workers
+
+Register the machine once, prove it, then dispatch by name:
+
+```text
+python <skill-dir>/osw.py host add fnnas --ssh fnnas --worktree path:/srv/repo
+python <skill-dir>/osw.py host doctor fnnas --provider <provider>
+python <skill-dir>/osw.py new --on fnnas <provider> --prefix <role> "<task>"
+```
+
+- The dispatch is the classic lane, not Orca's supervised one: `new --on
+  <host>` runs `orca terminal create --environment <host> --worktree
+  <selector> --command "<absolute provider path> <autonomy flags>"` and the
+  local watcher sends the prompt, reads the pane and collects the handoff over
+  SSH. A remote agent has no Dispatch id; the Run stays local and is unused
+  remotely. Do not re-enable `orchestration worker-start --on`: on Orca 1.4.248
+  a paired server reports `host_indeterminate` readiness — `worker-start` held
+  at `agent_readiness` for 240s with the pane at its composer,
+  `terminal wait --for tui-idle` timed out on that same idle pane, while
+  `terminal send`/`read` and `worktree ps` answered.
+- A provider that has never run for that account shows first-run
+  theme/security/bypass dialogs, and no readiness probe can clear them: have the
+  operator start it once in that pane. Directory trust is pre-recorded over
+  SSH, so that prompt does not appear.
+- Do not dispatch until `host doctor` has passed its four rungs, in order:
+  connection → workspace → worktree → provider. It stops at the first failure
+  and names the code (`host_unreachable`, `host_permission_denied`,
+  `remote_no_project`, `remote_no_worktree`, `provider_missing`,
+  `remote_session_unknown`, `unknown_host`, `host_registry_invalid`).
+- Address the agent as `<host>/<agent_id>`; a bare id and `local/<id>` both
+  mean this machine, and an unregistered prefix is refused with the list of
+  registered ones.
+- `list --all` / `status --all` cover every registered host. The remote
+  handoff is copied into the local `.orca/osw/handoffs/` when the turn ends
+  (record `evidence: ssh`) and judged there, by the same exists-and-size-stable
+  rule; accept the result by reading that file, exactly as for a local worker;
+  a remote worker that writes nothing still finishes `done` with
+  `handoff_missing`.
+- The other machine needs only `sshd` reachable from here with an authorised
+  key, a workspace already registered in Orca there, and the provider CLI.
+  Nothing is installed there — no OSW, no resident process, no helper script —
+  and OSW clones nothing.
+- `use --on <host>` adopts a pane there, `enroll --on <host>` records its
+  unmanaged panes, `revive <host>/<agent_id>` reopens the session there, and
+  `stop`/`del <host>/<agent_id> --close` act on that host. Remote `new` and
+  remote `revive` use the absolute provider path `host doctor` recorded (a
+  local launch or resume keeps the bare name).
+- A remote `revive` needs a provider session id from that host's hook cache
+  (`~/.config/orca/agent-hooks/last-status.json`, read over SSH). On a host
+  whose Orca never records hook status no pane has one: measured on host pi the
+  file exists with `version: 2` and **zero entries**, so `revive pi/<agent_id>`
+  fails with `remote_session_unknown` naming the pane and the cache path. It
+  fails rather than resuming a guess (pass `--session <sid>` to supply one),
+  and remote revive is not verified end to end.
+- Orca pairing is optional for operation; it is what lets a remote terminal be
+  viewed in the Orca UI.
+
 Notifications to expect besides `task-finished` / `task-error`:
 
 - `# [osw] blocked agent=<id> kind=<kind> ... screen=<excerpt>` — a dialog
@@ -114,6 +171,10 @@ Notifications to expect besides `task-finished` / `task-error`:
 - Never release dependent work from an unverified result.
 - Never edit `.orca/osw/` runtime records by hand, including the
   `agents/<id>.stop` sidecar; use `stop`.
+- Never reach another machine yourself: no `ssh`/`sftp`/`scp`, no terminal
+  scraping, no writes to remote paths. Cross-host work goes through
+  `--on <host>` and `<host>/<agent_id>`, which pass the host seam in
+  `skill/osw/hosts.py`.
 - Never launch a nested agent process inside a managed pane without
   clearing the inherited `ORCA_*` environment variables.
 - Use provider autonomy flags only in a trusted, externally controlled

@@ -10,6 +10,7 @@ import time
 import tomllib
 from pathlib import Path
 
+from osw import hosts
 from osw.process import hidden_subprocess_kwargs
 
 # Candidate agent CLIs to probe for on PATH. This is a *scan list*,
@@ -120,13 +121,18 @@ def build_provider_command(
     provider: str,
     model: str | None = None,
     thinking: str | None = None,
+    binary: str | None = None,
 ) -> str:
     """Build the provider CLI command OSW runs in an Orca terminal.
 
     Never includes the task prompt: the watcher sends the prompt as a
-    separate, observable turn once the TUI is ready.
+    separate, observable turn once the TUI is ready. `binary` replaces
+    the executable at the head of the command — the absolute path
+    `host doctor` discovered on a remote host, whose PATH the pane may
+    not resolve the provider from; empty keeps the provider name, so a
+    local command stays byte-identical.
     """
-    args = _provider_args(provider.strip(), model, thinking)
+    args = _provider_args(provider.strip(), model, thinking, binary)
     return " ".join(_quote_command_arg(arg) for arg in args)
 
 
@@ -135,6 +141,7 @@ def resume_command(
     session_id: str,
     model: str | None = None,
     thinking: str | None = None,
+    binary: str | None = None,
 ) -> str:
     """Command that reopens a provider session with the launch flags.
 
@@ -142,9 +149,13 @@ def resume_command(
     each CLI's resume syntax (codex's is a subcommand, so it follows the
     binary directly). kimi session ids carry a `session_` prefix; dsh
     resumes with the launcher's `--resume` flag after its target, which
-    the launcher accepts in any position.
+    the launcher accepts in any position. `binary` replaces the
+    executable at the head of the command, as it does for a launch —
+    the absolute path `host doctor` discovered on a remote host; empty
+    or absent keeps the provider name, so a local command stays
+    byte-identical.
     """
-    args = resume_args(provider, session_id, model, thinking)
+    args = resume_args(provider, session_id, model, thinking, binary)
     return " ".join(_quote_command_arg(arg) for arg in args)
 
 
@@ -153,13 +164,17 @@ def resume_args(
     session_id: str,
     model: str | None = None,
     thinking: str | None = None,
+    binary: str | None = None,
 ) -> list[str]:
-    """argv of `resume_command`, for quoting into a particular shell."""
+    """argv of `resume_command`, for quoting into a particular shell.
+
+    `binary`, when set, replaces the executable at the head of argv.
+    """
     provider = normalize_provider(provider)
     session_id = (session_id or "").strip()
     if not session_id:
         raise ProviderError("a session id is required to resume a session")
-    args = _provider_args(provider, model, thinking)
+    args = _provider_args(provider, model, thinking, binary)
     if provider == "codex":
         args = [args[0], "resume", session_id, *args[1:]]
     elif provider == "kimi":
@@ -212,11 +227,16 @@ def _provider_args(
     provider: str,
     model: str | None,
     thinking: str | None,
+    binary: str | None = None,
 ) -> list[str]:
-    """argv for a provider TUI launch: binary, autonomy, model flags."""
+    """argv for a provider TUI launch: binary, autonomy, model flags.
+
+    `binary`, when set, replaces the executable at the head of argv.
+    """
     provider = normalize_provider(provider)
     model = (model or "").strip() or None
     thinking = (thinking or "").strip() or None
+    binary = (binary or "").strip() or None
     if provider not in SUPPORTED_PROVIDERS:
         expected = ", ".join(SUPPORTED_PROVIDERS)
         raise ProviderError(
@@ -224,9 +244,9 @@ def _provider_args(
         )
 
     if provider == "dsh":
-        return _dsh_args(model, thinking)
+        return _dsh_args(model, thinking, binary)
 
-    args = [provider, *PROVIDER_AUTONOMY_FLAGS[provider]]
+    args = [binary or provider, *PROVIDER_AUTONOMY_FLAGS[provider]]
     if provider == "codex":
         if thinking:
             args += ["-c", f"model_reasoning_effort={thinking}"]
@@ -256,7 +276,9 @@ def _provider_args(
     return args
 
 
-def _dsh_args(model: str | None, thinking: str | None) -> list[str]:
+def _dsh_args(
+    model: str | None, thinking: str | None, binary: str | None = None,
+) -> list[str]:
     """argv for the DSH-TUI launch.
 
     `dsh-tui` is the DeepSeek Harness TUI launcher: it resolves its own
@@ -276,82 +298,154 @@ def _dsh_args(model: str | None, thinking: str | None) -> list[str]:
             "effort and permission preset live in DSH settings and change "
             "inside the TUI (/model, /permission) — drop --model/--thinking"
         )
-    return ["dsh-tui", "."]
+    return [binary or "dsh-tui", "."]
 
 
-def ensure_workspace_trust(provider: str, root: Path) -> str:
+async def ensure_workspace_trust(
+    provider: str, root: Path | str, host: hosts.Host | None = None,
+) -> str:
     """Pre-record workspace trust so the provider TUI skips its
     interactive "trust this directory?" prompt on first launch.
+
+    `root` is the workspace path *on that host*: a local `Path`, or the
+    string the operator registered for a remote. A remote string is
+    used verbatim for every provider key and lookup — rebuilding it
+    through `Path` on a Windows machine yields `\\srv\\repo`, which no
+    remote TUI ever queries — except that a Windows remote's claude key
+    is that same path with forward slashes, the way claude itself writes
+    it. A local root keeps its host-native and POSIX spellings exactly
+    as before.
 
     Best-effort and idempotent: returns a short note of what was done
     ("" for providers without a known trust store), and never raises —
     a failed write just means the prompt appears as before.
     """
+    target = host or hosts.local_host()
+    claude_root, native_root, posix_root, base_name = _trust_roots(target, root)
     try:
         if provider == "claude":
-            return _trust_claude(root)
+            return await _trust_claude(target, claude_root)
         if provider == "codex":
-            return _trust_codex(root)
+            return await _trust_codex(target, native_root)
         if provider == "kimi":
-            return _trust_kimi(root)
-    except OSError:
+            return await _trust_kimi(target, posix_root, base_name)
+    except (OSError, hosts.HostError):
         return "trust pre-record failed"
     return ""
 
 
-def _trust_claude(root: Path) -> str:
-    """claude keeps per-project trust in ~/.claude.json as
-    projects["<posix path>"].hasTrustDialogAccepted."""
-    path = Path.home() / ".claude.json"
+def _trust_roots(
+    host: hosts.Host, root: Path | str,
+) -> tuple[str, str, str, str]:
+    """(claude key, codex key, kimi key, basename) of the workspace root.
+
+    Each provider keys the path the way it writes it. A remote root is
+    already the string its TUI was launched with, so codex and kimi
+    take it unchanged. claude normalises a Windows path to forward
+    slashes before using it as a `~/.claude.json` project key: a
+    Windows remote that registered `C:\\Users\\hy\\w` looks up
+    `C:/Users/hy/w`, so the backslashed spelling never matches its own
+    entry and the trust dialog still appears. A POSIX remote and this
+    machine keep today's keys exactly (`Path.as_posix()` for
+    claude/kimi, `str(root)` for codex).
+    """
+    if not host.is_local:
+        posix_root = root if isinstance(root, str) else root.as_posix()
+        tail = posix_root.rstrip("/")
+        basename = tail.rsplit("/", 1)[-1] if tail else ""
+        claude_root = (
+            posix_root.replace("\\", "/") if host.is_windows else posix_root
+        )
+        return claude_root, posix_root, posix_root, basename
+    path = Path(root)
+    return path.as_posix(), str(root), path.as_posix(), path.name
+
+
+def _host_home(host: hosts.Host) -> str:
+    """The home directory trust paths hang off: the discovered remote one,
+    else this process's."""
+    return host.home or str(Path.home())
+
+
+async def _read_or_empty(host: hosts.Host, path: str) -> bytes:
+    """File bytes, or b"" when the provider has no store yet.
+
+    A missing trust file is the normal first-launch case, and a remote
+    get for it fails the same way a local open does, so both collapse
+    here instead of surfacing as an error.
+    """
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        return await host.read_file(path)
+    except (OSError, hosts.HostError):
+        return b""
+
+
+async def _trust_claude(host: hosts.Host, root_key: str) -> str:
+    """claude keeps per-project trust in ~/.claude.json as
+    projects["<key>"].hasTrustDialogAccepted, keyed the way
+    `_trust_roots` spells it: `Path.as_posix()` locally, the remote
+    string as-is on POSIX, forward slashes on a Windows remote."""
+    path = host.join(_host_home(host), ".claude.json")
+    raw = await _read_or_empty(host, path)
+    try:
+        data = json.loads(raw.decode("utf-8")) if raw else {}
+    except (UnicodeDecodeError, ValueError):
         data = {}
     if not isinstance(data, dict):
         data = {}
-    projects = data.setdefault("projects", {})
-    entry = projects.setdefault(root.as_posix(), {})
+    projects = data.get("projects")
+    if not isinstance(projects, dict):
+        projects = data["projects"] = {}
+    entry = projects.get(root_key)
+    if not isinstance(entry, dict):
+        entry = projects[root_key] = {}
     if entry.get("hasTrustDialogAccepted") is True:
         return "already trusted"
     entry["hasTrustDialogAccepted"] = True
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    await host.write_file(path, payload.encode("utf-8"))
     return "trusted"
 
 
-def _trust_codex(root: Path) -> str:
+async def _trust_codex(host: hosts.Host, native_root: str) -> str:
     """codex keeps trust in ~/.codex/config.toml as
-    [projects."<windows path>"] trust_level = "trusted"."""
-    path = Path.home() / ".codex" / "config.toml"
-    key = str(root).replace("\\", "\\\\").replace('"', '\\"')
+    [projects."<host-native path>"] trust_level = "trusted".
+
+    The key is what codex itself writes on that machine: a Windows path
+    locally, the POSIX string of a remote."""
+    config_dir = host.join(_host_home(host), ".codex")
+    path = host.join(config_dir, "config.toml")
+    raw = await _read_or_empty(host, path)
     try:
-        with path.open("rb") as f:
-            config = tomllib.load(f)
-    except FileNotFoundError:
-        config = {}
+        config = tomllib.loads(raw.decode("utf-8")) if raw else {}
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        # Rewriting a config we cannot parse would drop the operator's
+        # settings, so leave it alone and let the prompt appear.
+        return "trust pre-record failed"
     projects = config.get("projects")
     if isinstance(projects, dict):
-        entry = projects.get(str(root))
+        entry = projects.get(native_root)
         if isinstance(entry, dict) and entry.get("trust_level") == "trusted":
             return "already trusted"
-    with path.open("a", encoding="utf-8") as f:
-        f.write(f'\n[projects."{key}"]\ntrust_level = "trusted"\n')
+    key = native_root.replace("\\", "\\\\").replace('"', '\\"')
+    await host.ensure_dir(config_dir)
+    section = f'\n[projects."{key}"]\ntrust_level = "trusted"\n'
+    await host.write_file(path, raw + section.encode("utf-8"))
     return "trusted"
 
 
-def _trust_kimi(root: Path) -> str:
+async def _trust_kimi(host: hosts.Host, posix_root: str, base_name: str) -> str:
     """kimi keeps trust in ~/.kimi-code/workspace-trust/ as
     wd_<basename-lower>_<sha256(posix root)[:12]> JSON files."""
-    posix_root = root.as_posix()
     digest = hashlib.sha256(posix_root.encode("utf-8")).hexdigest()[:12]
-    slug = re.sub(r"[^a-z0-9._-]+", "-", root.name.lower()).strip("-") or "root"
-    path = Path.home() / ".kimi-code" / "workspace-trust" / f"wd_{slug}_{digest}"
-    if path.exists():
+    slug = re.sub(r"[^a-z0-9._-]+", "-", base_name.lower()).strip("-") or "root"
+    trust_dir = host.join(_host_home(host), ".kimi-code", "workspace-trust")
+    path = host.join(trust_dir, f"wd_{slug}_{digest}")
+    if await host.exists(path):
         return "already trusted"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    await host.ensure_dir(trust_dir)
     payload = {"root": posix_root, "trustedAt": int(time.time() * 1000)}
-    path.write_text(json.dumps(payload), encoding="utf-8")
+    await host.write_file(path, json.dumps(payload).encode("utf-8"))
     return "trusted"
 
 

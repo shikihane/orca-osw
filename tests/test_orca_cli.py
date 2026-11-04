@@ -142,7 +142,7 @@ async def test_run_orca_parses_json_and_dedups_json_flag():
 async def test_run_orca_passes_hidden_process_kwargs():
     startupinfo = object()
     mock_run = AsyncMock(return_value=_completed(stdout=b"{}"))
-    with patch("osw.orca_cli.hidden_subprocess_kwargs",
+    with patch("osw.hosts.hidden_subprocess_kwargs",
                return_value={"startupinfo": startupinfo, "creationflags": 123}), \
          patch("osw.orca_cli.anyio.run_process", mock_run):
         await orca_cli.run_orca("worktree", "ps")
@@ -389,6 +389,22 @@ async def test_orchestration_run_current_accepts_null_run():
     )
     assert result["run"] is None
     assert cmd[1:] == ["orchestration", "run-current", "--json"]
+
+
+@pytest.mark.anyio
+async def test_orchestration_run_wrappers_normalize_the_flat_run_id():
+    # Orca 1.4.248 answers with result.runId, not result.run.id.
+    current, _ = await _run(
+        lambda: orca_cli.orchestration_run_current(),
+        stdout=b'{"result":{"runId":"run_7","objective":"x"}}',
+    )
+    assert current["run"]["id"] == "run_7"
+
+    created, _ = await _run(
+        lambda: orca_cli.orchestration_run_create("x"),
+        stdout=b'{"result":{"runId":"run_8","objective":"x"}}',
+    )
+    assert created["run"]["id"] == "run_8"
 
 
 @pytest.mark.anyio

@@ -4,12 +4,13 @@ import json
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import anyio
 import pytest
 
-from osw import state
+from osw import hosts, state
 from osw.orca_cli import OrcaError
 from osw.watcher import (
     Watcher, _foreign_done, _prompt_truncated_at, format_completion_report,
@@ -199,6 +200,41 @@ async def test_watcher_rebinds_stale_terminal_handle_by_pane(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_rebind_asks_the_agents_host_but_notify_stays_local(tmp_path):
+    """The pane lives on the agent's host; the guardian is a terminal on
+    this machine, so the notify lookup must never travel."""
+    state.init_state_dir(tmp_path)
+    hosts.save_host(tmp_path, hosts.Host(
+        name="fnnas", ssh="fnnas", worktree="path:/srv/ws",
+        remote_root="/srv/ws", home="/srv/home",
+    ))
+    state.write_agent(tmp_path, {
+        "agent_id": "misc_001",
+        "terminal": "term-old",
+        "pane_key": "tab-a:leaf-b",
+        "state": "working",
+        "host": "fnnas",
+        "caller_terminal": "caller-1",
+    })
+    watcher = Watcher(tmp_path, "misc_001")
+    terminals = AsyncMock(return_value=[{
+        "handle": "term-new", "tabId": "tab-a", "leafId": "leaf-b",
+    }])
+
+    with patch("osw.watcher.terminal_list", terminals):
+        assert await watcher._rebind_terminal() is True
+        assert watcher.handle == "term-new"
+        assert await watcher._rebind_notify_target("tab-a:leaf-b") == "term-new"
+
+    remote_call, local_call = terminals.await_args_list
+    assert remote_call.args[0] == "path:/srv/ws"
+    assert remote_call.kwargs["host"].name == "fnnas"
+    # No host: the guardian terminal is addressed on this machine.
+    assert local_call.args[0] == f"path:{tmp_path}"
+    assert "host" not in local_call.kwargs
+
+
+@pytest.mark.anyio
 async def test_watcher_retries_prompt_after_stale_handle_rebind(tmp_path):
     state.init_state_dir(tmp_path)
     # The unset global switch is `off`, keeping the gate out of the
@@ -264,7 +300,7 @@ async def test_watcher_rebinds_stale_handle_during_output_polling(tmp_path):
     )
     new_output = iter([1000, 1000, 2000])
 
-    async def show(handle):
+    async def show(handle, **_kwargs):
         if handle == "term-old":
             raise stale
         return {
@@ -303,7 +339,7 @@ async def test_tracking_loss_tui_idle_rebinds_stale_handle(tmp_path):
     now_ms = int(time.time() * 1000)
     output_times = iter([now_ms, now_ms, now_ms + 5000])
 
-    async def show(_handle):
+    async def show(_handle, **_kwargs):
         return {
             "result": {
                 "terminal": {"lastOutputAt": next(output_times, now_ms + 5000)},
@@ -322,7 +358,7 @@ async def test_tracking_loss_tui_idle_rebinds_stale_handle(tmp_path):
         code="terminal_handle_stale",
     )
 
-    async def wait(handle, event, timeout_ms):
+    async def wait(handle, event, timeout_ms, **_kwargs):
         if handle == "term-old":
             raise stale
         return {}
@@ -330,7 +366,7 @@ async def test_tracking_loss_tui_idle_rebinds_stale_handle(tmp_path):
     waiting = AsyncMock(side_effect=wait)
     with patch("osw.watcher.terminal_show", AsyncMock(side_effect=show)), \
          patch("osw.watcher.worktree_ps", AsyncMock(
-             side_effect=lambda: next(ps_results, [{"agents": []}]),
+             side_effect=lambda **_kwargs: next(ps_results, [{"agents": []}]),
          )), \
          patch("osw.watcher.terminal_wait", waiting), \
          patch("osw.watcher.terminal_list", AsyncMock(return_value=[{
@@ -449,7 +485,8 @@ async def test_startup_idle_is_readiness_not_completion(tmp_path):
         _ps_result(pane, "done", handoff_done),   # handoff turn finished
     ])
     ps = AsyncMock(
-        side_effect=lambda: next(ps_results, _ps_result(pane, "done", handoff_done))
+        side_effect=lambda **_kwargs: next(
+            ps_results, _ps_result(pane, "done", handoff_done))
     )
     show = AsyncMock(return_value={
         "result": {"terminal": {
@@ -962,7 +999,7 @@ async def test_busy_tracked_pane_becoming_ready_receives_prompt(tmp_path):
     done = _ps_result("tab-a:leaf-b", "done", int(time.time() * 1000))
     ps_calls = iter([working] * 5 + [done])
 
-    async def ps_seq():
+    async def ps_seq(**_kwargs):
         # 5 busy polls ≈ 400ms total — well past the bare 250ms
         # timeout, so only the re-arm keeps the wait alive; each
         # single poll stays far under the window even with Windows
@@ -1088,7 +1125,8 @@ async def test_tracking_loss_after_observed_work_uses_tui_idle(tmp_path):
         [{"agents": []}],
         [{"agents": []}],
     ])
-    ps = AsyncMock(side_effect=lambda: next(ps_results, [{"agents": []}]))
+    ps = AsyncMock(side_effect=lambda **_kwargs: next(
+        ps_results, [{"agents": []}]))
     wait = AsyncMock(return_value={})
 
     with patch("osw.watcher.terminal_show", show), \
@@ -1099,7 +1137,8 @@ async def test_tracking_loss_after_observed_work_uses_tui_idle(tmp_path):
         result = await watcher._wait_turn_done(time.time() * 1000)
 
     assert result == "tui_idle"
-    wait.assert_awaited_once_with("term-a", "tui-idle", timeout_ms=1000)
+    wait.assert_awaited_once_with(
+        "term-a", "tui-idle", timeout_ms=1000, host=hosts.local_host())
 
 
 @pytest.mark.anyio
@@ -1431,7 +1470,7 @@ async def test_late_ps_registration_upgrades_to_ps_done(tmp_path):
         _ps_result("tab-a:leaf-b", "done", task_done),
     ])
     ps = AsyncMock(
-        side_effect=lambda: next(
+        side_effect=lambda **_kwargs: next(
             ps_results, _ps_result("tab-a:leaf-b", "done", task_done)
         )
     )
@@ -1905,7 +1944,7 @@ async def test_prompt_echo_pages_scrollback_past_screenful(tmp_path):
         "    repo",
     ]
 
-    async def read(handle, limit=200, cursor=None):
+    async def read(handle, limit=200, cursor=None, **_kwargs):
         if cursor is None:
             return {"result": {"terminal": {
                 "tail": [" 🌔 · Tip: ask Kimi to schedule tasks"],
@@ -2016,7 +2055,7 @@ async def test_prompt_echo_check_abstains_on_redraw_only_scrollback(tmp_path):
             f"  main · D:\\bit\\master\\repo · {n * 137} tokens used",
         ] + [""] * 5
 
-    async def read(handle, limit=200, cursor=None):
+    async def read(handle, limit=200, cursor=None, **_kwargs):
         if cursor is None:
             return {"result": {"terminal": {
                 "tail": ["· Wrangling… (1m 52s · ↓ 4.8k tokens)", "", "", ""],
@@ -2486,7 +2525,8 @@ async def test_split_send_writes_confirms_then_enters(tmp_path):
 
     assert confirmed is True
     assert [c.kwargs for c in sends.await_args_list] == [
-        {"enter": False}, {"enter": True},
+        {"enter": False, "host": hosts.local_host()},
+        {"enter": True, "host": hosts.local_host()},
     ]
     assert [c.args for c in sends.await_args_list] == [
         ("term-a", "[200~do the task now[201~"), ("term-a", ""),
@@ -2550,7 +2590,8 @@ async def test_split_send_timeout_still_enters_and_reports_unconfirmed(tmp_path)
 
     assert confirmed is False
     assert [c.kwargs for c in sends.await_args_list] == [
-        {"enter": False}, {"enter": True},
+        {"enter": False, "host": hosts.local_host()},
+        {"enter": True, "host": hosts.local_host()},
     ]
 
 
@@ -2572,7 +2613,7 @@ async def test_split_send_keeps_legacy_path_for_other_providers(tmp_path):
 
     assert confirmed is True
     assert sends.await_args_list[0].args == ("term-a", "do the task now")
-    assert sends.await_args_list[0].kwargs == {}
+    assert sends.await_args_list[0].kwargs == {"host": hosts.local_host()}
 
 
 @pytest.mark.anyio
@@ -3051,7 +3092,7 @@ async def test_gate_wait_survives_busy_branch_and_keeps_clock(tmp_path):
         _ps_result("tab-a:leaf-b", "done", done_ts),
         _ps_result("tab-a:leaf-b", "working"),
     ])
-    ps = AsyncMock(side_effect=lambda: next(
+    ps = AsyncMock(side_effect=lambda **_kwargs: next(
         ps_results, _ps_result("tab-a:leaf-b", "done", done_ts)))
     reads = AsyncMock(return_value={
         "result": {"terminal": {"source": "screen", "tail": ["booting"]}},
@@ -3227,7 +3268,7 @@ async def test_enforce_hold_releases_on_mode_off_mid_hold(tmp_path):
 
     state_checked = {"n": 0}
 
-    def ps_side_effect():
+    def ps_side_effect(**_kwargs):
         state_checked["n"] += 1
         if state_checked["n"] == 2:
             # Kill switch flips mid-hold (global switch).
@@ -3513,7 +3554,7 @@ async def test_supervised_settlement_finalizes_with_handoff(tmp_path):
     assert agent["state"] == "done"
     assert agent["completion_source"] == "orchestration"
     assert agent["orchestration_outcome"] == "succeeded"
-    retain.assert_awaited_once_with("ctx_1")
+    retain.assert_awaited_once_with("ctx_1", host=hosts.local_host())
 
     reports = list(state.reports_dir(tmp_path).glob("misc_001_*.json"))
     assert len(reports) == 1
@@ -3536,7 +3577,7 @@ async def test_supervised_missing_handoff_sends_wrapup_then_accepts_file(
         "completed", "succeeded", "settled", outcome="succeeded",
     ))
 
-    async def send(handle, text, enter=True):
+    async def send(handle, text, enter=True, **_kwargs):
         assert "Task wrap-up" in text
         handoff.write_text("# late handoff\n", encoding="utf-8")
         return {}
@@ -3600,6 +3641,347 @@ async def test_supervised_failed_outcome_finalizes_error(tmp_path):
     agent = state.read_agent(tmp_path, "misc_001")
     assert agent["state"] == "error"
     assert agent["completion_source"] == "orchestration_failed"
+
+
+# ---------------------------------------------------------------------------
+# Remote handoff (issue 07): the record's path is absolute on the worker's
+# machine; SSH is the data plane and the local handoffs directory keeps one
+# meaning of `done` on every machine.
+
+
+def _completed(returncode=0, stdout=b"", stderr=b""):
+    return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+class _RemoteMachine:
+    """The far side of the seam: `ssh test -e`, `sftp get`, `mkdir -p`.
+
+    `reads` are the bytes successive `get`s return, so a partial transfer
+    can be scripted; `present` answers the existence check.
+    """
+
+    def __init__(self, reads=(), present=False, fail_read=False):
+        self.reads = list(reads)
+        self.present = present
+        self.fail_read = fail_read
+        self.scripts: list[str] = []
+        self.batches: list[str] = []
+
+    async def __call__(self, argv, **_kwargs):
+        if argv[0] == "sftp":
+            batch = Path(argv[argv.index("-b") + 1]).read_text(
+                encoding="utf-8")
+            self.batches.append(batch)
+            if self.fail_read:
+                return _completed(returncode=1, stderr=b"connection lost")
+            Path(batch.split('"')[3]).write_bytes(
+                self.reads.pop(0) if self.reads else b"")
+            return _completed()
+        script = argv[-1]
+        self.scripts.append(script)
+        if script.startswith("test -e "):
+            return _completed(returncode=0 if self.present else 1)
+        return _completed()  # mkdir -p
+
+
+def _remote_session_agent(tmp_path, pane_key: str = "tab-s:leaf-s") -> None:
+    """A remote record with a pane, for the hook-cache lookup."""
+    hosts.save_host(tmp_path, hosts.Host(
+        name="fnnas", ssh="fnnas", worktree="path:/srv/ws",
+        remote_root="/srv/ws", home="/srv/home",
+    ))
+    state.write_agent(tmp_path, {
+        "agent_id": "misc_001",
+        "terminal": "term-r",
+        "state": "assigned",
+        "provider": "omp",
+        "prompt": "do the task",
+        "host": "fnnas",
+        "pane_key": pane_key,
+        "caller_terminal": None,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Classic-lane remote handoff: the same copy over the seam, driven through
+# the normal prompt/turn machinery instead of Orca's supervised lifecycle.
+
+
+def _remote_classic_agent(tmp_path) -> None:
+    hosts.save_host(tmp_path, hosts.Host(
+        name="fnnas", ssh="fnnas", worktree="path:/srv/ws",
+        remote_root="/srv/ws", home="/srv/home",
+    ))
+    # No launch_mode and no follow_turn: the classic prompt/turn lane. No
+    # pane_key, so turn settlement never reads the remote session cache and
+    # the scripted sftp reads stay dedicated to the handoff.
+    state.write_agent(tmp_path, {
+        "agent_id": "misc_001",
+        "terminal": "term-classic",
+        "state": "assigned",
+        "provider": "omp",
+        "prompt": "do the task",
+        "host": "fnnas",
+        "caller_terminal": "caller-1",
+    })
+
+
+async def _run_remote_classic(tmp_path, machine) -> AsyncMock:
+    send = AsyncMock(return_value=True)
+    with patch("osw.hosts.anyio.run_process", machine), \
+         patch.object(Watcher, "_wait_ready", AsyncMock(return_value="ps_idle")), \
+         patch.object(Watcher, "_phase0_ready_wait", AsyncMock()), \
+         patch.object(Watcher, "_send_terminal", send), \
+         patch.object(Watcher, "_verify_prompt_echo",
+                      AsyncMock(return_value=None)), \
+         patch.object(Watcher, "_wait_turn_done",
+                      AsyncMock(return_value="ps_done")), \
+         patch("osw.watcher.terminal_send", AsyncMock(return_value={})), \
+         patch("osw.watcher.worktree_ps", AsyncMock(return_value=[])), \
+         patch("osw.watcher.REMOTE_HANDOFF_SETTLE_SECS", 0.2), \
+         patch("osw.watcher.REMOTE_HANDOFF_POLL_SECS", 0.01):
+        await Watcher(tmp_path, "misc_001").run()
+    return send
+
+
+def _handoff_sends(send: AsyncMock) -> list[str]:
+    return [call.args[0] for call in send.await_args_list
+            if call.args[0].startswith("Task wrap-up:")]
+
+
+@pytest.mark.anyio
+async def test_classic_remote_handoff_is_copied_into_the_local_handoffs_dir(
+        tmp_path):
+    state.init_state_dir(tmp_path)
+    _remote_classic_agent(tmp_path)
+    payload = b"# handoff\n\nremote work done\n"
+    machine = _RemoteMachine(present=True, reads=[payload, payload])
+
+    send = await _run_remote_classic(tmp_path, machine)
+
+    agent = state.read_agent(tmp_path, "misc_001")
+    assert agent["state"] == "done"
+    assert agent["completion_source"] == "ps_done"
+    assert agent["evidence"] == "ssh"
+    remote = agent["remote_handoff_path"]
+    assert remote.startswith("/srv/home/.orca/osw/handoffs/misc_001_")
+    local = Path(agent["handoff_path"])
+    assert local.parent == state.handoffs_dir(tmp_path)
+    assert local.read_bytes() == payload
+    assert any(f'get "{remote}"' in batch for batch in machine.batches)
+    sent = _handoff_sends(send)
+    assert len(sent) == 1
+    assert remote in sent[0]
+    assert any(script == f"mkdir -p {remote.rsplit('/', 1)[0]}"
+               for script in machine.scripts)
+    report = json.loads(Path(agent["report_file"]).read_text(encoding="utf-8"))
+    assert report["handoff_path"] == str(local)
+
+
+@pytest.mark.anyio
+async def test_classic_remote_short_read_is_retried_until_stable(tmp_path):
+    state.init_state_dir(tmp_path)
+    _remote_classic_agent(tmp_path)
+    payload = b"# handoff\n\nremote work done\n"
+    machine = _RemoteMachine(
+        present=True, reads=[payload[:6], payload, payload])
+
+    await _run_remote_classic(tmp_path, machine)
+
+    agent = state.read_agent(tmp_path, "misc_001")
+    assert agent["state"] == "done"
+    assert agent["evidence"] == "ssh"
+    assert Path(agent["handoff_path"]).read_bytes() == payload
+    # the first, short read was not accepted as the document
+    assert len(machine.batches) >= 3
+
+
+@pytest.mark.anyio
+async def test_classic_remote_never_written_finishes_handoff_missing(tmp_path):
+    state.init_state_dir(tmp_path)
+    _remote_classic_agent(tmp_path)
+    machine = _RemoteMachine(present=False)
+
+    send = await _run_remote_classic(tmp_path, machine)
+
+    agent = state.read_agent(tmp_path, "misc_001")
+    assert agent["state"] == "done"
+    assert agent["completion_source"] == "handoff_missing"
+    assert agent["handoff_path"] == ""
+    assert "evidence" not in agent
+    remote = agent["remote_handoff_path"]
+    sent = _handoff_sends(send)
+    # the two-attempt retry still resends the same remote instruction
+    assert len(sent) == 2
+    assert remote in sent[0]
+    assert any(script == f"mkdir -p {remote.rsplit('/', 1)[0]}"
+               for script in machine.scripts)
+
+
+@pytest.mark.anyio
+async def test_classic_remote_read_failure_is_a_named_error(tmp_path):
+    state.init_state_dir(tmp_path)
+    _remote_classic_agent(tmp_path)
+    machine = _RemoteMachine(present=True, fail_read=True)
+
+    await _run_remote_classic(tmp_path, machine)
+
+    agent = state.read_agent(tmp_path, "misc_001")
+    assert agent["state"] == "error"
+    assert agent["completion_source"] == "remote_read_failed"
+    assert "evidence" not in agent
+    failed = [e for e in _events(tmp_path)
+              if e["event"] == "remote_handoff_read_failed"]
+    assert len(failed) == 1
+    assert failed[0]["level"] == "ERROR"
+    assert "cannot read" in failed[0]["message"]
+    report = json.loads(Path(agent["report_file"]).read_text(encoding="utf-8"))
+    assert report["handoff_path"] == agent["remote_handoff_path"]
+    # no fabricated local copy
+    handoffs = state.handoffs_dir(tmp_path)
+    assert not handoffs.exists() or not any(handoffs.iterdir())
+
+
+class _WindowsRemoteMachine:
+    """The far side of a cmd.exe host: sftp get plus cmd.exe /c checks."""
+
+    def __init__(self, reads=(), present=False):
+        self.reads = list(reads)
+        self.present = present
+        self.scripts: list[str] = []
+        self.batches: list[str] = []
+
+    async def __call__(self, argv, **_kwargs):
+        if argv[0] == "sftp":
+            batch = Path(argv[argv.index("-b") + 1]).read_text(
+                encoding="utf-8")
+            self.batches.append(batch)
+            Path(batch.split('"')[3]).write_bytes(
+                self.reads.pop(0) if self.reads else b"")
+            return _completed()
+        script = argv[-1]
+        self.scripts.append(script)
+        if script.startswith("cmd.exe /c if exist "):
+            return _completed(returncode=0 if self.present else 1)
+        return _completed()  # cmd.exe /c if not exist ... mkdir ...
+
+
+def _windows_remote_classic_agent(tmp_path) -> None:
+    hosts.save_host(tmp_path, hosts.Host(
+        name="n100", ssh="hy@100.66.1.5", platform="Windows",
+        worktree="path:C:/Users/hy/orca-workspaces",
+        remote_root="C:/Users/hy/orca-workspaces",
+        home=r"C:\Users\hy",
+    ))
+    state.write_agent(tmp_path, {
+        "agent_id": "misc_001",
+        "terminal": "term-classic",
+        "state": "assigned",
+        "provider": "omp",
+        "prompt": "do the task",
+        "host": "n100",
+        "caller_terminal": "caller-1",
+    })
+
+
+@pytest.mark.anyio
+async def test_classic_windows_remote_handoff_creates_the_backslashed_parent(
+        tmp_path):
+    state.init_state_dir(tmp_path)
+    _windows_remote_classic_agent(tmp_path)
+    payload = b"# handoff\n\nwindows work done\n"
+    machine = _WindowsRemoteMachine(present=True, reads=[payload, payload])
+
+    send = await _run_remote_classic(tmp_path, machine)
+
+    agent = state.read_agent(tmp_path, "misc_001")
+    assert agent["state"] == "done"
+    assert agent["completion_source"] == "ps_done"
+    assert agent["evidence"] == "ssh"
+    remote = agent["remote_handoff_path"]
+    assert remote.startswith("C:\\Users\\hy\\.orca\\osw\\handoffs\\misc_001_")
+    parent = remote.rsplit("\\", 1)[0]
+    # The parent is the Windows path itself, never "" from a POSIX split.
+    assert any(
+        script == f"cmd.exe /c if not exist {parent} mkdir {parent}"
+        for script in machine.scripts
+    )
+    local = Path(agent["handoff_path"])
+    assert local.parent == state.handoffs_dir(tmp_path)
+    assert local.read_bytes() == payload
+    wire = remote.replace("\\", "/")
+    assert any(f'get "{wire}"' in batch for batch in machine.batches)
+    sent = _handoff_sends(send)
+    assert len(sent) == 1
+    assert remote in sent[0]
+    assert not any(e["event"] == "remote_handoff_read_failed"
+                   for e in _events(tmp_path))
+
+
+@pytest.mark.anyio
+async def test_classic_local_handoff_has_no_evidence_and_no_sftp(tmp_path):
+    watcher = _turn_agent(tmp_path)
+    texts: list = []
+    machine = _RemoteMachine(present=True, reads=[b"# x\n", b"# x\n"])
+
+    with patch("osw.hosts.anyio.run_process", machine), \
+         patch.object(Watcher, "_wait_ready",
+                      AsyncMock(return_value="ps_idle")), \
+         patch.object(Watcher, "_phase0_ready_wait", AsyncMock()), \
+         patch.object(Watcher, "_run_turn", _fake_turns(texts)), \
+         patch("osw.watcher.terminal_send", AsyncMock(return_value={})), \
+         patch("osw.watcher.worktree_ps", AsyncMock(return_value=[])):
+        await watcher.run()
+
+    agent = state.read_agent(tmp_path, "agent_001")
+    assert agent["state"] == "done"
+    assert agent["completion_source"] == "ps_done"
+    assert "evidence" not in agent
+    assert "remote_handoff_path" not in agent
+    assert machine.batches == []
+    assert machine.scripts == []
+    assert texts[0] == ("task", "do the task")
+    assert texts[1][0] == "handoff"
+    assert str(state.handoffs_dir(tmp_path)) in texts[1][1]
+
+
+@pytest.mark.anyio
+async def test_remote_session_id_lands_in_the_record(tmp_path):
+    state.init_state_dir(tmp_path)
+    _remote_session_agent(tmp_path)
+    cache = json.dumps({"version": 2, "entries": {
+        "tab-s:leaf-s": {"providerSession": {"id": "sess-r"}},
+    }}).encode()
+    machine = _RemoteMachine(present=True, reads=[cache])
+
+    with patch("osw.hosts.anyio.run_process", machine):
+        await Watcher(tmp_path, "misc_001")._record_session()
+
+    assert state.read_agent(tmp_path, "misc_001")["session_id"] == "sess-r"
+    # the id was read from that machine's hook cache, over the seam
+    assert len(machine.batches) == 1
+    assert 'get "' in machine.batches[0]
+    assert "/srv/home" in machine.batches[0]
+
+
+@pytest.mark.anyio
+async def test_remote_session_lookup_failure_warns_and_keeps_the_record(
+        tmp_path):
+    state.init_state_dir(tmp_path)
+    _remote_session_agent(tmp_path)
+    machine = _RemoteMachine(present=False)
+
+    with patch("osw.hosts.anyio.run_process", machine):
+        await Watcher(tmp_path, "misc_001")._record_session()
+
+    agent = state.read_agent(tmp_path, "misc_001")
+    assert "session_id" not in agent
+    assert agent["state"] == "assigned"
+    warned = [e for e in _events(tmp_path)
+              if e["event"] == "remote_session_unknown"]
+    assert len(warned) == 1
+    assert warned[0]["level"] == "WARNING"
+    assert "looked for" in warned[0]["message"]
 
 
 @pytest.mark.anyio
@@ -3862,7 +4244,7 @@ async def test_follow_turn_working_completes_on_fresh_done(tmp_path):
         _follow_entry("done", now_ms + 1_000, "Reply with exactly one word: OK"),
         _follow_entry("done", now_ms + 1_000, "Reply with exactly one word: OK"),
     ])
-    ps = AsyncMock(side_effect=lambda: next(
+    ps = AsyncMock(side_effect=lambda **_kwargs: next(
         ps_results, _follow_entry("done", now_ms + 2_000)))
     show = AsyncMock(return_value={"result": {"terminal": {
         "lastOutputAt": now_ms - 10_000,
@@ -3897,7 +4279,8 @@ async def test_follow_turn_tracking_loss_uses_tui_idle(tmp_path):
         _follow_entry("working", now_ms - 30_000),          # takeover
         _follow_entry("working", now_ms - 30_000),
     ])
-    ps = AsyncMock(side_effect=lambda: next(ps_results, [{"agents": []}]))
+    ps = AsyncMock(side_effect=lambda **_kwargs: next(
+        ps_results, [{"agents": []}]))
     output_times = iter([now_ms])                           # turn baseline
 
     async def show(*args, **kwargs):
@@ -3915,7 +4298,8 @@ async def test_follow_turn_tracking_loss_uses_tui_idle(tmp_path):
         await watcher.run()
 
     _assert_follow_finished(tmp_path, send, "tui_idle")
-    wait.assert_awaited_once_with("term-a", "tui-idle", timeout_ms=1000)
+    wait.assert_awaited_once_with(
+        "term-a", "tui-idle", timeout_ms=1000, host=hosts.local_host())
 
 
 @pytest.mark.anyio
@@ -4045,7 +4429,7 @@ async def test_follow_turn_session_lookup_failure_still_finishes(tmp_path):
     watcher.deadline = time.monotonic() + 2
     now_ms = int(time.time() * 1000)
     ps_results = iter([_follow_entry("working", now_ms - 30_000)])
-    ps = AsyncMock(side_effect=lambda: next(
+    ps = AsyncMock(side_effect=lambda **_kwargs: next(
         ps_results, _follow_entry("done", now_ms + 2_000)))
     show = AsyncMock(return_value={"result": {"terminal": {
         "lastOutputAt": now_ms - 10_000,
@@ -4449,7 +4833,7 @@ async def test_stop_mid_task_finalizes_error_skips_handoff_and_notifies_guardian
     now_ms = int(time.time() * 1000)
     calls = 0
 
-    async def ps():
+    async def ps(**_kwargs):
         nonlocal calls
         calls += 1
         if calls == 3:
@@ -4855,7 +5239,7 @@ async def test_blocker_enforce_update_prompt_locks_and_sends_dialog_enter(
             _UPDATE_WAIT, None, _UPDATE_FRAME, point="send")
 
     assert outcome == "acted"
-    enter.assert_awaited_once_with("term-a")
+    enter.assert_awaited_once_with("term-a", host=hosts.local_host())
     ask.assert_not_awaited()            # Orca already named the dialog
     lock = blockers_mod.update_lock_path("codex")
     assert json.loads(lock.read_text(encoding="utf-8"))["owner"] == "agent_001"
@@ -5081,7 +5465,7 @@ async def test_blocked_send_clears_update_dialog_then_resends(tmp_path, blocker_
     assert agent["state"] == "done"
     assert sends.await_count == 3          # blocked task, task, handoff
     assert sends.await_args_list[1].args[0] == "do the task"
-    enter.assert_awaited_once_with("term-a")
+    enter.assert_awaited_once_with("term-a", host=hosts.local_host())
     assert not blockers_mod.update_lock_path("codex").exists()
     names = _event_names(tmp_path)
     assert "turn_send_blocked" in names
@@ -5154,7 +5538,7 @@ async def test_gate_enforce_answer_can_act_on_a_whitelisted_blocker(
         vetoed = await watcher._gate_veto("ps_idle")
 
     assert vetoed is True
-    enter.assert_awaited_once_with("term-a")
+    enter.assert_awaited_once_with("term-a", host=hosts.local_host())
 
 
 @pytest.mark.anyio
@@ -5265,7 +5649,7 @@ async def test_wait_turn_done_records_tool_activity(tmp_path, tool, expected):
     watcher.deadline = time.monotonic() + 2
     now_ms = int(time.time() * 1000)
     ps_results = iter([_ps_tool("working", now_ms, tool)])
-    ps = AsyncMock(side_effect=lambda: next(
+    ps = AsyncMock(side_effect=lambda **_kwargs: next(
         ps_results, _ps_tool("done", now_ms + 1000)))
 
     with patch("osw.watcher.worktree_ps", ps), \
@@ -5399,7 +5783,7 @@ async def test_followed_turn_records_tool_activity_too(tmp_path):
         _follow_entry("working", now_ms - 30_000),           # takeover
         _follow_entry("working", now_ms - 30_000),
     ])
-    ps = AsyncMock(side_effect=lambda: next(
+    ps = AsyncMock(side_effect=lambda **_kwargs: next(
         ps_results, _follow_entry("done", now_ms + 1_000)))
     send = AsyncMock(return_value={})
 

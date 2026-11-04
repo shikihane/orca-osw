@@ -11,6 +11,7 @@
 - **自动交接** — 检测任务完成后发送固定的收尾指令（含预分配的交接文件路径），校验交接 markdown 已写入，通知调用方终端
 - **omp 标题态就绪与完成** — omp 从不进入输出空闲，Orca 也不为它发 `tui-idle`，因此 OSW 读取终端标题（前面有旋转符表示本轮正在运行）作为就绪判据与本轮完成判据
 - **接管与恢复** — `enroll` 登记不是 OSW 启动的 agent 终端，`guard` 让你成为它们的通知对象并跟踪进行中的一轮，`revive` 在 Orca 或 PC 重启后重新拉起 provider 会话，`stop` 中断当前一轮
+- **跨主机监管** — 机器登记一次，用 `--on <host>` 派单，交接文件落到本地：Orca 配对是派单面，SSH 是数据面，远端不需要安装 OSW
 - **兼容性防线** — 检查 Orca 实时 JSON 契约，并在 Orca 重启后恢复运行时级终端句柄
 - **最少依赖** — 仅需 `anyio`、`typer`，可选 `rich` 获得彩色日志
 
@@ -23,6 +24,8 @@
 ```
 python -m pip install anyio typer rich
 ```
+
+只有远程 agent 需要：本机的 `ssh` 与 `sftp`、对方机器可达的 `sshd`，以及本机密钥已被该账户授权。
 
 ## 快速开始
 
@@ -47,16 +50,20 @@ python skill/osw.py status
 | `doctor [--json]` | 只读检查 Orca 运行状态及 OSW 依赖的实时响应契约 |
 | `init` | 初始化 `.orca/osw/` 状态目录 |
 | `models <provider> [--json]` | 只读查看 provider 模型选项 |
-| `new <provider> [--prefix <prefix>] [--model <model>] [--thinking <值>] "<提示>"` | 创建新的 agent 终端并发送任务 |
-| `use <agent-id-or-terminal> [--prefix <prefix>] "<提示>"` | 接管已有 Orca 终端，或通过 OSW agent id 继续 |
-| `enroll` | 登记当前 worktree 中不是 OSW 启动的 agent 终端（`enrolled`，无 watcher） |
+| `host add <name> --ssh <dest> --worktree <selector> [--environment <sel>] [--root <path>]` | 登记一台机器；不探测、不在远端写入 |
+| `host list [--json]` | 查看已登记主机及一次性可达性 |
+| `host rm <name>` | 删除主机记录，并列出仍引用它的 agent |
+| `host doctor <host> [--provider <provider>] [--json]` | 按 connection → workspace → worktree → provider 顺序探测，首个失败即停止 |
+| `new <provider> [--on <host>] [--prefix <prefix>] [--model <model>] [--thinking <值>] "<提示>"` | 创建新的 agent 终端并发送任务 |
+| `use <agent-id-or-terminal> [--on <host>] [--prefix <prefix>] "<提示>"` | 接管已有 Orca 终端，或通过 OSW agent id 继续 |
+| `enroll [--on <host>]` | 登记当前 worktree 中不是 OSW 启动的 agent 终端（`enrolled`，无 watcher） |
 | `guard [<agent_id>...] [--caller-terminal <句柄>]` | 成为 agent 的监护方（通知对象）；跟踪进行中的一轮 |
 | `revive [<agent_id> [--session <id>]]` | 列出可恢复的 agent，或在新终端中恢复某个 agent 的 provider 会话 |
 | `stop <agent_id>` | 中断 agent 当前这一轮 |
 | `del <agent_id> [--close]` | 移除 agent |
-| `list [--json]` | 列出受管 agent |
+| `list [--all] [--json]` | 列出受管 agent |
 | `logs [--agent <agent_id>] [--tail N]` | 查看 OSW 日志和事件 |
-| `status` | 显示 OSW 状态和 agent 统计 |
+| `status [--all]` | 显示 OSW 状态和 agent 统计 |
 | `jev status [--check]` | 显示全局 Jev 开关、key/SDK/endpoint/代理状态；`--check` 实时探测端点 |
 | — | **模式就是全局开关**：机器级环境变量 `OSW_JEV_MODE`（`enforce\|shadow\|off`；未设置 = `off`）是唯一控制——不再有项目级 Jev 配置 |
 
@@ -65,6 +72,8 @@ python skill/osw.py status
 - `new` 的 provider 支持 `claude`、`codex`、`pi`、`omp`、`kimi`、`grok`、`dsh`。
 - `--prefix` 生成语义化 agent id，例如 `research_001`、`code_001`、`test_001`、`debug_001`、`review_001`、`misc_001`；省略时使用 `agent_NNN`。
 - `use <agent-id>` 会复用这个确切的 agent id 和终端上下文；`--prefix` 只用于 `new` 或 `use <terminal-handle>`。
+- `new`、`use`、`enroll` 的 `--on <host>` 指向已登记主机，默认是本机。
+- agent 引用形式是 `<host>/<agent_id>`：`fnnas/code_001` 指该主机上的 agent，`code_001` 与 `local/code_001` 都指本机。未登记的前缀会被拒绝，并在报错里列出已登记主机——打错字不会把任务派到别的机器。
 - `--model` 原样传给 provider。
 - `--thinking` 按 provider 转换：`claude --effort`、`codex -c model_reasoning_effort=...`、`pi`/`omp --thinking`、`grok --reasoning-effort`；`kimi` 的 effort 位于模型配置中，因此会拒绝该参数；`dsh` 的 TUI 入口既没有 model 也没有 effort 参数，因此 `--model` 与 `--thinking` 都会被拒绝。
 - `models omp` 读取 `omp models --json`；将其中的 `provider/model` selector 传给 `new omp --model`（作为 `--model` 转发给 TUI）。
@@ -90,15 +99,134 @@ OSW 优先使用 `ORCA_CLI_COMMAND`（可包含参数）；设置
 Orca 的终端 handle 只在当前 runtime 内有效。OSW 在创建或接管终端时持久化
 面板身份（`tabId:leafId`），Orca 重启后可据此重新绑定失效的 handle。
 
+## 跨主机运行
+
+OSW 可以监管终端位于另一台机器上的 agent。机器登记一次，之后按名字寻址。
+
+### 两个面，一条缝
+
+- **派单面** — Orca 的配对连接（`--environment <选择器>`）。它只负责在远端创建终端：`terminal create --environment <host> --worktree <选择器> --command "<provider 绝对路径> <自主权参数>"`。就绪判定、注入提示、轮次生命周期和交接文件都由本机 watcher 负责——与本地 agent 完全相同的经典通道。远端 agent **没有 Dispatch id**，Run 留在本机，远端用不到。
+- **数据面** — SSH：`ssh` 执行命令，`sftp` 传文件字节（读取、先写临时名再改名、存在性检查）。不靠抓取终端搬运字节，因此远端交接文件的读取保真度与本地一致。
+
+**为什么不用 Orca 的受监督通道（实测 2026-11-04，Orca 1.4.248）。** 配对服务器上的就绪判定是 `host_indeterminate`：`orchestration worker-start --on <host>` 停在 `agent_readiness` 达 240s，而远端面板明明停在输入框；对同一个空闲面板执行 `terminal wait --for tui-idle` 同样超时。`terminal send`、`terminal read`、`worktree ps` 则都有应答。远端没有可等的就绪信号，因此面板必须由本机创建并驱动。除非有新的实测证明远端会发出就绪信号，否则不要为远端重新启用受监督通道。
+
+两个面、主机注册表、agent 引用解析和错误映射都集中在 `skill/osw/hosts.py`。防止设计腐化的那条规则是：**该模块之外，任何代码都不得就另一台机器与 Orca 对话，也不得直接读写那台机器上的文件。** 本机调用与单机安装逐字节一致，因此不点名主机时这条缝不可见。
+
+### 远端机器上的前置条件
+
+- 本机可达该机的 `sshd`，且本机密钥已被该账户授权。密钥被拒会以 `host_permission_denied` 出现；去执行 `ssh-copy-id`，不要怀疑 OSW。
+- 那台机器的 Orca 里已经登记了 workspace，并且知道 Orca 使用的 worktree 选择器——`path:/srv/repo`，或 `name:`/`branch:`/`id:` 选择器。
+- 该 SSH 账户已安装 provider CLI。doctor 会记录其绝对路径，因为非交互 SSH 的 `PATH` 很精简，远端启动用的就是这个路径。
+- **本机**的 `PATH` 中有 `ssh` 与 `sftp`。
+- 如果该账户从未运行过这个 provider，必须先在那个面板里手动启动一次：首次运行会出现主题/安全/绕过确认等弹窗，任何就绪探测都清不掉它们。目录信任是另一回事——`new` 会通过 SSH 预先写入，因此不会出现"是否信任此目录？"；首次运行引导则不会被预写。
+
+远端刻意**不需要**：不安装 OSW、不常驻进程、不需要辅助脚本、不克隆或复制代码仓库。OSW 不在远端准备任何东西——Orca 用那台机器上已有的 workspace 创建终端。
+
+Orca 配对对运行是可选的：它既是派单的寻址方式，也是在 Orca 界面里查看远端终端的手段，但没有任何文件读写依赖它。失去配对只影响对该主机的派单，不影响 OSW 读取交接文件或判定完成。
+
+### 主机命令
+
+```bash
+python skill/osw.py host add fnnas --ssh fnnas --worktree path:/srv/repo
+python skill/osw.py host list
+python skill/osw.py host doctor fnnas
+python skill/osw.py host rm fnnas
+```
+
+`host add` 往 `.orca/osw/hosts.json`（与 `state.json` 并列，不在其中）写一条记录：名称、SSH 目标、Orca 环境选择器（默认为名称）、workspace 选择器，以及可选的 `--root`（用于拼接路径）。它不探测任何东西，也不在远端写入。重名登记会被拒绝并给出已有记录；`local` 不可登记——它就是本机。
+
+`host list` 输出名称、SSH 目标、环境、worktree，以及一次性探测的可达性：`reachable`、`unreachable` 或 `permission_denied`。死掉的主机是一行状态，不是错误，也不会被省略。
+
+`host rm` 删除记录，并列出仍引用它的 agent 记录。
+
+### doctor
+
+`host doctor <host> [--provider <provider>] [--json]` 按顺序走四阶，首个失败即停止，因此不会让人去给一台连 workspace 都没有的机器装 provider。它也接受未登记的目标（`host doctor myhost --ssh user@myhost --worktree path:/srv/repo`），因此可在 `host add` 之前使用。
+
+| 阶 | 检查 | 失败码 |
+|---|---|---|
+| `connection` | 一条 SSH 命令（`true`）能返回 | `host_unreachable`、`host_permission_denied` |
+| `workspace` | 那台机器的 Orca 已登记 workspace | `remote_no_project` |
+| `worktree` | 有 worktree 匹配记录的选择器 | `remote_no_worktree` |
+| `provider` | 对 provider 执行一次 `command -v` | `provider_missing` |
+
+每个失败都会打印错误码和下一条可执行动作。`provider` 阶会把 Orca CLI 与 provider CLI 的绝对路径写进主机记录，并缓存远端 home 与平台，之后调用不再依赖环境配置。失败之后的阶不会被探测，doctor 之外的任何命令路径都不做探测。
+
+### 错误码
+
+来自主机缝的失败是一个封闭集合。脚本和 agent 按错误码分支，绝不解析文案。
+
+| 错误码 | 含义 |
+|---|---|
+| `host_unreachable` | ssh/sftp 无法到达该机、超时，或本机没有 `ssh` |
+| `host_permission_denied` | 本机 SSH 密钥未被该账户授权 |
+| `remote_no_project` | 那台机器的 Orca 里没有登记 workspace |
+| `remote_no_worktree` | 没有 worktree 匹配记录的选择器 |
+| `provider_missing` | 该 SSH 账户下没有安装 provider CLI |
+| `remote_session_unknown` | 恢复所需的 hook 缓存读不到，或其中没有该面板的条目 |
+| `unknown_host` | 名称未登记；报错里会列出已登记主机 |
+| `host_registry_invalid` | `.orca/osw/hosts.json` 不可读或格式未知 |
+
+主机缝内部既非传输也非探测的失败，表现为 `remote_read_failed`、`remote_write_failed` 或 `remote_command_failed`。
+
+### 登记 → doctor → 派单 → 收取 → 清理
+
+```bash
+# 1. 登记一次
+python skill/osw.py host add fnnas --ssh fnnas --worktree path:/srv/repo
+
+# 2. 逐阶验证
+python skill/osw.py host doctor fnnas --provider claude
+
+# 3. 派单：在那台机器上开一个面板，由本机驱动
+python skill/osw.py new --on fnnas claude --prefix code "修复失败的测试"
+
+# 4. 在本机看整个机队
+python skill/osw.py list --all
+python skill/osw.py status --all
+
+# 5. 这一轮结束后，交接文件是本地文件
+cat .orca/osw/handoffs/code_001_<ts>.md
+
+# 6. 清理
+python skill/osw.py del fnnas/code_001 --close
+```
+
+每一步保证什么：
+
+- **派单**。`new --on <host>` 需要该主机的 workspace 选择器（`host add` 记录、doctor 确认）；缺失或未知时在创建任何东西之前失败——绝不在远端猜目录。随后用 `terminal create --environment <host> --worktree <选择器> --command "<provider 绝对路径> <与本地启动相同的自主权参数>"` 在那台机器上创建 Orca 终端，在本机记录带 `host` 的 agent，并启动与本地 agent 相同的本机 watcher。发提示、读面板、判定这一轮结束的都是 watcher，不是 Orca。workspace 信任通过 SSH 预先写入，写入失败则退化为交互提示，一个 Enter 即可清除。Run 与所有日志都留在本机，因此远端 agent 不出现在任何 Dispatch 里。
+- **寻址**。记录携带 `host`，之后每条命令都知道该找哪台机器。agent id 仍是 `<host>/<agent_id>`（`local/` 可省略），与记录矛盾的前缀会被拒绝，而不是被静默忽略。
+- **机队视图**。`list --all` 用一张表显示本地与远端 agent，并带 `HOST` 列（`--json` 每行都带 host）；`status --all` 按主机统计 agent 与运行中的 watcher。当前不可达的主机显示为显式的未知状态，而不是它上一次的状态。
+- **交接收取**。这一轮结束后，远端面板收到标准收尾指令，其中命名的是它自己机器上的路径——`<远端 home>/.orca/osw/handoffs/<agent>_<ts>.md`，位于仓库之外，因此 OSW 不会污染别人的代码。watcher 通过 SSH 轮询存在性与字节长度，直到两次读取一致，再把字节复制进本地 `.orca/osw/handoffs/`，并在那里套用同样的"存在且大小稳定"判据。记录保留 `remote_handoff_path` 并标记 `evidence: ssh`。远端 agent 结束时没有交接文件，同样记为 `done` 加 `handoff_missing`，与本地 agent 一致。
+- **报告**。完成报告和转发的 worker 提问仍沿原有通知路径送到本机的监护方终端，行为不变。
+- **清理**。`del <host>/<agent_id> --close` 停掉 watcher，让 Orca 关闭那台机器上的终端，并删除记录；终端已经关闭不算错误。之后用 `host rm` 删除主机记录。
+
+### 说明与限制
+
+- **只有 watcher 写 agent 记录。** `list`、`status`、`use`、`revive` 只读记录，并可能把 watcher 已死的 agent 标记为 `lost`；其他代码不写记录。跨主机行为完全一致。
+- **Provider 路径。** 远端 `new` 启动、远端 `revive` 重新输入的都是 `host doctor` 记录的 provider 绝对路径，而不是裸名字——配对运行时的 shell 未必能从 `PATH` 解析到 provider。本地启动与本地恢复仍用裸名字，与之前逐字节一致；doctor 未记录路径的主机回退到名字。
+- **远端 revive 需要会话 id。** 它通过 SSH 读那台主机的 hook 缓存（`~/.config/orca/agent-hooks/last-status.json`）。Orca 从不记录 hook 状态的主机上，任何面板都没有 id：实测主机 pi 上该文件存在、`version: 2` 但零条目，因此 `revive pi/<agent_id>` 以 `remote_session_unknown` 失败，错误里点名面板与缓存路径。OSW 直接失败，而不是猜一个会话去恢复（可用 `--session <sid>` 自行提供）；远端 revive 尚未做过端到端验证。
+- **首次运行归操作者。** 如果该账户在一台机器上从未运行过某 provider，OSW 无法替它清掉首次运行的主题/安全/绕过确认弹窗；先在那个面板里手动启动一次。目录信任不同：它通过 SSH 预写，不需要操作者介入。
+- 主机记录在 `.orca/osw/hosts.json`；agent 记录保持扁平布局，位于 `.orca/osw/agents/`。`<host>/<agent_id>` 只是寻址形式，不是存储布局，因此 id 在本机仍然唯一。
+- 阻塞更新锁按主机区分：本机是 `update-<provider>.lock`，具名主机是 `update-<provider>--<host>.lock`，因此两台主机不会互相串行等待，同一主机上的面板之间仍然串行。
+- 支持的目标是 POSIX 远端；Windows 远端只做尽力支持。
+- `guard` 保持在本机——监护方是本机的一个终端。
+
 ## 架构
 
 ```
-new/use
-  ├── 创建或接管 Orca 终端
-  ├── 写入 .orca/osw/agents/agent_NNN.json
-  ├── 启动 detached watcher(agent_NNN)
+new/use [--on <host>]
+  ├── 解析主机（本机，或已登记且已知选择器的主机）
+  ├── 创建或接管 Orca 终端——远端为 `terminal create --environment <host>
+  │   --worktree <选择器> --command "<provider 绝对路径> <参数>"`
+  ├── 写入 .orca/osw/agents/agent_NNN.json（记录带 `host`）
+  ├── 在本机启动 detached watcher(agent_NNN)——所有主机都如此
   └── 立即返回
 ```
+
+这一行之下两台机器完全相同：由 watcher 发送提示、读取面板、判定这一轮并收取交接文件——面板在远端时走 SSH。Orca 不会被要求去监督远端 agent。
+
+每一次 Orca 调用，以及对 agent 可见文件的每一次读、写和存在性检查，都经过 `skill/osw/hosts.py`；其他模块不构造 `ssh`/`sftp` 参数列表，也不直接操作另一台机器上的文件。单机安装时这条缝解析到本地实现，行为与之前逐字节一致。
 
 OSW 只负责编排：初始化状态、创建或接管 Orca 终端、启动 detached watcher、记录日志并报告完成。Provider 命令构造集中在 `skill/osw/providers.py`。
 
@@ -167,12 +295,18 @@ python skill/osw.py stop code_001                # 中断当前一轮
 | `follow_turn` | watcher 接手进行中的一轮；结束后清除 |
 | `resume_turn` | watcher 的任务提示为 `continue`；结束后清除 |
 | `notified_asks` | 已转给监护方的 supervised worker 提问 id |
+| `host` | agent 所在的主机；缺省表示本机 |
+| `worktree_path` | 那台机器上的 worktree 路径（远程启动时记录） |
+| `remote_handoff_path` | 通过 SSH 收取交接文件时，agent 所在主机上的交接路径 |
+| `evidence` | 交接文件从远端复制而来时为 `ssh` |
 
 新增状态：`enrolled`（已登记，无 watcher）和 `lost`（非终态且 watcher 进程已不存在，由 `list`/`status`/`use`/`revive` 标记）。新增完成来源：`already_done` 和 `interrupted`。
 
 每次发送通知前都会重新解析通知对象：有监护方时用监护方，否则用调用方终端。监护方 agent 的记录读不到时回退到调用方终端（记录 `guardian_unresolved` 事件）；监护方 handle 失效时按面板重新绑定一次并重试一次。
 
 会话 id 来自 Orca 的 agent-hook 缓存 `%APPDATA%\orca\agent-hooks\last-status.json`（本机为 `C:\Users\shiki\AppData\Roaming\orca\agent-hooks\last-status.json`）。它不是 Orca 的公开接口：OSW 只在 `version` 匹配（2）时读取，格式变化时会话 id 为空。
+
+远端 revive 通过 SSH 读 agent 所在主机上的同一份缓存：`~/.config/orca/agent-hooks/last-status.json`。实测（2026-11-04，主机 pi）：文件存在且 `version: 2`，但**没有任何条目**，因此那台机器上没有任何面板有 provider 会话 id，`revive pi/<agent_id>` 会明确失败并报 `remote_session_unknown`，错误里点名该面板与缓存路径。Orca 从不记录 hook 状态的主机无法自行恢复 agent：OSW 直接失败，而不是猜一个会话去恢复（知道 id 时可用 `--session <sid>`）。远端 revive 尚未做过端到端验证。
 
 OSW 自己只会向终端输入四类内容：收尾指令 `watcher.HANDOFF_TEMPLATE`、恢复提示 `watcher.RESUME_TEMPLATE`（`continue`）、白名单内的弹窗按键（`osw.blockers.WHITELIST`），以及 `revive` 向确认为空的 shell 输入的恢复命令。
 
@@ -216,6 +350,7 @@ orca-osw/
       cli.py          # typer CLI 命令
       deps.py         # 依赖检查
       log.py          # 结构化事件与文件日志
+      hosts.py        # 主机缝：本地/SSH 执行、主机注册表、引用解析、doctor
       orca_cli.py     # 异步 Orca CLI 包装
       process.py      # 隐藏子进程窗口辅助（Windows）
       providers.py    # provider 命令构造与模型发现
@@ -236,6 +371,7 @@ orca-osw/
   .orca/
     osw/
       state.json      # OSW 项目状态
+      hosts.json      # 已登记主机（`host add` 创建）
       agents/          # 每个受管 agent 一个 JSON 记录（以及 <id>.stop 停止请求）
       handoffs/        # worker 写入的交接 markdown
       logs/

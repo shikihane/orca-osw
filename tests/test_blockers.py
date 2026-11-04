@@ -285,3 +285,40 @@ def test_update_lock_default_directory_is_user_level(tmp_path, monkeypatch):
     assert acquire_update_lock("codex", "agent_001") is True
     assert path.exists()
     assert release_update_lock("codex", "agent_001") is True
+
+
+def test_update_lock_file_names_keep_local_and_separate_hosts(tmp_path):
+    assert update_lock_path("codex", tmp_path).name == "update-codex.lock"
+    assert update_lock_path("codex", tmp_path, host="").name \
+        == "update-codex.lock"
+    assert update_lock_path("codex", tmp_path, host="local").name \
+        == "update-codex.lock"
+    assert update_lock_path("codex", tmp_path, host="fnnas").name \
+        == "update-codex--fnnas.lock"
+    # The host part carries only [a-z0-9_-]: no path or shell characters.
+    assert update_lock_path("codex", tmp_path, host="Build Box/01").name \
+        == "update-codex--build-box-01.lock"
+
+
+def test_update_lock_is_per_host(tmp_path):
+    """Two panes on different hosts may update at once; two on the same
+    host may not, and the local host keeps its own single lock."""
+    assert acquire_update_lock("codex", "a1", directory=tmp_path) is True
+    assert acquire_update_lock("codex", "a2", directory=tmp_path,
+                               host="fnnas") is True
+    assert acquire_update_lock("codex", "a3", directory=tmp_path,
+                               host="n100") is True
+
+    assert acquire_update_lock("codex", "a4", directory=tmp_path,
+                               host="fnnas") is False
+    assert acquire_update_lock("codex", "a5", directory=tmp_path,
+                               host="local") is False
+
+    assert release_update_lock("codex", "a2", directory=tmp_path,
+                               host="fnnas") is True
+    assert acquire_update_lock("codex", "a4", directory=tmp_path,
+                               host="fnnas") is True
+    # Releasing on one host leaves the others' locks in place.
+    assert release_update_lock("codex", "a3", directory=tmp_path,
+                               host="n100") is True
+    assert acquire_update_lock("codex", "a1", directory=tmp_path) is False

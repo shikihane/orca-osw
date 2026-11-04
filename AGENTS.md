@@ -18,6 +18,13 @@ recorded (`blocker_shadow_action`) and notified, never acted on. A task or
 followed turn that ps tracked without ever showing a tool call finishes
 `done` with `tools_observed: false` and `warning=no_tool_activity`; it is
 never resent.
+`skill/osw/hosts.py` is the host seam: the `Host` value with four
+operations (`exec`, `read_file`, `write_file`, `exists`), a local and an
+SSH implementation, the host registry `hosts.json` beside `state.json`,
+`<host>/<agent_id>` reference parsing, the doctor ladder and the closed
+error taxonomy. Orca dispatch goes through pairing (`--environment`), data
+through SSH (`ssh`, `sftp`); nothing outside this module may build an
+`ssh`/`sftp` argument list or read or write a file on another machine.
 The Codex skill guide is `skill/SKILL.md`. Tests live in `tests/`, with
 `conftest.py` adding the local package path. User-facing docs are in
 `README.md`, `README_zh.md`, `QUICK.md`, and `QUICK_zh.md`. Runtime state such
@@ -31,8 +38,10 @@ should not be treated as source.
 - `pytest -q` runs the full test suite.
 - `pytest tests/test_cli.py -v` runs focused CLI tests.
 - `python skill/osw.py --help` checks the top-level CLI.
+- `python skill/osw.py host --help`, `python skill/osw.py host doctor <host>
+  --json` verify the host verbs and the doctor ladder against a real machine.
 - `python skill/osw.py new --help` and `python skill/osw.py use --help` verify
-  provider and adoption options.
+  provider and adoption options; both, plus `enroll --help`, list `--on <host>`.
 - `python skill/osw.py enroll|guard|revive|stop --help` cover takeover and
   recovery: `enroll` records unmanaged agent panes (`enrolled`), `guard`
   sets the `guardian` and follows a running turn (`follow_turn`), `revive`
@@ -58,12 +67,75 @@ record; the CLI signals it through side files such as the stop request
 `blockers.WHITELIST` entries, and the resume command `revive` types into a
 confirmed empty shell.
 
+## Host Seam and Cross-Host Operation
+
+Cross-host operation adds one dimension, not a second code path. Keep these
+rules when changing it:
+
+- **One seam.** Every Orca invocation and every read, write or existence check
+  on an agent-visible file goes through the `Host` value in
+  `skill/osw/hosts.py` (`exec`, `read_file`, `write_file`, `exists`). No call
+  site builds an `ssh`/`sftp` argument list, quotes a remote path itself, or
+  touches a remote file directly. A local host resolves to the
+  subprocess/filesystem implementation, so a single-machine install stays
+  byte-identical and the existing suite must keep passing unchanged.
+- **Two planes.** Orca pairing (`--environment <selector>`) is the dispatch
+  plane, but it only creates the pane: a remote agent is a classic-lane
+  terminal (`terminal create --environment <host> --worktree <selector>
+  --command "<absolute provider path> <autonomy flags>"`) whose prompt,
+  readiness, turn and handoff the local watcher owns. A remote agent has no
+  Dispatch id, and the Run stays local and is unused remotely. SSH is the data
+  plane; the remote handoff is copied into the local handoffs directory and
+  judged there. Terminal scraping is never a file channel — completion
+  evidence keeps its local strength.
+- **No supervised lane on a remote host.** Do not re-enable
+  `orchestration worker-start --on` without a new measurement. On Orca 1.4.248
+  a paired server is `host_indeterminate`: `worker-start --on` held at
+  `agent_readiness` for 240s while the remote pane sat at its composer,
+  `terminal wait --for tui-idle` timed out on that same idle pane, and only
+  `terminal send`/`read` and `worktree ps` answered. A provider's first-run
+  theme/security/bypass dialogs are the operator's to clear once in that pane;
+  directory trust is pre-recorded over SSH, onboarding is not.
+- **Registry and references.** Host records live in `.orca/osw/hosts.json`
+  beside `state.json`, never inside it. Agent records keep the flat
+  `.orca/osw/agents/` layout and gain a `host` field, so ids stay unique on
+  this machine; `<host>/<agent_id>` is addressing, not storage, and `local/`
+  is optional. An unregistered prefix is refused (`unknown_host`) with the
+  registered names listed.
+- **Closed taxonomy.** `host_unreachable`, `host_permission_denied`,
+  `remote_no_project`, `remote_no_worktree`, `provider_missing`,
+  `remote_session_unknown`, `unknown_host`, `host_registry_invalid`, plus
+  `remote_read_failed`, `remote_write_failed` and `remote_command_failed`
+  raised inside the seam. Call sites surface these codes; they never invent
+  their own.
+- **Doctor is the only probe.** `host doctor` walks connection → workspace →
+  worktree → provider, stops at the first failing rung, and persists the
+  discovered Orca/provider paths plus the remote home and platform on the host
+  record. Remote launch and remote revive start argv with that recorded
+  provider path, never the bare name. No other command path probes before
+  acting.
+- **Single writer.** Only the watcher writes an agent record, locally and
+  remotely. `list`, `status`, `use` and `revive` read records and may mark a
+  dead watcher's agent `lost`.
+- **Nothing runs on the far side.** No OSW install, no resident process, no
+  helper script, no clone or copy of a repository. The watcher, the logs, the
+  blocker policy and the update lock stay where the CLI runs; the lock key
+  carries the host (`update-<provider>--<host>.lock`) so different hosts never
+  serialise against each other.
+- **Pairing is optional.** Orca pairing only views a remote terminal in the
+  UI. Losing it must never change how OSW reads files, judges completion or
+  reports.
+- **POSIX remotes only.** A Windows remote is best effort; do not build
+  features that require one.
+
 ## Testing Guidelines
 
 Tests use `pytest` and `typer.testing.CliRunner`. Add or update tests before
 changing behavior. Prefer focused tests near the affected module, such as
 `tests/test_providers.py` for provider command formatting and `tests/test_cli.py`
-for user-visible CLI behavior. Mock Orca calls with `AsyncMock`; do not require
+for user-visible CLI behavior. Host-seam changes (argv construction, exit-status
+mapping, the doctor ladder) belong in `tests/test_hosts.py`, driven through the
+single patched process runner. Mock Orca calls with `AsyncMock`; do not require
 a live Orca instance for unit tests.
 
 ## Commit & Pull Request Guidelines
@@ -83,9 +155,20 @@ directory?" prompt; grok instead launches with `--always-approve --trust`,
 where `--trust` grants folder trust for the workspace. DSH gets neither: its
 launch (`dsh-tui .`) has no trust or approval flag, so its permission preset
 (`/permission`) and first-run setup stay the operator's choice, and OSW
-records no autonomy for it. Use them only in
-trusted, externally controlled
-workspaces. Do not commit generated `.orca/` runtime state, local logs, reports,
+records no autonomy for it. Use them only in trusted, externally controlled
+workspaces.
+
+Remote dispatch keeps that posture unchanged: the same autonomy flags, and
+workspace trust written on the host that will run the agent through the same
+seam (a failed remote write degrades to the interactive prompt, never to a
+failed launch). A provider that has never run for that account still shows its
+own first-run theme/security/bypass dialogs, which no readiness probe can
+clear — clear them once in that pane. A remote host needs only `sshd`
+reachable from here with an authorised key, a workspace already registered in
+Orca there, and the provider CLI: never install OSW, a resident process or a
+helper script on it, and never clone or copy a repository there from OSW.
+
+Do not commit generated `.orca/` runtime state, local logs, reports,
 or handoff files. Never launch a nested agent process inside a managed pane
 without clearing the inherited `ORCA_*` environment variables.
 

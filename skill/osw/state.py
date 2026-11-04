@@ -92,6 +92,11 @@ def write_state(root: Path, state: dict) -> None:
     _atomic_write_json(state_file(root), state)
 
 
+def write_json_atomic(path: Path, payload: dict) -> None:
+    """Atomically write an arbitrary local JSON file (registry and the like)."""
+    _atomic_write_json(path, payload)
+
+
 def _atomic_write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path: Path | None = None

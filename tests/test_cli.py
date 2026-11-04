@@ -3,17 +3,20 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 from typer.testing import CliRunner
 
+from osw import hosts as host_mod
 from osw import state as state_mod
 from osw.cli import app, _spawn_watcher
+from osw.hosts import local_host
 from osw.log import read_events
 from osw.orca_cli import OrcaError
 
 runner = CliRunner()
+LOCAL = local_host()
 
 
 @pytest.fixture(autouse=True)
@@ -333,6 +336,140 @@ def test_new_supervised_omp_launches_through_worker_start(tmp_path, monkeypatch)
     assert agent["pane_key"] == "tab-x:leaf-y"
     assert agent["handoff_path"].endswith(".md")
     assert state_mod.read_state(tmp_path)["orchestration_run_id"] == "run_abc"
+
+
+def test_new_remote_creates_the_terminal_through_the_classic_lane(
+    tmp_path, monkeypatch,
+):
+    """Remote dispatch uses `terminal create --environment <host>`.
+
+    The supervised lane is unavailable on a paired server on Orca
+    1.4.248: `worker-start --on` never leaves agent_readiness, so the
+    local classic lane (create the pane, let the watcher send the
+    prompt) is the one that runs. The launch command starts with the
+    provider's absolute path, which `host doctor` recorded.
+    """
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    record = _remote_host()
+    record.home = "/home/u"
+    record.providers = {"claude": "/opt/agents/claude"}
+    host_mod.save_host(tmp_path, record)
+    create = AsyncMock(return_value={"result": {"terminal": {
+        "handle": "term-r", "tabId": "tab-r", "leafId": "leaf-r",
+    }}})
+    start = AsyncMock()
+    run_create = AsyncMock()
+    spawn = Mock(return_value=6789)
+    ensure = AsyncMock()
+
+    with patch("osw.cli.terminal_create", create), \
+         patch("osw.cli.orchestration_worker_start", start), \
+         patch("osw.cli.orchestration_run_create", run_create), \
+         patch("osw.cli.ensure_workspace_trust",
+               AsyncMock(return_value="trusted")) as trust, \
+         patch("osw.hosts.Host.ensure_dir", ensure), \
+         patch("osw.cli._spawn_watcher", spawn):
+        result = runner.invoke(
+            app,
+            [
+                "new", "claude", "--on", "fnnas",
+                "--caller-terminal", "caller-1",
+                "--prefix", "misc",
+                "remote task",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    create_kwargs = create.await_args.kwargs
+    assert create.await_args.args[0] == (
+        "/opt/agents/claude --dangerously-skip-permissions"
+    )
+    assert create_kwargs["worktree"] == "path:/srv/fnnas"
+    assert create_kwargs["host"].name == "fnnas"
+    assert not create_kwargs["host"].is_local
+    # Trust is written on the host that will run the agent, with the
+    # POSIX root passed through as the string it is.
+    assert trust.await_args.args[1] == "/srv/fnnas"
+    assert trust.await_args.args[2].name == "fnnas"
+    # No supervised launch, no Dispatch, no Run on the far side.
+    start.assert_not_awaited()
+    run_create.assert_not_awaited()
+    ensure.assert_not_awaited()
+    spawn.assert_called_once_with(tmp_path, "misc_001")
+
+    agent = state_mod.read_agent(tmp_path, "misc_001")
+    assert agent["host"] == "fnnas"
+    assert agent["worktree_path"] == "/srv/fnnas"
+    assert agent["provider_command"] == (
+        "/opt/agents/claude --dangerously-skip-permissions"
+    )
+    assert agent["terminal"] == "term-r"
+    assert agent["pane_key"] == "tab-r:leaf-r"
+    assert "launch_mode" not in agent
+    assert "dispatch_id" not in agent
+
+
+def test_new_remote_requires_a_workspace_selector(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    record = _remote_host()
+    record.worktree = ""
+    host_mod.save_host(tmp_path, record)
+    create = AsyncMock()
+
+    with patch("osw.cli.terminal_create", create):
+        result = runner.invoke(
+            app, ["new", "claude", "--on", "fnnas", "--caller-terminal", "c", "t"],
+        )
+
+    assert result.exit_code == 1
+    assert "workspace selector" in result.output
+    create.assert_not_awaited()
+    assert list(tmp_path.glob(".orca/osw/agents/*.json")) == []
+
+
+def test_new_remote_refuses_a_provider_the_host_never_probed(
+    tmp_path, monkeypatch,
+):
+    """`host doctor --provider` records the absolute provider path; a
+    host with no entry for the provider cannot launch it, so `new`
+    refuses before creating anything."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    host_mod.save_host(tmp_path, _remote_host())   # providers={}
+    create = AsyncMock()
+
+    with patch("osw.cli.terminal_create", create):
+        result = runner.invoke(
+            app,
+            ["new", "claude", "--on", "fnnas", "--caller-terminal", "c", "t"],
+        )
+
+    assert result.exit_code == 1
+    assert "no recorded path for provider 'claude'" in result.output
+    assert "osw host doctor fnnas --provider claude" in result.output
+    create.assert_not_awaited()
+    assert list(tmp_path.glob(".orca/osw/agents/*.json")) == []
+
+
+def test_new_refuses_an_unregistered_host_before_creating_anything(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    host_mod.save_host(tmp_path, _remote_host())
+    create = AsyncMock()
+
+    with patch("osw.cli.terminal_create", create):
+        result = runner.invoke(
+            app, ["new", "claude", "--on", "typo", "--caller-terminal", "c", "t"],
+        )
+
+    assert result.exit_code == 1
+    assert "unknown host 'typo'" in result.output
+    assert "fnnas" in result.output
+    create.assert_not_awaited()
 
 
 def test_new_supervised_rebinds_foreign_caller_run(tmp_path, monkeypatch):
@@ -662,7 +799,7 @@ def test_del_supervised_release_failure_falls_back_to_close(
 
     assert result.exit_code == 0
     assert "release refused" in result.output
-    close.assert_awaited_once_with("t1")
+    close.assert_awaited_once_with("t1", host=LOCAL)
     assert state_mod.list_agents(tmp_path) == {}
 
 
@@ -842,7 +979,7 @@ def test_use_adopts_terminal_with_terminal_show_result_unwrap(tmp_path, monkeypa
 
     assert result.exit_code == 0
     assert "Adopted debug_001" in result.output
-    show.assert_awaited_once_with("term-existing")
+    show.assert_awaited_once_with("term-existing", host=LOCAL)
     spawn.assert_called_once_with(tmp_path, "debug_001")
     agent = state_mod.read_agent(tmp_path, "debug_001")
     assert agent["terminal"] == "term-existing"
@@ -887,7 +1024,7 @@ def test_use_accepts_existing_agent_id(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert "Reused agent_001" in result.output
-    show.assert_awaited_once_with("term-existing")
+    show.assert_awaited_once_with("term-existing", host=LOCAL)
     spawn.assert_called_once_with(tmp_path, "agent_001")
     agent = state_mod.read_agent(tmp_path, "agent_001")
     assert agent["terminal"] == "term-existing"
@@ -960,6 +1097,65 @@ def test_use_supervised_agent_starts_followup_dispatch(tmp_path, monkeypatch):
     assert agent["handoff_path"] != "old.md"
 
 
+def test_use_remote_supervised_record_continues_through_classic_watcher(
+    tmp_path, monkeypatch,
+):
+    """A remote record continues by the classic watcher.
+
+    The supervised lane cannot run on a paired server (worker-start
+    never leaves agent_readiness), so a record an older remote dispatch
+    marked supervised is followed on its own pane instead: the pane is
+    shown on that host, the record keeps its host, and the watcher sends
+    the prompt.
+    """
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    host_mod.save_host(tmp_path, _remote_host())
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "misc_001",
+        "terminal": "term-sup",
+        "worktree_path": "/srv/fnnas",
+        "provider": "claude",
+        "provider_command": "claude --dangerously-skip-permissions",
+        "model_name": "",
+        "thinking": "",
+        "state": "done",
+        "caller_terminal": None,
+        "prompt": "old task",
+        "host": "fnnas",
+        "launch_mode": "supervised",
+        "dispatch_id": "ctx_old",
+    })
+    show = AsyncMock(return_value={"result": {"terminal": {
+        "handle": "term-sup",
+        "worktreePath": "/srv/fnnas",
+    }}})
+    start = AsyncMock()
+    spawn = Mock(return_value=4242)
+
+    with patch("osw.cli.terminal_show", show), \
+         patch("osw.cli.orchestration_worker_start", start), \
+         patch("osw.cli._spawn_watcher", spawn):
+        result = runner.invoke(
+            app, ["use", "fnnas/misc_001", "--no-notify", "continue"],
+        )
+
+    assert result.exit_code == 0, result.output
+    start.assert_not_awaited()
+    assert show.await_args.args[0] == "term-sup"
+    assert show.await_args.kwargs["host"].name == "fnnas"
+    spawn.assert_called_once_with(tmp_path, "misc_001")
+
+    agent = state_mod.read_agent(tmp_path, "misc_001")
+    assert agent["host"] == "fnnas"
+    assert agent["worktree_path"] == "/srv/fnnas"
+    assert agent["prompt"] == "continue"
+    assert agent["provider_command"] == "claude --dangerously-skip-permissions"
+    assert "launch_mode" not in agent
+    assert "dispatch_id" not in agent
+
+
 def test_use_existing_agent_id_reuses_same_id(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
@@ -994,7 +1190,7 @@ def test_use_existing_agent_id_reuses_same_id(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert "Reused research_099" in result.output
-    show.assert_awaited_once_with("term-existing")
+    show.assert_awaited_once_with("term-existing", host=LOCAL)
     spawn.assert_called_once_with(tmp_path, "research_099")
     agent = state_mod.read_agent(tmp_path, "research_099")
     assert agent["terminal"] == "term-existing"
@@ -1144,7 +1340,7 @@ def test_del_removes_agent_kills_watcher_and_optionally_closes(tmp_path, monkeyp
 
     assert result.exit_code == 0
     terminate.assert_called_once_with(1234)
-    close.assert_awaited_once_with("t1")
+    close.assert_awaited_once_with("t1", host=LOCAL)
     assert state_mod.list_agents(tmp_path) == {}
 
 
@@ -1522,7 +1718,7 @@ def test_del_close_rebinds_stale_handle_by_pane_key(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert "Warning" not in result.output
     assert [call.args[0] for call in close.await_args_list] == ["term-old", "term-new"]
-    terminals.assert_awaited_once_with(f"path:{tmp_path}")
+    terminals.assert_awaited_once_with(f"path:{tmp_path}", host=LOCAL)
     assert state_mod.list_agents(tmp_path) == {}
 
 
@@ -1541,7 +1737,7 @@ def test_del_close_stale_handle_without_live_pane_warns(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert "Warning: failed to close terminal" in result.output
-    close.assert_awaited_once_with("term-old")
+    close.assert_awaited_once_with("term-old", host=LOCAL)
     assert state_mod.list_agents(tmp_path) == {}
 
 
@@ -1650,13 +1846,13 @@ def test_enroll_registers_unrecorded_agent_terminals(tmp_path, monkeypatch):
     with patch("osw.cli.terminal_list", terminal_list), \
          patch("osw.cli.terminal_show", _me_show(tmp_path)), \
          patch("osw.cli.worktree_ps", AsyncMock(return_value=ps)), \
-         patch("osw.cli.session_for_pane", side_effect=_session_ids), \
+         patch("osw.sessions.session_for_pane", side_effect=_session_ids), \
          patch("osw.cli._spawn_watcher", spawn):
         result = runner.invoke(app, ["enroll"])
 
     assert result.exit_code == 0, result.output
     out = json.loads(result.stdout)
-    terminal_list.assert_awaited_once_with(f"path:{tmp_path}")
+    terminal_list.assert_awaited_once_with(f"path:{tmp_path}", host=LOCAL)
     spawn.assert_not_called()
 
     assert [a["agent_id"] for a in out["enrolled"]] == [
@@ -1708,7 +1904,7 @@ def test_enroll_prefers_agent_identity_over_ps_agent_type(tmp_path, monkeypatch)
 
     with patch("osw.cli.terminal_list", AsyncMock(return_value=terminals)), \
          patch("osw.cli.worktree_ps", AsyncMock(return_value=ps)), \
-         patch("osw.cli.session_for_pane", return_value=""):
+         patch("osw.sessions.session_for_pane", return_value=""):
         result = runner.invoke(app, ["enroll"])
 
     assert result.exit_code == 0
@@ -1726,7 +1922,7 @@ def test_enroll_twice_skips_everything_already_recorded(tmp_path, monkeypatch):
     with patch("osw.cli.terminal_list", AsyncMock(return_value=terminals)), \
          patch("osw.cli.terminal_show", _me_show(tmp_path)), \
          patch("osw.cli.worktree_ps", AsyncMock(return_value=ps)), \
-         patch("osw.cli.session_for_pane", side_effect=_session_ids):
+         patch("osw.sessions.session_for_pane", side_effect=_session_ids):
         first = json.loads(runner.invoke(app, ["enroll"]).stdout)
         second = json.loads(runner.invoke(app, ["enroll"]).stdout)
 
@@ -1754,7 +1950,7 @@ def test_enroll_skips_terminal_without_pane_identity(tmp_path, monkeypatch):
 
     with patch("osw.cli.terminal_list", AsyncMock(return_value=terminals)), \
          patch("osw.cli.worktree_ps", AsyncMock(return_value=[])), \
-         patch("osw.cli.session_for_pane", return_value=""):
+         patch("osw.sessions.session_for_pane", return_value=""):
         result = runner.invoke(app, ["enroll"])
 
     assert json.loads(result.stdout) == {
@@ -1775,7 +1971,7 @@ def test_enroll_falls_back_to_agent_identity_when_ps_fails(tmp_path, monkeypatch
 
     with patch("osw.cli.terminal_list", AsyncMock(return_value=terminals)), \
          patch("osw.cli.worktree_ps", AsyncMock(side_effect=OrcaError("down", 1))), \
-         patch("osw.cli.session_for_pane", return_value=""):
+         patch("osw.sessions.session_for_pane", return_value=""):
         result = runner.invoke(app, ["enroll"])
 
     assert result.exit_code == 0
@@ -1821,7 +2017,7 @@ def test_enroll_recognizes_executor_by_pane_not_handle_string(tmp_path, monkeypa
     with patch("osw.cli.terminal_list", AsyncMock(return_value=terminals)), \
          patch("osw.cli.terminal_show", show), \
          patch("osw.cli.worktree_ps", AsyncMock(return_value=[])), \
-         patch("osw.cli.session_for_pane", return_value=""):
+         patch("osw.sessions.session_for_pane", return_value=""):
         result = runner.invoke(app, ["enroll"])
 
     show.assert_awaited_once_with("term-me-alias")
@@ -1840,7 +2036,7 @@ def test_enroll_stale_executor_handle_warns_on_stderr_only(tmp_path, monkeypatch
     with patch("osw.cli.terminal_list", AsyncMock(return_value=terminals)), \
          patch("osw.cli.terminal_show", AsyncMock(side_effect=_stale_handle_error())), \
          patch("osw.cli.worktree_ps", AsyncMock(return_value=[])), \
-         patch("osw.cli.session_for_pane", return_value=""):
+         patch("osw.sessions.session_for_pane", return_value=""):
         result = runner.invoke(app, ["enroll"])
 
     assert result.exit_code == 0
@@ -1862,6 +2058,402 @@ def test_list_json_stdout_stays_json_when_ps_fails(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert "worktree ps failed" in result.stderr
     assert list(json.loads(result.stdout)) == ["agent_001"]
+
+
+# ---------------------------------------------------------------------------
+# host command group: add / list / rm / doctor
+# ---------------------------------------------------------------------------
+
+def test_host_add_writes_the_record_and_prints_it(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["host", "add", "fnnas", "--ssh", "fnnas",
+         "--worktree", "path:/srv/ws"],
+    )
+
+    assert result.exit_code == 0, result.output
+    hosts = host_mod.read_hosts(tmp_path)
+    assert list(hosts) == ["fnnas"]
+    record = hosts["fnnas"]
+    assert record.name == "fnnas"
+    assert record.ssh == "fnnas"
+    assert record.environment == "fnnas"
+    assert record.worktree == "path:/srv/ws"
+    assert record.remote_root == ""
+    assert "Registered host fnnas (ssh fnnas, worktree path:/srv/ws)" \
+        in result.output
+
+
+def test_host_add_refuses_a_duplicate_and_keeps_the_record(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    first = runner.invoke(
+        app,
+        ["host", "add", "fnnas", "--ssh", "fnnas",
+         "--worktree", "path:/srv/ws"],
+    )
+    assert first.exit_code == 0, first.output
+
+    result = runner.invoke(
+        app,
+        ["host", "add", "fnnas", "--ssh", "other.lan",
+         "--worktree", "path:/srv/other"],
+    )
+
+    assert result.exit_code == 1
+    assert "already registered" in result.output
+    assert "ssh fnnas" in result.output
+    assert "worktree path:/srv/ws" in result.output
+    record = host_mod.read_hosts(tmp_path)["fnnas"]
+    assert (record.ssh, record.worktree) == ("fnnas", "path:/srv/ws")
+
+
+def test_host_add_refuses_to_register_local(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["host", "add", "local", "--ssh", "localhost",
+         "--worktree", "path:/srv/ws"],
+    )
+
+    assert result.exit_code == 1
+    assert "cannot be registered" in result.output
+    assert host_mod.read_hosts(tmp_path) == {}
+
+
+def test_host_list_prints_name_ssh_worktree_and_reachability(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    for name in ("alpha", "bravo", "delta"):
+        host_mod.save_host(tmp_path, host_mod.Host(
+            name=name, ssh=f"{name}.lan", worktree=f"path:/srv/{name}"))
+
+    states = ["reachable", "unreachable", "permission_denied"]
+    with patch("osw.hosts.reachability", side_effect=states):
+        result = runner.invoke(app, ["host", "list"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[0].split() == [
+        "HOST", "SSH", "ENVIRONMENT", "WORKTREE", "REACHABILITY",
+    ]
+    for name, state in zip(("alpha", "bravo", "delta"), states):
+        row = (
+            f"{name:<16} {name + '.lan':<24} {name:<16} "
+            f"{'path:/srv/' + name:<40} {state}"
+        )
+        assert row in lines
+
+
+def test_host_list_json_carries_a_dead_host_as_a_row(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    host_mod.save_host(tmp_path, host_mod.Host(
+        name="alpha", ssh="alpha.lan", worktree="path:/srv/alpha"))
+    host_mod.save_host(tmp_path, host_mod.Host(
+        name="fnnas", ssh="fnnas.lan", worktree="path:/srv/fnnas"))
+
+    def reach(host):
+        return "unreachable" if host.name == "fnnas" else "reachable"
+
+    with patch("osw.hosts.reachability", side_effect=reach):
+        result = runner.invoke(app, ["host", "list", "--json"])
+
+    assert result.exit_code == 0, result.output
+    rows = {row["name"]: row for row in json.loads(result.output)["hosts"]}
+    assert rows["fnnas"] == {
+        "name": "fnnas",
+        "ssh": "fnnas.lan",
+        "environment": "fnnas",
+        "worktree": "path:/srv/fnnas",
+        "root": "",
+        "reachability": "unreachable",
+    }
+    assert rows["alpha"]["reachability"] == "reachable"
+
+
+def test_host_rm_removes_the_record_and_names_referencing_agents(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    host_mod.save_host(tmp_path, _remote_host())
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "fnnas_001", "terminal": "t1", "state": "done",
+        "host": "fnnas",
+    })
+
+    result = runner.invoke(app, ["host", "rm", "fnnas"])
+
+    assert result.exit_code == 0, result.output
+    assert "Removed host fnnas" in result.output
+    assert "Agents still referencing it: fnnas_001" in result.output
+    assert host_mod.read_hosts(tmp_path) == {}
+
+
+def test_host_rm_refuses_an_unknown_name(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+
+    result = runner.invoke(app, ["host", "rm", "ghost"])
+
+    assert result.exit_code == 1
+    assert "host 'ghost' is not registered" in result.output
+    assert host_mod.read_hosts(tmp_path) == {}
+
+
+def test_host_doctor_json_reports_a_failing_rung_and_exits_nonzero(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    host_mod.save_host(tmp_path, _remote_host())
+    report = {
+        "host": "fnnas",
+        "ok": False,
+        "rungs": [{
+            "rung": "connection", "ok": False, "code": "host_unreachable",
+            "message": "ssh: connect timed out",
+            "next": "check the ssh alias",
+        }],
+        "code": "host_unreachable",
+        "message": "ssh: connect timed out",
+    }
+    doctor = AsyncMock(return_value=report)
+
+    with patch("osw.hosts.doctor", doctor):
+        result = runner.invoke(app, ["host", "doctor", "fnnas", "--json"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.output) == report
+    assert doctor.await_args.args[1].name == "fnnas"
+    assert doctor.await_args.args[2] == "claude"
+
+
+def test_host_doctor_json_reports_success_and_exits_zero(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    host_mod.save_host(tmp_path, _remote_host())
+    report = {
+        "host": "fnnas",
+        "ok": True,
+        "rungs": [
+            {"rung": "connection", "ok": True},
+            {"rung": "workspace", "ok": True, "path": "/srv/fnnas"},
+            {"rung": "worktree", "ok": True, "path": "/srv/fnnas"},
+            {"rung": "provider", "ok": True, "path": "/opt/bin/claude",
+             "orca_path": "/opt/bin/orca"},
+        ],
+    }
+
+    with patch("osw.hosts.doctor", AsyncMock(return_value=report)):
+        result = runner.invoke(app, ["host", "doctor", "fnnas", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == report
+
+
+def test_host_doctor_builds_a_transient_host_for_an_unregistered_name(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    report = {
+        "host": "unregistered", "ok": True,
+        "rungs": [{"rung": "connection", "ok": True}],
+    }
+    doctor = AsyncMock(return_value=report)
+
+    with patch("osw.hosts.doctor", doctor):
+        result = runner.invoke(
+            app,
+            ["host", "doctor", "unregistered", "--ssh", "user@box",
+             "--worktree", "path:/srv/x", "--json"],
+        )
+
+    assert result.exit_code == 0, result.output
+    project, host, provider = doctor.await_args.args
+    assert project == tmp_path.resolve()
+    assert host.name == "unregistered"
+    assert host.ssh == "user@box"
+    assert host.environment == "unregistered"
+    assert host.worktree == "path:/srv/x"
+    assert provider == "claude"
+
+
+# ---------------------------------------------------------------------------
+# fleet view: `list --all` / `status --all` across registered hosts
+# ---------------------------------------------------------------------------
+
+def _remote_host(
+    name: str = "fnnas", providers: dict[str, str] | None = None,
+) -> host_mod.Host:
+    return host_mod.Host(
+        name=name,
+        ssh=f"{name}.lan",
+        environment=name,
+        worktree=f"path:/srv/{name}",
+        remote_root=f"/srv/{name}",
+        providers=dict(providers or {}),
+    )
+
+
+def _fleet_records(tmp_path) -> None:
+    """One local record and one on `fnnas`, both mid-task."""
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "local_001", "terminal": "term-l", "pane_key": "tab-l:leaf",
+        "state": "working", "prompt": "local task", "watcher_pid": 0,
+    })
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "fnnas_001", "terminal": "term-r", "pane_key": "tab-r:leaf",
+        "state": "working", "prompt": "remote task", "host": "fnnas",
+    })
+
+
+def test_list_all_merges_local_and_remote_rows(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    host_mod.save_host(tmp_path, _remote_host())
+    _fleet_records(tmp_path)
+
+    async def ps(*, host=None):
+        host = host or local_host()
+        if host.is_local:
+            return [{"agents": [{"paneKey": "tab-l:leaf", "state": "done"}]}]
+        return [{"agents": [{"paneKey": "tab-r:leaf", "state": "working"}]}]
+
+    ps_mock = AsyncMock(side_effect=ps)
+    with patch("osw.cli.worktree_ps", ps_mock), \
+         patch("osw.cli.pid_is_running", return_value=False):
+        fleet = json.loads(runner.invoke(
+            app, ["list", "--all", "--json"]).stdout)
+        text = runner.invoke(app, ["list", "--all"]).output
+
+    local_ps = AsyncMock(side_effect=ps)
+    with patch("osw.cli.worktree_ps", local_ps), \
+         patch("osw.cli.pid_is_running", return_value=False):
+        local_only = json.loads(runner.invoke(app, ["list", "--json"]).stdout)
+
+    assert fleet["local_001"]["host"] == "local"
+    assert fleet["local_001"]["orca_state"] == "done"
+    assert fleet["fnnas_001"]["host"] == "fnnas"
+    assert fleet["fnnas_001"]["orca_state"] == "working"
+    # One ps per host and per call: the local answer never stands in for
+    # the remote pane (two `--all` invocations, sorted host order).
+    asked = [call.kwargs["host"].name for call in ps_mock.await_args_list]
+    assert asked == ["fnnas", "local", "fnnas", "local"]
+    assert [call.kwargs["host"].name for call in local_ps.await_args_list] \
+        == ["local"]
+    assert "HOST" in text.splitlines()[0]
+    assert "fnnas" in text
+
+    # The ordinary listing is the record as-is: no HOST annotation is
+    # added, and it pays no remote round trip.
+    assert "host" not in local_only["local_001"]
+    assert local_only["fnnas_001"]["host"] == "fnnas"
+    assert local_only["fnnas_001"]["orca_state"] == ""
+
+
+def test_list_all_marks_unreachable_host_state_unknown(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    host_mod.save_host(tmp_path, _remote_host())
+    _fleet_records(tmp_path)
+
+    async def ps(*, host=None):
+        host = host or local_host()
+        if host.is_local:
+            return [{"agents": [{"paneKey": "tab-l:leaf", "state": "done"}]}]
+        raise OrcaError("host unreachable", 1)
+
+    with patch("osw.cli.worktree_ps", AsyncMock(side_effect=ps)), \
+         patch("osw.cli.pid_is_running", return_value=False):
+        rows = json.loads(runner.invoke(app, ["list", "--all", "--json"]).stdout)
+        summary = runner.invoke(app, ["status", "--all"]).output
+
+    assert rows["local_001"]["orca_state"] == "done"
+    assert rows["fnnas_001"]["orca_state"] == "unknown"
+    assert "fnnas: 1 (working 1); watchers running: 0; orca state unknown" \
+        in summary
+    assert "local: 1 (working 1); watchers running: 0" in summary
+
+
+def test_unknown_host_reference_is_refused_with_registered_hosts(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    host_mod.save_host(tmp_path, _remote_host())
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "agent_001", "terminal": "t1", "state": "done",
+    })
+
+    result = runner.invoke(app, ["del", "nope/agent_001"])
+
+    assert result.exit_code == 1
+    assert "unknown host 'nope'" in result.output
+    assert "fnnas" in result.output
+    # Refused, not treated as a local agent.
+    assert state_mod.read_agent(tmp_path, "agent_001")["agent_id"] == "agent_001"
+
+
+def test_bare_agent_id_resolves_local_and_prefixed_resolves_remote(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    host_mod.save_host(tmp_path, _remote_host())
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "agent_001", "terminal": "term-l", "pane_key": "tab-l:leaf",
+        "provider": "claude", "state": "lost",
+    })
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "fnnas_001", "terminal": "term-r", "pane_key": "tab-r:leaf",
+        "provider": "claude", "state": "lost", "host": "fnnas",
+    })
+
+    interrupt = AsyncMock(return_value={})
+    with patch("osw.cli.terminal_interrupt", interrupt), \
+         patch("osw.cli.pid_is_running", return_value=False), \
+         patch("osw.sessions.session_for_pane", return_value=""), \
+         patch("osw.sessions.session_on_host", AsyncMock(return_value="")):
+        bare = runner.invoke(app, ["stop", "agent_001"])
+        prefixed = runner.invoke(app, ["stop", "fnnas/fnnas_001"])
+
+    assert bare.exit_code == 0, bare.output
+    assert prefixed.exit_code == 0, prefixed.output
+    local_call, remote_call = interrupt.await_args_list
+    assert local_call.args[0] == "term-l"
+    assert local_call.kwargs["host"].is_local
+    assert remote_call.args[0] == "term-r"
+    assert remote_call.kwargs["host"].name == "fnnas"
+
+
+def test_del_on_flag_addresses_the_record_host(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    host_mod.save_host(tmp_path, _remote_host())
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "fnnas_001", "terminal": "term-r", "pane_key": "tab-r:leaf",
+        "provider": "claude", "state": "lost", "host": "fnnas",
+    })
+
+    result = runner.invoke(app, ["del", "fnnas_001", "--on", "fnnas"])
+
+    assert result.exit_code == 0, result.output
+    assert "Removed fnnas_001" in result.output
+    assert state_mod.list_agents(tmp_path) == {}
 
 
 def test_use_keeps_guardian_as_notify_target_without_caller_flag(
@@ -2099,6 +2691,34 @@ def test_guard_reports_unknown_ids(tmp_path, monkeypatch):
     ]
 
 
+def test_guard_refuses_a_remote_record_without_reading_its_ps(tmp_path, monkeypatch):
+    """Guard is local-only by spec: a remote id is refused, later ids
+    still proceed, and no remote ps is read."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.setenv("ORCA_TERMINAL_HANDLE", "term-me")
+    host_mod.save_host(tmp_path, _remote_host())
+    state_mod.write_agent(tmp_path, _guard_record(
+        "fnnas_001", "done", "tab:r", host="fnnas"))
+    state_mod.write_agent(tmp_path, _guard_record("b_001", "done", "tab:b"))
+    ps = AsyncMock(return_value=[])
+
+    with patch("osw.cli.terminal_show", _me_show(tmp_path)), \
+         patch("osw.cli.worktree_ps", ps), \
+         patch("osw.cli.pid_is_running", return_value=False):
+        result = runner.invoke(app, ["guard"])
+
+    assert result.exit_code == 0, result.output
+    out = json.loads(result.stdout)
+    assert out["guarded"] == [{"agent_id": "b_001", "action": "guardian_set"}]
+    assert out["skipped"] == [{"agent_id": "fnnas_001", "reason": "remote_host"}]
+    assert "runs on host 'fnnas'" in result.stderr
+    assert "guard is local-only" in result.stderr
+    # Only this machine's ps was asked, exactly once.
+    assert ps.await_args_list == [call()]
+    assert "guardian" not in state_mod.read_agent(tmp_path, "fnnas_001")
+
+
 def test_guard_skips_watcher_that_does_not_exit(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
@@ -2188,7 +2808,7 @@ def _invoke_stop(tmp_path, monkeypatch, record: dict, *, watcher: bool,
     with patch("osw.cli.terminal_interrupt", interrupt), \
          patch("osw.cli.terminal_send_escape", escape), \
          patch("osw.cli.terminal_list", terminals), \
-         patch("osw.cli.session_for_pane", session), \
+         patch("osw.sessions.session_for_pane", session), \
          patch("osw.cli.pid_is_running", return_value=watcher):
         result = runner.invoke(app, ["stop", record["agent_id"]])
     return result, interrupt, escape
@@ -2208,7 +2828,7 @@ def test_stop_sends_the_provider_interrupt_key(tmp_path, monkeypatch, provider, 
         "agent_id": "agent_001", "key": key, "watcher": False,
     }
     used, unused = (interrupt, escape) if key == "interrupt" else (escape, interrupt)
-    used.assert_awaited_once_with("term-a")
+    used.assert_awaited_once_with("term-a", host=LOCAL)
     unused.assert_not_awaited()
 
 
@@ -2222,7 +2842,7 @@ def test_stop_with_live_watcher_writes_sidecar_not_record(tmp_path, monkeypatch)
     assert json.loads(result.output) == {
         "agent_id": "agent_001", "key": "interrupt", "watcher": True,
     }
-    interrupt.assert_awaited_once_with("term-a")
+    interrupt.assert_awaited_once_with("term-a", host=LOCAL)
     assert state_mod.read_stop_request(tmp_path, "agent_001")
     # the live watcher owns the record: the CLI never writes it
     assert state_mod.read_agent(tmp_path, "agent_001") == record
@@ -2240,7 +2860,7 @@ def test_stop_without_watcher_records_session_and_writes_no_sidecar(tmp_path, mo
         watcher=False, session=session)
 
     assert result.exit_code == 0, result.output
-    escape.assert_awaited_once_with("term-a")
+    escape.assert_awaited_once_with("term-a", host=LOCAL)
     assert lookups == ["tab-a:leaf-b"]
     agent = state_mod.read_agent(tmp_path, "agent_001")
     assert agent["session_id"] == "pi-sess"
@@ -2250,15 +2870,25 @@ def test_stop_without_watcher_records_session_and_writes_no_sidecar(tmp_path, mo
 
 def test_stop_session_lookup_failure_still_interrupts(tmp_path, monkeypatch):
     def session(pane_key):
-        raise RuntimeError("cache unreadable")
+        raise host_mod.HostError(
+            host_mod.REMOTE_SESSION_UNKNOWN, "fnnas: cannot read session cache",
+            host="fnnas",
+        )
 
     result, interrupt, _ = _invoke_stop(
         tmp_path, monkeypatch, _stop_record("codex", session_id="old"),
         watcher=False, session=session)
 
     assert result.exit_code == 0, result.output
-    interrupt.assert_awaited_once_with("term-a")
+    interrupt.assert_awaited_once_with("term-a", host=LOCAL)
     assert state_mod.read_agent(tmp_path, "agent_001")["session_id"] == "old"
+    # Never silent: the cache failure is named in the event stream.
+    warned = [e for e in read_events(state_mod.logs_dir(tmp_path))
+              if e["event"] == "session_lookup_failed"]
+    assert len(warned) == 1
+    assert warned[0]["level"] == "WARNING"
+    assert "cannot read session cache" in warned[0]["message"]
+    assert warned[0]["data"]["code"] == host_mod.REMOTE_SESSION_UNKNOWN
 
 
 def test_stop_rebinds_stale_handle_by_pane_and_retries_once(tmp_path, monkeypatch):
@@ -2273,7 +2903,7 @@ def test_stop_rebinds_stale_handle_by_pane_and_retries_once(tmp_path, monkeypatc
 
     assert result.exit_code == 0, result.output
     assert [c.args[0] for c in interrupt.await_args_list] == ["term-a", "term-new"]
-    terminals.assert_awaited_once_with(f"path:{tmp_path}")
+    terminals.assert_awaited_once_with(f"path:{tmp_path}", host=LOCAL)
     assert state_mod.read_stop_request(tmp_path, "agent_001")
 
 
@@ -2285,7 +2915,7 @@ def test_stop_stale_handle_without_live_pane_fails_without_sidecar(tmp_path, mon
 
     assert result.exit_code == 1
     assert "older runtime" in result.output
-    escape.assert_awaited_once_with("term-a")
+    escape.assert_awaited_once_with("term-a", host=LOCAL)
     assert not state_mod.stop_request_path(tmp_path, "agent_001").exists()
 
 
@@ -2313,6 +2943,51 @@ def test_stop_unknown_provider_fails_without_sending(tmp_path, monkeypatch, prov
     interrupt.assert_not_awaited()
     escape.assert_not_awaited()
     assert not state_mod.stop_request_path(tmp_path, "agent_001").exists()
+
+
+def _remote_stop_record(**extra) -> dict:
+    return {
+        "agent_id": "fnnas_001",
+        "terminal": "term-r",
+        "pane_key": "tab-r:leaf",
+        "provider": "claude",
+        "state": "working",
+        "host": "fnnas",
+        **extra,
+    }
+
+
+def test_stop_on_flag_addresses_the_record_host(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    host_mod.save_host(tmp_path, _remote_host())
+    state_mod.write_agent(tmp_path, _remote_stop_record())
+    interrupt = AsyncMock(return_value={})
+
+    with patch("osw.cli.terminal_interrupt", interrupt), \
+         patch("osw.cli.pid_is_running", return_value=False), \
+         patch("osw.sessions.session_on_host", AsyncMock(return_value="")):
+        result = runner.invoke(app, ["stop", "fnnas_001", "--on", "fnnas"])
+
+    assert result.exit_code == 0, result.output
+    assert interrupt.await_args.args[0] == "term-r"
+    assert interrupt.await_args.kwargs["host"].name == "fnnas"
+
+
+def test_stop_on_flag_contradicting_the_record_is_refused(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    host_mod.save_host(tmp_path, _remote_host())
+    state_mod.write_agent(tmp_path, _remote_stop_record())
+    interrupt = AsyncMock(return_value={})
+
+    with patch("osw.cli.terminal_interrupt", interrupt), \
+         patch("osw.cli.pid_is_running", return_value=False):
+        result = runner.invoke(app, ["stop", "fnnas_001", "--on", "local"])
+
+    assert result.exit_code == 1
+    assert "belongs to host 'fnnas', not 'local'" in result.output
+    interrupt.assert_not_awaited()
 
 
 def test_stop_missing_agent_fails(tmp_path, monkeypatch):
@@ -2402,7 +3077,8 @@ def test_revive_lost_agent_resumes_session_and_continues_task(tmp_path, monkeypa
 
     assert result.exit_code == 0, result.output
     create.assert_awaited_once_with(
-        "claude --dangerously-skip-permissions --model sonnet --effort high --resume s-1"
+        "claude --dangerously-skip-permissions --model sonnet --effort high --resume s-1",
+        host=LOCAL,
     )
     ps.assert_not_awaited()  # never judge from the old pane's ps state
     spawn.assert_called_once_with(tmp_path, "code_001")
@@ -2432,14 +3108,15 @@ def test_revive_idle_agent_only_restores_session(tmp_path, monkeypatch):
     with patch("osw.cli.pid_is_running", return_value=False), \
          patch("osw.cli.terminal_create", create), \
          patch("osw.cli.terminal_show", _me_show(tmp_path)), \
-         patch("osw.cli.session_for_pane", sessions), \
+         patch("osw.sessions.session_for_pane", sessions), \
          patch("osw.cli._spawn_watcher", spawn):
         result = runner.invoke(app, ["revive", "code_001"])
 
     assert result.exit_code == 0, result.output
     sessions.assert_called_once_with("tab:code_001")
     create.assert_awaited_once_with(
-        "codex resume s-pane --dangerously-bypass-approvals-and-sandbox"
+        "codex resume s-pane --dangerously-bypass-approvals-and-sandbox",
+        host=LOCAL,
     )
     spawn.assert_not_called()
     agent = state_mod.read_agent(tmp_path, "code_001")
@@ -2464,11 +3141,11 @@ def test_revive_session_flag_beats_recorded_session(tmp_path, monkeypatch):
     sessions = Mock(return_value="s-pane")
     with patch("osw.cli.pid_is_running", return_value=False), \
          patch("osw.cli.terminal_create", create), \
-         patch("osw.cli.session_for_pane", sessions):
+         patch("osw.sessions.session_for_pane", sessions):
         result = runner.invoke(app, ["revive", "code_001", "--session", "s-flag"])
 
     assert result.exit_code == 0, result.output
-    create.assert_awaited_once_with("pi --approve --session s-flag")
+    create.assert_awaited_once_with("pi --approve --session s-flag", host=LOCAL)
     sessions.assert_not_called()
     assert state_mod.read_agent(tmp_path, "code_001")["session_id"] == "s-flag"
 
@@ -2482,7 +3159,7 @@ def test_revive_without_any_session_fails(tmp_path, monkeypatch):
     create = _created()
     with patch("osw.cli.pid_is_running", return_value=False), \
          patch("osw.cli.terminal_create", create), \
-         patch("osw.cli.session_for_pane", return_value=""):
+         patch("osw.sessions.session_for_pane", return_value=""):
         result = runner.invoke(app, ["revive", "code_001"])
 
     assert result.exit_code == 1
@@ -2640,7 +3317,7 @@ def test_revive_lost_omp_claims_new_terminal_with_worker_start(tmp_path, monkeyp
     spawn = Mock(return_value=999)
     identity = _omp_identity_show(tmp_path)
 
-    async def show(handle):
+    async def show(handle, host=None):
         if handle == "term-g":
             return _show_pane(tmp_path, "term-g", "tab", "g")
         return await identity(handle)
@@ -2658,7 +3335,7 @@ def test_revive_lost_omp_claims_new_terminal_with_worker_start(tmp_path, monkeyp
         result = runner.invoke(app, ["revive", "misc_001"])
 
     assert result.exit_code == 0, result.output
-    create.assert_awaited_once_with("omp --auto-approve --resume s-omp")
+    create.assert_awaited_once_with("omp --auto-approve --resume s-omp", host=LOCAL)
     release.assert_awaited_once_with("ctx_old")
     identity.assert_awaited_with("term-new")
     kwargs = start.await_args.kwargs
@@ -2848,8 +3525,8 @@ def test_revive_in_place_types_resume_command_into_empty_shell(tmp_path, monkeyp
     result, spawn = _run_revive(mocks, ["revive", "code_001"])
 
     assert result.exit_code == 0, result.output
-    mocks["terminal_list"].assert_awaited_once_with(f"path:{tmp_path}")
-    mocks["terminal_read"].assert_awaited_once_with("term-cur", screen=True)
+    mocks["terminal_list"].assert_awaited_once_with(f"path:{tmp_path}", host=LOCAL)
+    mocks["terminal_read"].assert_awaited_once_with("term-cur", screen=True, host=LOCAL)
     ask = mocks["ask_ready"].await_args
     assert ask.args[2] == "claude"
     assert ask.args[3] == _shell_frame()
@@ -2857,6 +3534,7 @@ def test_revive_in_place_types_resume_command_into_empty_shell(tmp_path, monkeyp
     mocks["terminal_send"].assert_awaited_once_with(
         "term-cur",
         "claude --dangerously-skip-permissions --model 'claude-opus-5-5[1m]' --resume s-1",
+        host=LOCAL,
     )
     mocks["terminal_create"].assert_not_awaited()
     spawn.assert_not_called()
@@ -2907,7 +3585,7 @@ def test_revive_in_place_recognizes_shell_from_title(tmp_path, monkeypatch, titl
     result, _ = _run_revive(mocks, ["revive", "code_001"])
 
     assert result.exit_code == 0, result.output
-    mocks["terminal_send"].assert_awaited_once_with("term-cur", expected)
+    mocks["terminal_send"].assert_awaited_once_with("term-cur", expected, host=LOCAL)
     assert json.loads(result.stdout)["placement"] == "in_place"
 
 
@@ -2926,6 +3604,7 @@ def test_revive_in_place_cmd_quotes_with_double_quotes(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     mocks["terminal_send"].assert_awaited_once_with(
         "term-cur", 'claude --dangerously-skip-permissions --model "my model" --resume s-1',
+        host=LOCAL,
     )
 
 
@@ -3137,9 +3816,165 @@ def test_revive_new_terminal_resolves_pane_key_via_terminal_show(tmp_path, monke
         result = runner.invoke(app, ["revive", "code_001"])
 
     assert result.exit_code == 0, result.output
-    show.assert_awaited_once_with("term-new")
+    show.assert_awaited_once_with("term-new", host=LOCAL)
     assert state_mod.read_agent(tmp_path, "code_001")["pane_key"] == "tab:new"
     assert json.loads(result.stdout)["pane_key"] == "tab:new"
+
+
+def _revive_remote_record(**extra) -> dict:
+    return {
+        "agent_id": "fnnas_001",
+        "terminal": "term-r",
+        "pane_key": "tab-r:leaf",
+        "worktree_path": "/srv/fnnas",
+        "provider": "claude",
+        "state": "done",
+        "prompt": "remote task",
+        "host": "fnnas",
+        **extra,
+    }
+
+
+def test_revive_remote_reads_its_own_cache_and_creates_on_that_host(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    state_mod.write_agent(tmp_path, _revive_remote_record())
+    fleet_host = _remote_host(providers={"claude": "/opt/agents/claude/bin/claude"})
+    host_mod.save_host(tmp_path, fleet_host)
+
+    sessions = AsyncMock(return_value="s-r")
+    listing = AsyncMock(return_value=[])
+    create = _created(handle="term-r-new", tab="tab-r", leaf="new")
+    with patch("osw.cli.pid_is_running", return_value=False), \
+         patch("osw.cli.terminal_list", listing), \
+         patch("osw.cli.terminal_create", create), \
+         patch("osw.cli.terminal_send", AsyncMock()) as send, \
+         patch("osw.sessions.session_on_host", sessions):
+        result = runner.invoke(app, ["revive", "fnnas/fnnas_001"])
+
+    assert result.exit_code == 0, result.output
+    sessions.assert_awaited_once_with(fleet_host, "tab-r:leaf", tmp_path)
+    listing.assert_awaited_once_with("path:/srv/fnnas", host=fleet_host)
+    # The paired server's non-interactive shell may not resolve `claude`
+    # from PATH: the host's recorded absolute provider path heads argv.
+    create.assert_awaited_once_with(
+        "/opt/agents/claude/bin/claude --dangerously-skip-permissions --resume s-r",
+        "path:/srv/fnnas", host=fleet_host,
+    )
+    send.assert_not_awaited()
+    agent = state_mod.read_agent(tmp_path, "fnnas_001")
+    assert agent["host"] == "fnnas"
+    assert agent["terminal"] == "term-r-new"
+    assert agent["pane_key"] == "tab-r:new"
+    assert agent["session_id"] == "s-r"
+    assert agent["state"] == "enrolled"
+    out = json.loads(result.stdout)
+    assert out["placement"] == "new_terminal"
+
+
+def test_revive_remote_in_place_types_absolute_resume_command(
+    tmp_path, monkeypatch,
+):
+    """The in-place shell line carries the host's absolute provider path
+    too, not just the new-terminal command."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    monkeypatch.setenv("OSW_JEV_MODE", "shadow")
+    state_mod.write_agent(tmp_path, _revive_remote_record(session_id="s-r"))
+    fleet_host = _remote_host(providers={"claude": "/opt/agents/claude/bin/claude"})
+    host_mod.save_host(tmp_path, fleet_host)
+
+    mocks = _in_place_patches(terminals=[{
+        "handle": "term-r", "tabId": "tab-r", "leafId": "leaf",
+        "title": "/usr/bin/bash",
+    }])
+    result, spawn = _run_revive(mocks, ["revive", "fnnas/fnnas_001"])
+
+    assert result.exit_code == 0, result.output
+    handle, line = mocks["terminal_send"].await_args.args[:2]
+    assert handle == "term-r"
+    assert line == (
+        "/opt/agents/claude/bin/claude --dangerously-skip-permissions "
+        "--resume s-r"
+    )
+    mocks["terminal_create"].assert_not_awaited()
+    spawn.assert_not_called()
+    assert json.loads(result.stdout)["placement"] == "in_place"
+
+
+def test_revive_remote_with_empty_cache_fails_remote_session_unknown(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    record = _revive_remote_record()
+    state_mod.write_agent(tmp_path, record)
+    host_mod.save_host(tmp_path, _remote_host(
+        providers={"claude": "/opt/agents/claude"},
+    ))
+
+    create = _created()
+    with patch("osw.cli.pid_is_running", return_value=False), \
+         patch("osw.cli.terminal_create", create), \
+         patch("osw.sessions.session_on_host", AsyncMock(return_value="")):
+        result = runner.invoke(app, ["revive", "fnnas/fnnas_001"])
+
+    assert result.exit_code == 1
+    assert "remote_session_unknown" in result.output
+    assert "tab-r:leaf" in result.output
+    create.assert_not_awaited()
+    assert state_mod.read_agent(tmp_path, "fnnas_001") == record
+
+
+def test_revive_remote_refuses_a_provider_the_host_never_probed(
+    tmp_path, monkeypatch,
+):
+    """`--on` alone addresses the host; a provider it never probed is
+    refused before the pane is even listed."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    record = _revive_remote_record()
+    state_mod.write_agent(tmp_path, record)
+    host_mod.save_host(tmp_path, _remote_host())   # providers={}
+    create = _created()
+    listing = AsyncMock()
+
+    with patch("osw.cli.pid_is_running", return_value=False), \
+         patch("osw.cli.terminal_list", listing), \
+         patch("osw.cli.terminal_create", create):
+        result = runner.invoke(
+            app, ["revive", "fnnas_001", "--on", "fnnas"],
+        )
+
+    assert result.exit_code == 1
+    assert "no recorded path for provider 'claude'" in result.output
+    assert "osw host doctor fnnas --provider claude" in result.output
+    listing.assert_not_awaited()
+    create.assert_not_awaited()
+    assert state_mod.read_agent(tmp_path, "fnnas_001") == record
+
+
+def test_revive_on_flag_contradicting_the_record_is_refused(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    state_mod.write_agent(tmp_path, _revive_remote_record())
+    host_mod.save_host(tmp_path, _remote_host())
+
+    result = runner.invoke(
+        app, ["revive", "fnnas_001", "--on", "local"],
+    )
+
+    assert result.exit_code == 1
+    assert "belongs to host 'fnnas', not 'local'" in result.output
 
 
 def test_revive_release_unknown_is_one_concise_warning(tmp_path, monkeypatch, caplog):
@@ -3205,7 +4040,7 @@ def test_del_close_closes_terminal_orchestration_left_open(tmp_path, monkeypatch
 
     assert result.exit_code == 0, result.output
     (release if verb == "release" else stop).assert_awaited_once_with("ctx_1")
-    close.assert_awaited_once_with("term-cur")
+    close.assert_awaited_once_with("term-cur", host=LOCAL)
     assert "Warning" not in result.output
     assert state_mod.list_agents(tmp_path) == {}
 
@@ -3226,7 +4061,7 @@ def test_del_close_matches_leftover_terminal_by_handle_without_pane(tmp_path, mo
         result = runner.invoke(app, ["del", "misc_001", "--close"])
 
     assert result.exit_code == 0, result.output
-    close.assert_awaited_once_with("term-cur")
+    close.assert_awaited_once_with("term-cur", host=LOCAL)
 
 
 def test_del_close_leftover_check_failure_still_removes_agent(tmp_path, monkeypatch):
