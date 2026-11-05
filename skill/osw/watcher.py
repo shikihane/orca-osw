@@ -86,6 +86,7 @@ from osw.log import emit_event, enable_file_logging, get_logger, setup_logging
 from osw.orca_cli import (
     OrcaError,
     orchestration_inbox,
+    orchestration_send,
     orchestration_worker_retain,
     orchestration_worker_show,
     terminal_interrupt,
@@ -1042,13 +1043,17 @@ class Watcher:
         if session_id:
             self._update(session_id=session_id)
 
-    def _notify_target(self) -> tuple[str, str]:
-        """(terminal, pane_key) to notify, resolved fresh on every call.
+    def _notify_target(self) -> tuple[str, str, str]:
+        """(kind, target, pane_key) to notify, resolved fresh on every call.
 
-        A guardian that is an OSW agent is stored by id only and read
-        from its own record each time, so its current handle is used; an
-        inline guardian carries its terminal and pane key. Without a
-        resolvable guardian the caller terminal (no pane key) is used.
+        `kind` is "terminal" for a terminal handle and "session" for a
+        structured-chat address (`orca_session_id:<id>`), which Orca
+        injects into that chat as a user turn. A guardian that is an OSW
+        agent is stored by id only and read from its own record each
+        time, so its current handle is used; an inline guardian carries
+        its terminal and pane key, or its chat session. Without a
+        resolvable guardian the caller is used: the terminal when there
+        is one, else the chat session.
         """
         guardian = self.agent.get("guardian")
         if isinstance(guardian, dict) and guardian.get("agent_id"):
@@ -1058,7 +1063,10 @@ class Watcher:
             except (OSError, ValueError):
                 record = None
             if record and record.get("terminal"):
-                return str(record["terminal"]), str(record.get("pane_key") or "")
+                return (
+                    "terminal", str(record["terminal"]),
+                    str(record.get("pane_key") or ""),
+                )
             self._event(
                 "guardian_unresolved",
                 level="WARNING",
@@ -1066,9 +1074,20 @@ class Watcher:
                         "falling back to caller terminal",
                 data={"guardian": guardian_id},
             )
+        elif isinstance(guardian, dict) and guardian.get("session"):
+            return "session", str(guardian["session"]), ""
         elif isinstance(guardian, dict) and guardian.get("terminal"):
-            return str(guardian["terminal"]), str(guardian.get("pane_key") or "")
-        return str(self.agent.get("caller_terminal") or ""), ""
+            return (
+                "terminal", str(guardian["terminal"]),
+                str(guardian.get("pane_key") or ""),
+            )
+        caller = str(self.agent.get("caller_terminal") or "")
+        if caller:
+            return "terminal", caller, ""
+        session = str(self.agent.get("caller_session") or "")
+        if session:
+            return "session", session, ""
+        return "terminal", "", ""
 
     async def _rebind_notify_target(self, pane_key: str) -> str:
         """Current handle of the notify target's pane, or ""."""
@@ -1084,20 +1103,24 @@ class Watcher:
         return ""
 
     async def _notify(self, line: str) -> None:
-        target, pane_key = self._notify_target()
+        kind, target, pane_key = self._notify_target()
         if not target:
             # Never drop a completion notification silently: record an
             # ERROR event so the gap is visible in `osw logs`.
             log.warning(
-                "notify skipped (agent=%s): no caller_terminal recorded",
+                "notify skipped (agent=%s): no caller recorded",
                 self.agent_id,
             )
             self._event(
                 "notify_skipped",
                 level="ERROR",
-                message="no caller_terminal recorded; notification dropped",
+                message="no caller terminal or chat session recorded; "
+                        "notification dropped",
                 data={"line": line},
             )
+            return
+        if kind == "session":
+            await self._notify_session(target, line)
             return
         try:
             await terminal_send(target, line)
@@ -1131,6 +1154,29 @@ class Watcher:
             message=f"failed to notify caller terminal: {failure}",
             data={"caller_terminal": target, "line": line},
         )
+
+    async def _notify_session(self, address: str, line: str) -> None:
+        """Deliver through Orca's session mailbox, which injects a chat turn.
+
+        A structured chat has no terminal handle, and Orca's own
+        `orchestration send` is the only channel into it: the message
+        arrives as a user turn, exactly like the terminal notice does in
+        a terminal pane. Nothing is rebindable here — the address is the
+        session id, not a runtime handle.
+        """
+        text = line[len("# [osw] "):] if line.startswith("# [osw] ") else line
+        subject = text[:120] or "osw"
+        try:
+            await orchestration_send(address, subject, line)
+            return
+        except OrcaError as exc:
+            log.warning("notify failed (session=%s): %s", address, exc)
+            self._event(
+                "notify_failed",
+                level="ERROR",
+                message=f"failed to notify caller chat session: {exc}",
+                data={"caller_session": address, "line": line},
+            )
 
     async def _rebind_terminal(self) -> bool:
         """Refresh a runtime-scoped handle using the pane's stable identity.

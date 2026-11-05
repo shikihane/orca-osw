@@ -82,7 +82,7 @@ When Orca reports the agent's turn as done (`worktree ps`; untracked CLIs fall b
 1. The watcher sends a fixed single-line wrap-up instruction with a pre-allocated handoff path
 2. The agent writes the handoff markdown to `.orca/osw/handoffs/<agent>_<ts>.md` (verified, one retry)
 3. The watcher writes a JSON report to `.orca/osw/reports/`
-4. The caller terminal (auto-detected when run from a TTY, or set via `--caller-terminal`) receives a single-line report:
+4. The caller (a terminal auto-detected from a TTY or `ORCA_TERMINAL_HANDLE`, a chat session from `ORCA_AGENT_SESSION_ID`, or an explicit `--caller-terminal` address) receives a single-line report:
 
 ```
 # [osw] task-finished agent=code_001 terminal=term_xxx report=... handoff=... summary=...

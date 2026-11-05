@@ -113,12 +113,16 @@ python <skill-dir>/osw.py use <agent-id-or-terminal> [--prefix <role>] [--caller
 
 OSW resolves the notification target in this order: `--caller-terminal`,
 then the inherited `ORCA_TERMINAL_HANDLE` (validated first; a stale handle
-is dropped with a warning instead of aborting the dispatch), then
-marker-based auto-detection in an interactive Orca terminal. If no caller
-can be identified, the dispatch is rejected — an agent that can never
-report completion is not created. Pass `--no-notify` to proceed anyway;
-OSW prints a warning and you must poll `list`/`status` yourself. A record
-that already has a `guardian` keeps notifying that guardian on `use`
+is dropped with a warning instead of aborting the dispatch), then the
+injected `ORCA_AGENT_SESSION_ID` of an Orca chat, then marker-based
+auto-detection in an interactive Orca terminal. A chat (a structured agent
+session) has no terminal handle, so OSW records `caller_session:
+orca_session_id:<id>` and the watcher delivers through `orca
+orchestration send`, which Orca injects into that chat as a user turn. If no
+caller can be identified, the dispatch is rejected — an agent that can
+never report completion is not created. Pass `--no-notify` to proceed
+anyway; OSW prints a warning and you must poll `list`/`status` yourself. A
+record that already has a `guardian` keeps notifying that guardian on `use`
 unless `--caller-terminal` names another target explicitly.
 
 `use <agent-id>` requires a settled agent (`done`, `error`, `lost`, or
@@ -166,10 +170,12 @@ provider `dsh`, so such a pane enrolls as `support: full`. Output:
 reason is `caller_terminal`, `no_pane_key`, `already_recorded`, `no_agent`, or
 `write_failed`.
 
-`guard` makes the executor — `--caller-terminal`, else `ORCA_TERMINAL_HANDLE`
-— the guardian (notification target) of the named agents; without ids it takes
-every unguarded `enrolled`/`done`/`error` record. An executor that is itself an
-OSW agent is stored as `{agent_id}`, anything else as `{terminal, pane_key}`.
+`guard` makes the executor — `--caller-terminal`, else `ORCA_TERMINAL_HANDLE`,
+else the injected `ORCA_AGENT_SESSION_ID` of an Orca chat — the guardian
+(notification target) of the named agents; without ids it takes every
+unguarded `enrolled`/`done`/`error` record. An executor that is itself an OSW
+agent is stored as `{agent_id}`, a chat session as `{session}` (delivered
+through `orca orchestration send`), anything else as `{terminal, pane_key}`.
 Per agent: a live watcher is terminated and restarted to follow the turn in
 progress (`watcher_restarted`); an unwatched pane ps reports `working` gets a
 watcher that follows it (`follow_started`); an idle agent only records the

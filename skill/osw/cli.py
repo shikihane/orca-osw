@@ -33,6 +33,8 @@ from osw.orca_cli import (
     OrcaError,
     compatibility_report,
     detect_current_terminal,
+    injected_session_address,
+    is_session_address,
     orchestration_run_create,
     orchestration_run_current,
     orchestration_run_use,
@@ -509,22 +511,29 @@ def _check_env_caller() -> tuple[str | None, dict | None]:
 
 
 def _executor_identity(caller_terminal: str | None) -> tuple[str | None, str]:
-    """(handle, pane_key) of the terminal running this command.
+    """(handle or session address, pane_key) of this command's caller.
 
     Callers compare panes, not handle strings: the pane key is the
     stable identity, a handle only names it within one Orca runtime.
     `--caller-terminal` overrides ORCA_TERMINAL_HANDLE; a stale env
     handle falls back to caller detection like `_maybe_detect_caller`.
+    A structured chat session has no terminal and no pane: its identity
+    is the injected `orca_session_id:<id>` address, returned with an
+    empty pane key.
     """
     data = None
     if caller_terminal:
         handle: str | None = caller_terminal
     else:
         handle, data = _check_env_caller()
+        if not handle:
+            handle = injected_session_address() or None
         if not handle and sys.stdin.isatty() and sys.stdout.isatty():
             handle = _detect_caller_terminal()
     if not handle:
         return None, ""
+    if is_session_address(handle):
+        return handle, ""
     if data is None:
         try:
             data = anyio.run(terminal_show, handle)
@@ -538,6 +547,14 @@ def _executor_identity(caller_terminal: str | None) -> tuple[str | None, str]:
 
 
 def _maybe_detect_caller(caller_terminal: str | None) -> str | None:
+    """The notification address of this command's caller, or None.
+
+    A terminal handle when one is known; otherwise the injected
+    structured-session address, which Orca delivers mail into as a user
+    turn. A structured chat (OMP launched as an Orca chat) has neither
+    a terminal handle nor a TTY, so without that fallback the caller of
+    every chat-dispatched agent would be unknown.
+    """
     if caller_terminal:
         return caller_terminal
     # Orca exports the hosting terminal's handle into every terminal it
@@ -547,6 +564,10 @@ def _maybe_detect_caller(caller_terminal: str | None) -> str | None:
     env_handle = _validate_env_caller()
     if env_handle:
         return env_handle
+    session = injected_session_address()
+    if session:
+        log.info("caller from ORCA_AGENT_SESSION_ID  address=%s", session)
+        return session
     if sys.stdin.isatty() and sys.stdout.isatty():
         return _detect_caller_terminal()
     log.warning("caller detect skipped: stdin/stdout are not TTYs")
@@ -564,16 +585,16 @@ def _resolve_caller(caller_terminal: str | None, no_notify: bool) -> str | None:
         return caller
     if no_notify:
         typer.echo(
-            "WARNING: no caller terminal identified; completion will NOT "
+            "WARNING: no caller identified; completion will NOT "
             "be reported. Poll `osw.py status` instead.",
             err=True,
         )
         return None
     typer.echo(
-        "Error: could not identify the caller terminal, so the completion "
-        "notification would be lost. Run from an Orca-managed terminal, "
-        "pass --caller-terminal <handle>, or pass --no-notify to proceed "
-        "without notifications.",
+        "Error: could not identify the caller terminal or chat session, "
+        "so the completion notification would be lost. Run from an "
+        "Orca-managed terminal or chat, pass --caller-terminal <handle>, "
+        "or pass --no-notify to proceed without notifications.",
         err=True,
     )
     raise typer.Exit(1)
@@ -912,7 +933,7 @@ def _base_agent(
     agent_id: str,
     terminal: str,
     prompt: str,
-    caller_terminal: str | None,
+    caller: str | None,
     provider: str = "",
     provider_command: str = "",
     model_name: str = "",
@@ -922,6 +943,12 @@ def _base_agent(
     host: str = "",
     worktree_path: str | None = None,
 ) -> dict:
+    # The notification target is either a terminal handle or a
+    # structured-session address; the watcher picks the delivery lane
+    # from which field is set.
+    caller_address = caller or ""
+    caller_session = caller_address if is_session_address(caller_address) else ""
+    caller_terminal = "" if caller_session else caller_address
     now = now_iso()
     agent = {
         "agent_id": agent_id,
@@ -934,11 +961,13 @@ def _base_agent(
         "origin": origin,
         "state": "assigned",
         "phase": "",
-        "caller_terminal": caller_terminal,
+        "caller_terminal": caller_terminal or None,
         "prompt": prompt,
         "created_at": now,
         "updated_at": now,
     }
+    if caller_session:
+        agent["caller_session"] = caller_session
     if host:
         agent["host"] = host
     terminal_info = terminal_info or {}
@@ -1943,7 +1972,10 @@ def _wait_pid_exit(pid: int, timeout: float) -> bool:
 
 def _guardian_ref(root: Path, handle: str, pane_key: str) -> dict:
     """Guardian reference: an OSW agent by id (its current handle is read
-    from its own record at notify time), anything else inline."""
+    from its own record at notify time), a structured chat by session
+    address, anything else inline."""
+    if is_session_address(handle):
+        return {"session": handle}
     owner = find_agent_by_pane(root, pane_key)
     if owner is not None:
         return {"agent_id": owner["agent_id"]}
@@ -2016,9 +2048,9 @@ def guard(
     handle, pane_key = _executor_identity(caller_terminal)
     if not handle:
         typer.echo(
-            "Error: could not identify the caller terminal to act as "
-            "guardian. Run from an Orca-managed terminal or pass "
-            "--caller-terminal <handle>.",
+            "Error: could not identify the caller (terminal or chat "
+            "session) to act as guardian. Run from an Orca-managed "
+            "terminal or chat, or pass --caller-terminal <handle>.",
             err=True,
         )
         raise typer.Exit(1)
@@ -2108,6 +2140,10 @@ async def _live_guardian(root: Path, guardian) -> dict | None:
             read_agent(root, str(guardian["agent_id"]))
         except (FileNotFoundError, ValueError):
             return None
+        return guardian
+    if guardian.get("session"):
+        # A structured chat has no terminal to probe, and mailing it
+        # just to check liveness would inject a turn. Keep it.
         return guardian
     handle = str(guardian.get("terminal") or "")
     if not handle:

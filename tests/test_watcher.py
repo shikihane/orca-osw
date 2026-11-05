@@ -4548,6 +4548,77 @@ async def test_notify_without_guardian_uses_caller_terminal(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_notify_uses_mailbox_for_caller_chat_session(tmp_path):
+    """A structured chat has no terminal; the notice goes through Orca's
+    session mailbox, which injects it into the chat as a user turn."""
+    watcher = _turn_agent(
+        tmp_path, caller_terminal=None,
+        caller_session="orca_session_id:omp_abc")
+    send = AsyncMock(return_value={})
+    terminal = AsyncMock(return_value={})
+
+    with patch("osw.watcher.orchestration_send", send), \
+         patch("osw.watcher.terminal_send", terminal):
+        await watcher._notify("# [osw] task-finished agent=agent_001")
+
+    send.assert_awaited_once_with(
+        "orca_session_id:omp_abc",
+        "task-finished agent=agent_001",
+        "# [osw] task-finished agent=agent_001",
+    )
+    terminal.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_notify_uses_mailbox_for_chat_session_guardian(tmp_path):
+    watcher = _turn_agent(
+        tmp_path, guardian={"session": "orca_session_id:omp_abc"})
+    send = AsyncMock(return_value={})
+    terminal = AsyncMock(return_value={})
+
+    with patch("osw.watcher.orchestration_send", send), \
+         patch("osw.watcher.terminal_send", terminal):
+        await watcher._notify("# [osw] blocked agent=agent_001")
+
+    send.assert_awaited_once_with(
+        "orca_session_id:omp_abc",
+        "blocked agent=agent_001",
+        "# [osw] blocked agent=agent_001",
+    )
+    terminal.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_notify_terminal_caller_wins_over_recorded_session(tmp_path):
+    watcher = _turn_agent(
+        tmp_path, caller_session="orca_session_id:omp_abc")
+    send = AsyncMock(return_value={})
+    mailbox = AsyncMock(return_value={})
+
+    with patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.orchestration_send", mailbox):
+        await watcher._notify("# [osw] hello")
+
+    send.assert_awaited_once_with("caller-1", "# [osw] hello")
+    mailbox.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_notify_session_failure_is_recorded(tmp_path):
+    watcher = _turn_agent(
+        tmp_path, caller_terminal=None,
+        caller_session="orca_session_id:omp_abc")
+
+    with patch("osw.watcher.orchestration_send",
+               AsyncMock(side_effect=OrcaError("no such session", 1))):
+        await watcher._notify("# [osw] hello")
+
+    events = [e for e in _events(tmp_path) if e["event"] == "notify_failed"]
+    assert events and events[0]["data"]["caller_session"] == \
+        "orca_session_id:omp_abc"
+
+
+@pytest.mark.anyio
 async def test_notify_unresolvable_guardian_agent_falls_back_to_caller(tmp_path):
     watcher = _turn_agent(tmp_path, guardian={"agent_id": "gone_001"})
     send = AsyncMock(return_value={})

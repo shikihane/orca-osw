@@ -721,6 +721,36 @@ async def test_orchestration_inbox_requires_message_list():
                    stdout=json.dumps({"result": {"messages": "nope"}}).encode())
 
 
+@pytest.mark.anyio
+async def test_orchestration_send_addresses_a_session_mailbox():
+    payload = {"result": {"messageId": "msg_1"}}
+    result, cmd = await _run(
+        lambda: orca_cli.orchestration_send(
+            "orca_session_id:omp_abc", "task-finished", "# [osw] task-finished"),
+        stdout=json.dumps(payload).encode(),
+    )
+    assert cmd == [
+        "orca", "orchestration", "send",
+        "--to", "orca_session_id:omp_abc",
+        "--subject", "task-finished",
+        "--body", "# [osw] task-finished",
+        "--type", "status",
+        "--json",
+    ]
+    assert result["result"]["messageId"] == "msg_1"
+
+
+def test_injected_session_address_reads_only_the_injected_id(monkeypatch):
+    monkeypatch.delenv("ORCA_AGENT_SESSION_ID", raising=False)
+    assert orca_cli.injected_session_address() == ""
+    assert orca_cli.is_session_address("") is False
+
+    monkeypatch.setenv("ORCA_AGENT_SESSION_ID", " omp_abc ")
+    assert orca_cli.injected_session_address() == "orca_session_id:omp_abc"
+    assert orca_cli.is_session_address("orca_session_id:omp_abc") is True
+    assert orca_cli.is_session_address("term_1") is False
+
+
 def test_worker_asks_matches_the_workers_unanswered_questions_and_escalations():
     payload = json.dumps({"taskId": "task_1", "dispatchId": "ctx_1"})
     other = json.dumps({"taskId": "task_9", "dispatchId": "ctx_9"})

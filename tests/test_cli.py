@@ -823,6 +823,27 @@ def test_new_detects_caller_from_orca_env(tmp_path, monkeypatch):
     assert agent["caller_terminal"] == "term-host"
 
 
+def test_new_detects_caller_from_agent_session_env(tmp_path, monkeypatch):
+    """An Orca chat is a structured agent session: no terminal handle,
+    no TTY. ORCA_AGENT_SESSION_ID is its only injected identity, and
+    Orca delivers mail addressed to `orca_session_id:<id>` into that
+    chat as a user turn."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    monkeypatch.setenv("ORCA_AGENT_SESSION_ID", "omp_abc")
+
+    create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
+    with patch("osw.cli.terminal_create", create), \
+         patch("osw.cli._spawn_watcher", Mock(return_value=4567)):
+        result = runner.invoke(app, ["new", "claude", "do the task"])
+
+    assert result.exit_code == 0
+    agent = state_mod.read_agent(tmp_path, "agent_001")
+    assert agent["caller_session"] == "orca_session_id:omp_abc"
+    assert agent["caller_terminal"] is None
+
+
 def test_explicit_caller_terminal_beats_orca_env(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
@@ -841,12 +862,35 @@ def test_explicit_caller_terminal_beats_orca_env(tmp_path, monkeypatch):
     assert agent["caller_terminal"] == "caller-1"
 
 
+def test_new_accepts_explicit_session_address(tmp_path, monkeypatch):
+    """--caller-terminal may name a chat session address directly."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    monkeypatch.delenv("ORCA_AGENT_SESSION_ID", raising=False)
+
+    create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
+    with patch("osw.cli.terminal_create", create), \
+         patch("osw.cli._spawn_watcher", Mock(return_value=4567)):
+        result = runner.invoke(
+            app,
+            ["new", "claude", "--caller-terminal",
+             "orca_session_id:omp_xyz", "do the task"],
+        )
+
+    assert result.exit_code == 0
+    agent = state_mod.read_agent(tmp_path, "agent_001")
+    assert agent["caller_session"] == "orca_session_id:omp_xyz"
+    assert agent["caller_terminal"] is None
+
+
 def test_new_fails_loudly_when_caller_unknown(tmp_path, monkeypatch):
     """No env handle and no TTY (agent tool pipeline): dispatch is rejected
     instead of silently creating an agent that can never report back."""
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
     monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    monkeypatch.delenv("ORCA_AGENT_SESSION_ID", raising=False)
 
     create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
     with patch("osw.cli.terminal_create", create), \
@@ -864,6 +908,7 @@ def test_new_no_notify_proceeds_with_warning(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
     monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    monkeypatch.delenv("ORCA_AGENT_SESSION_ID", raising=False)
 
     create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
     with patch("osw.cli.terminal_create", create), \
@@ -2743,16 +2788,35 @@ def test_guard_skips_watcher_that_does_not_exit(tmp_path, monkeypatch):
     assert state_mod.read_agent(tmp_path, "b_001") == record
 
 
+def test_guard_records_chat_session_guardian(tmp_path, monkeypatch):
+    """A guard run from an Orca chat has no terminal: the guardian is the
+    chat session address, delivered through the orchestration mailbox."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    monkeypatch.setenv("ORCA_AGENT_SESSION_ID", "omp_abc")
+    state_mod.write_agent(tmp_path, _guard_record("b_001", "done", "tab:b"))
+
+    with patch("osw.cli.worktree_ps", AsyncMock(return_value=[])):
+        result = runner.invoke(app, ["guard"])
+
+    assert result.exit_code == 0, result.output
+    expected = {"session": "orca_session_id:omp_abc"}
+    assert json.loads(result.stdout)["guardian"] == expected
+    assert state_mod.read_agent(tmp_path, "b_001")["guardian"] == expected
+
+
 def test_guard_without_identifiable_executor_fails(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
     monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    monkeypatch.delenv("ORCA_AGENT_SESSION_ID", raising=False)
     state_mod.write_agent(tmp_path, _guard_record("b_001", "done", "tab:b"))
 
     result = runner.invoke(app, ["guard"])
 
     assert result.exit_code == 1
-    assert "caller terminal" in result.output
+    assert "could not identify the caller" in result.output
     assert "guardian" not in state_mod.read_agent(tmp_path, "b_001")
 
 
@@ -2760,6 +2824,7 @@ def test_guard_stale_executor_handle_fails_loudly(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state_mod.init_state_dir(tmp_path)
     monkeypatch.setenv("ORCA_TERMINAL_HANDLE", "term-gone")
+    monkeypatch.delenv("ORCA_AGENT_SESSION_ID", raising=False)
     state_mod.write_agent(tmp_path, _guard_record("b_001", "done", "tab:b"))
 
     with patch("osw.cli.terminal_show", AsyncMock(side_effect=_stale_handle_error())):

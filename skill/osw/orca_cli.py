@@ -13,6 +13,26 @@ from osw.log import get_logger
 
 log = get_logger("orca")
 
+# A structured agent session (an Orca chat) has no terminal handle. Orca
+# addresses it as `orca_session_id:<ORCA_AGENT_SESSION_ID>` and injects
+# messages sent there into that chat as a user turn; its own CLI derives
+# the same address from the same variable.
+SESSION_ADDRESS_PREFIX = "orca_session_id:"
+
+
+def is_session_address(value: str) -> bool:
+    return str(value or "").startswith(SESSION_ADDRESS_PREFIX)
+
+
+def injected_session_address() -> str:
+    """This process's own structured-session address, or "".
+
+    Only the id Orca injected is trusted: a session address is issued
+    and validated by the same runtime that hosts the session.
+    """
+    session_id = os.environ.get("ORCA_AGENT_SESSION_ID", "").strip()
+    return f"{SESSION_ADDRESS_PREFIX}{session_id}" if session_id else ""
+
 
 class OrcaError(Exception):
     def __init__(
@@ -687,6 +707,31 @@ async def orchestration_worker_retain(
     """Record OSW's decision to keep a settled worker terminal live."""
     return await run_orca(
         "orchestration", "worker-retain", "--dispatch", dispatch_id, host=host,
+    )
+
+
+async def orchestration_send(
+    to: str, subject: str, body: str, *, host: "Host | None" = None,
+) -> dict:
+    """Deliver one message to an orchestration mailbox.
+
+    This is the only channel into a structured agent session: Orca
+    injects it as a user turn (`orca_session_id:<id>`), where a terminal
+    send has no handle to address. `status` is a plain non-lifecycle
+    type, so the message never settles or fenced a worker.
+    """
+    return await run_orca(
+        "orchestration",
+        "send",
+        "--to",
+        to,
+        "--subject",
+        subject,
+        "--body",
+        body,
+        "--type",
+        "status",
+        host=host,
     )
 
 

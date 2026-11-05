@@ -82,7 +82,7 @@ python skill/osw.py status
 - `new omp` launches `omp --auto-approve` in an Orca terminal like every other provider: the readiness gate accepts the pane once its title has no spinner in front, the watcher sends the task prompt as its own turn, and the turn counts as done when Orca reports the pane `done` while the title stays idle. Neither signal can come from output silence — an omp status bar repaints continuously — and the supervised `orca orchestration worker-start --agent omp` lane is not used: Orca 1.4.246 waits for its own `tui-idle` readiness there, which an omp pane never emits (measured: failed at `agent_readiness` after both a 120s and a 240s budget, with the TUI sitting at its composer).
 - `new dsh` launches the DeepSeek Harness TUI with `dsh-tui .` — the entry Orca itself starts and tracks as agent `dsh`. DSH carries no model, effort or approval flag at launch: those live in DSH settings and change inside the TUI (`/model`, `/permission`), so `--model`/`--thinking` are refused rather than dropped, and OSW adds no autonomy flag. Readiness holds while DSH's own boot notice (`正在启动 DSH…` / `Starting DSH…`) is on screen: the launchpad draws its composer before the harness is up and drops a prompt sent then. Orca identifies the pane from its title (`✦ 🐋 <session>`) and takes working/done from DSH-TUI's Program Status Protocol reports; neither names a tool, so the report carries `tools_observed: null` instead of claiming none. With DSH's Orca hook bridge installed (`@deepseek-ai/dsh-hooks-claude-code` plus its runtime peers in the `dsh-tui` profile), OSW records the DSH session id during the ready wait — before the first turn's Program Status reports take over the pane record; without the bridge, `revive` needs `--session <id>`.
 - OSW adds the provider's non-blocking autonomy flag by default: `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`, `pi --approve`, `omp --auto-approve`, `kimi --yolo`, or `grok --always-approve --trust`.
-- `new` and `use` accept `--caller-terminal <handle>` to receive completion reports on a parent terminal.
+- `new` and `use` accept `--caller-terminal <handle>` to receive completion reports on a parent terminal. Run from an Orca chat (a structured agent session, which has no terminal handle), the caller is the injected `ORCA_AGENT_SESSION_ID`, recorded as `caller_session: orca_session_id:<id>`; the watcher delivers through `orca orchestration send`, which Orca injects into that chat as a user turn.
 - `del --close` also asks Orca to close the terminal.
 - `list --json` outputs raw JSON.
 
@@ -316,7 +316,7 @@ What each step guarantees:
   machine, `update-<provider>--<host>.lock` for a named one, so two hosts never
   serialise against each other while panes on the same host still do.
 - POSIX remotes are the supported target; a Windows remote is best effort.
-- `guard` stays local — the guardian is a terminal on this machine.
+- `guard` stays local — the guardian is a terminal or chat session on this machine.
 
 ## Architecture
 
@@ -354,9 +354,11 @@ wait until the pane is ready (`worktree ps` reports it done; a title-state TUI l
 ```
 
 The completion notification is sent proactively by the OSW watcher through
-`orca terminal send`; it is not an Orca-native cross-session notification.
-Automatic delivery therefore requires a detected caller terminal or an
-explicit `--caller-terminal` handle.
+`orca terminal send` (a terminal caller) or `orca orchestration send` (a chat
+session caller, delivered into that chat as a user turn); it is not an
+Orca-native cross-session notification. Automatic delivery therefore requires
+a detected caller — a terminal or a chat session — or an explicit
+`--caller-terminal` address.
 
 `new` starts the bare provider TUI only — the watcher always sends the task
 prompt as its own turn, so a briefly idle TUI at startup can never be
@@ -400,7 +402,7 @@ python skill/osw.py stop code_001                # interrupt the current turn
 ```
 
 - **`enroll`** scans `terminal list` for this worktree, skips the caller's own terminal and already-recorded panes, takes the provider from `agentIdentity` (else the ps `agentType`), and writes one `enrolled` record per pane with `origin: enroll`. Providers OSW cannot launch get `support: guard_only` (`support_reason: unsupported_provider`). Orca names a DSH pane after its launcher (`dsh-tui`); enroll maps that to provider `dsh`. It prints `{"enrolled": [...], "skipped": [{terminal, reason}]}`.
-- **`guard [<id>...]`** makes the executor (`--caller-terminal`, else `ORCA_TERMINAL_HANDLE`) the guardian; without ids it takes every unguarded `enrolled`/`done`/`error` agent. A live watcher is terminated and restarted to follow the running turn; an unwatched pane that ps reports `working` gets a following watcher; an idle agent only records the guardian. A followed turn is reported without a handoff (`already_done` when it had finished before the watcher took over). `use` keeps notifying the guardian unless `--caller-terminal` is passed.
+- **`guard [<id>...]`** makes the executor (`--caller-terminal`, else `ORCA_TERMINAL_HANDLE`, else the injected `ORCA_AGENT_SESSION_ID` of an Orca chat) the guardian; without ids it takes every unguarded `enrolled`/`done`/`error` agent. A live watcher is terminated and restarted to follow the running turn; an unwatched pane that ps reports `working` gets a following watcher; an idle agent only records the guardian. A followed turn is reported without a handoff (`already_done` when it had finished before the watcher took over). `use` keeps notifying the guardian unless `--caller-terminal` is passed.
 - **`revive`** without an id prints `{"revivable": [...], "not_revivable": [{agent_id, reason}]}`. `revive <id> [--session <sid>]` needs `support: full`, state `lost`/`done`/`error`/`enrolled`, and no live watcher. It reopens the session (`--session`, else the recorded `session_id`, else the pane's current one) with the provider's resume syntax plus the usual autonomy and model flags, and keeps the agent id. The command is typed into the agent's original pane when that pane is a confirmed empty shell — still listed, no `agentIdentity`, its ps row not `working`, a shell OSW can quote for (pwsh/PowerShell, cmd, POSIX), and Jev `ready_state` judging `shell_prompt` — so `pane_key` stays (`placement: in_place`); otherwise, including `OSW_JEV_MODE=off`, it opens a new terminal (`placement: new_terminal`). The output and the `agent_revived` event carry `placement`. A `lost` agent (interrupted mid-task) is resumed with `resume_turn: true`: the watcher sends `continue`, then runs the normal completion detection and handoff. Otherwise the agent comes back `enrolled`.
 - **`stop <id>`** sends Ctrl-C (`terminal send --interrupt`) to claude, codex, kimi, grok, and dsh, and a bare Esc to pi and omp. With a live watcher it writes the sidecar `.orca/osw/agents/<id>.stop`; the watcher ends the turn when ps reports it interrupted or done, or the pane has been silent for 5s, records `error` with `completion_source: interrupted`, skips the handoff, notifies the guardian, and deletes the sidecar. It prints `{"agent_id", "key", "watcher"}`.
 
@@ -410,7 +412,8 @@ New record fields (all optional; old records still load):
 |---|---|
 | `origin` | `new`, `use`, `enroll` |
 | `session_id` | Provider session id |
-| `guardian` | `{agent_id}` for an OSW agent (its current terminal is read from its record at notify time), else `{terminal, pane_key}` |
+| `guardian` | `{agent_id}` for an OSW agent (its current terminal is read from its record at notify time), `{session}` for a chat-session guardian, else `{terminal, pane_key}` |
+| `caller_session` | `orca_session_id:<id>` when the dispatch came from an Orca chat instead of a terminal |
 | `support` | `full`, or `guard_only` with `support_reason: unsupported_provider` |
 | `follow_turn` | The watcher takes over the running turn; cleared when it finishes |
 | `resume_turn` | The watcher's task prompt is `continue`; cleared when it finishes |
@@ -422,7 +425,7 @@ New record fields (all optional; old records still load):
 
 New states: `enrolled` (recorded, no watcher) and `lost` (non-final, watcher process gone — set by `list`/`status`/`use`/`revive`). New completion sources: `already_done` and `interrupted`.
 
-Notifications resolve their target before every send: the guardian if one is recorded, else the caller terminal. A guardian agent whose record cannot be read falls back to the caller terminal (`guardian_unresolved` event); a stale guardian handle is re-resolved once by pane and the send retried once.
+Notifications resolve their target before every send: the guardian if one is recorded, else the caller (terminal, else chat session). A guardian agent whose record cannot be read falls back to the caller (`guardian_unresolved` event); a stale guardian handle is re-resolved once by pane and the send retried once. A chat-session target has no handle to rebind: its notice goes through `orca orchestration send --to orca_session_id:<id>`, and a failed delivery records `notify_failed` with `caller_session`.
 
 Session ids come from Orca's agent-hook cache `%APPDATA%\orca\agent-hooks\last-status.json` (here `C:\Users\shiki\AppData\Roaming\orca\agent-hooks\last-status.json`). It is not a public Orca interface: OSW reads it only when its `version` matches (2), so on a different format the session id is simply empty.
 

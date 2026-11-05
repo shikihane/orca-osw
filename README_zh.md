@@ -80,7 +80,7 @@ python skill/osw.py status
 - `new omp` 与其他 provider 一样，在 Orca 终端里启动 `omp --auto-approve`：标题前面没有旋转符且输入框状态栏已画出时视为就绪，任务提示由 watcher 作为独立一轮发送，Orca 报告该面板 `done` 且标题保持空闲时视为本轮完成。这两个信号都不可能来自"输出安静"——omp 状态栏持续重绘——也不再走受监督的 `orca orchestration worker-start --agent omp` 通道：Orca 1.4.246 在那里等待自己的 `tui-idle` 就绪信号，而 omp 面板永远不会发出（实测：120s 与 240s 两种就绪预算下都停在 `agent_readiness` 失败，此时 TUI 已停在输入框）。
 - `new dsh` 用 `dsh-tui .` 启动 DeepSeek Harness TUI——正是 Orca 自己启动并识别为 agent `dsh` 的入口。DSH 的启动命令没有 model、effort 或批准参数：这些都在 DSH 设置里，并在 TUI 内用 `/model`、`/permission` 改变，因此 `--model`/`--thinking` 直接拒绝而不是静默丢弃，OSW 也不添加自主权参数。DSH 自己的启动提示（`正在启动 DSH…` / `Starting DSH…`）还在屏幕上时，就绪会被推迟：launchpad 在 harness 起来之前就画出输入框，此时发出的 prompt 会被丢弃。Orca 用终端标题（`✦ 🐋 <session>`）识别该面板，working/done 取自 DSH-TUI 的 Program Status Protocol 上报；两者都不报告工具名，因此报告写 `tools_observed: null`，而不是断言“没有工具调用”。装好 DSH 的 Orca hook 桥（`@deepseek-ai/dsh-hooks-claude-code` 及其运行时 peer，装进 `dsh-tui` profile）后，OSW 会在就绪等待阶段就记录会话 id——赶在第一回合的 Program Status 上报接管该面板记录之前；没装桥时 `revive` 需要 `--session <id>`。
 - OSW 默认添加 provider 的非阻塞/批准类启动参数：`claude --dangerously-skip-permissions`、`codex --dangerously-bypass-approvals-and-sandbox`、`pi --approve`、`omp --auto-approve`、`kimi --yolo`、`grok --always-approve --trust`。
-- `new` 和 `use` 支持 `--caller-terminal <句柄>`，指定接收完成报告的父终端。
+- `new` 和 `use` 支持 `--caller-terminal <句柄>`，指定接收完成报告的父终端。在 Orca 对话（结构化 agent 会话，没有终端句柄）里运行时，调用方取自注入的 `ORCA_AGENT_SESSION_ID`，记为 `caller_session: orca_session_id:<id>`；watcher 通过 `orca orchestration send` 投递，Orca 会把它作为用户轮注入该对话。
 - `del --close` 同时让 Orca 关闭终端。
 - `list --json` 输出原始 JSON。
 
@@ -241,9 +241,10 @@ OSW 只负责编排：初始化状态、创建或接管 Orca 终端、启动 det
  → 写入 JSON 报告并通知调用方终端
 ```
 
-完成提醒由 OSW watcher 通过 `orca terminal send` 主动发给调用方终端，
-并不是 Orca 原生的跨会话通知。要自动送达，必须成功检测到调用方终端，或
-显式传入 `--caller-terminal`。
+完成提醒由 OSW watcher 主动发送：调用方是终端时用 `orca terminal send`，
+是对话会话时用 `orca orchestration send`（Orca 会把它作为用户轮注入该对话）。
+这不是 Orca 原生的跨会话通知，因此要自动送达，必须成功检测到调用方（终端或
+对话会话），或显式传入 `--caller-terminal` 地址。
 
 `new` 只启动裸 provider TUI——任务提示始终由 watcher 作为独立一轮发送，
 因此启动瞬间的 TUI 空闲状态不可能被误判为任务完成。
@@ -280,7 +281,7 @@ python skill/osw.py stop code_001                # 中断当前一轮
 ```
 
 - **`enroll`** 扫描当前 worktree 的 `terminal list`，跳过执行者自己的终端和已有记录的面板，provider 取 `agentIdentity`（没有则取 ps 的 `agentType`），每个面板写一条 `enrolled` 记录，`origin: enroll`。OSW 无法启动的 provider 记为 `support: guard_only`（`support_reason: unsupported_provider`）。Orca 用启动器名（`dsh-tui`）标记 DSH 面板，`enroll` 会把它归一到 provider `dsh`。输出 `{"enrolled": [...], "skipped": [{terminal, reason}]}`。
-- **`guard [<id>...]`** 让执行者（`--caller-terminal`，否则 `ORCA_TERMINAL_HANDLE`）成为监护方；不带 id 时监护所有未被监护的 `enrolled`/`done`/`error` agent。有存活 watcher 时先终止它，再以跟踪方式重启；没有 watcher 但 ps 报 `working` 的面板会起一个跟踪 watcher；空闲 agent 只记录监护方。被跟踪的一轮结束后照常报告，但不发 handoff（watcher 接手时这一轮已结束则为 `already_done`）。`use` 未传 `--caller-terminal` 时继续通知监护方。
+- **`guard [<id>...]`** 让执行者（`--caller-terminal`，否则 `ORCA_TERMINAL_HANDLE`，否则 Orca 对话注入的 `ORCA_AGENT_SESSION_ID`）成为监护方；不带 id 时监护所有未被监护的 `enrolled`/`done`/`error` agent。有存活 watcher 时先终止它，再以跟踪方式重启；没有 watcher 但 ps 报 `working` 的面板会起一个跟踪 watcher；空闲 agent 只记录监护方。被跟踪的一轮结束后照常报告，但不发 handoff（watcher 接手时这一轮已结束则为 `already_done`）。`use` 未传 `--caller-terminal` 时继续通知监护方。
 - **`revive`** 不带 id 时输出 `{"revivable": [...], "not_revivable": [{agent_id, reason}]}`。`revive <id> [--session <sid>]` 要求 `support: full`、状态为 `lost`/`done`/`error`/`enrolled` 且没有存活 watcher。会话取 `--session`，否则取记录的 `session_id`，否则取该面板当前的会话；按 provider 的恢复语法（附带原有的自主权参数和模型参数）重新打开，agent id 不变。原面板确认是空 shell 时——仍在列表中、没有 `agentIdentity`、ps 条目不是 `working`、是 OSW 能转义的 shell（pwsh/PowerShell、cmd、POSIX）、且 Jev `ready_state` 判为 `shell_prompt`——直接在原面板输入恢复命令，`pane_key` 不变（`placement: in_place`）；否则（包括 `OSW_JEV_MODE=off`）新建终端（`placement: new_terminal`）。输出和 `agent_revived` 事件都带 `placement`。`lost`（中途被打断）的 agent 以 `resume_turn: true` 恢复：watcher 发送 `continue`，随后照常完成检测并发 handoff；其余情况恢复为 `enrolled`。
 - **`stop <id>`** 对 claude、codex、kimi、grok、dsh 发 Ctrl-C（`terminal send --interrupt`），对 pi、omp 发单个 Esc。有存活 watcher 时写旁路文件 `.orca/osw/agents/<id>.stop`；watcher 在 ps 报告该轮被中断或 done、或面板静默 5 秒后结束这一轮，记为 `error`、`completion_source: interrupted`，跳过 handoff，通知监护方并删除旁路文件。输出 `{"agent_id", "key", "watcher"}`。
 
@@ -290,7 +291,8 @@ python skill/osw.py stop code_001                # 中断当前一轮
 |---|---|
 | `origin` | `new`、`use`、`enroll` |
 | `session_id` | provider 会话 id |
-| `guardian` | 监护方是 OSW agent 时为 `{agent_id}`（通知时从它的记录读取当前终端），否则为 `{terminal, pane_key}` |
+| `guardian` | 监护方是 OSW agent 时为 `{agent_id}`（通知时从它的记录读取当前终端），是对话会话时为 `{session}`，否则为 `{terminal, pane_key}` |
+| `caller_session` | 从 Orca 对话（而不是终端）派发时为 `orca_session_id:<id>` |
 | `support` | `full`，或 `guard_only` 并带 `support_reason: unsupported_provider` |
 | `follow_turn` | watcher 接手进行中的一轮；结束后清除 |
 | `resume_turn` | watcher 的任务提示为 `continue`；结束后清除 |
@@ -302,7 +304,7 @@ python skill/osw.py stop code_001                # 中断当前一轮
 
 新增状态：`enrolled`（已登记，无 watcher）和 `lost`（非终态且 watcher 进程已不存在，由 `list`/`status`/`use`/`revive` 标记）。新增完成来源：`already_done` 和 `interrupted`。
 
-每次发送通知前都会重新解析通知对象：有监护方时用监护方，否则用调用方终端。监护方 agent 的记录读不到时回退到调用方终端（记录 `guardian_unresolved` 事件）；监护方 handle 失效时按面板重新绑定一次并重试一次。
+每次发送通知前都会重新解析通知对象：有监护方时用监护方，否则用调用方（优先终端，其次对话会话）。监护方 agent 的记录读不到时回退到调用方（记录 `guardian_unresolved` 事件）；监护方 handle 失效时按面板重新绑定一次并重试一次。对话会话目标没有句柄可重绑：通知走 `orca orchestration send --to orca_session_id:<id>`，投递失败记录 `notify_failed` 并带 `caller_session`。
 
 会话 id 来自 Orca 的 agent-hook 缓存 `%APPDATA%\orca\agent-hooks\last-status.json`（本机为 `C:\Users\shiki\AppData\Roaming\orca\agent-hooks\last-status.json`）。它不是 Orca 的公开接口：OSW 只在 `version` 匹配（2）时读取，格式变化时会话 id 为空。
 

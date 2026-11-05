@@ -82,7 +82,7 @@ Watchers running: 1
 1. watcher 发送固定的单行收尾指令，附带预分配的交接文件路径
 2. agent 把交接 markdown 写入 `.orca/osw/handoffs/<agent>_<ts>.md`（会校验，重试一次）
 3. watcher 把 JSON 报告写入 `.orca/osw/reports/`
-4. 调用方终端（TTY 下自动检测，或通过 `--caller-terminal` 指定）收到单行完成报告：
+4. 调用方（TTY 下自动检测、`ORCA_TERMINAL_HANDLE`、对话会话的 `ORCA_AGENT_SESSION_ID`，或通过 `--caller-terminal` 显式指定的地址）收到单行完成报告：
 
 ```
 # [osw] task-finished agent=code_001 terminal=term_xxx report=... handoff=... summary=...
