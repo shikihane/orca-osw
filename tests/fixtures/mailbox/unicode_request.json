@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "from": {"role": "human", "id": "terminal:term_unicode"},
+  "to": {"role": "router", "id": ""},
+  "kind": "request",
+  "thread_key": "chat:unicode",
+  "body": {
+    "text": "修复 café ☕ 的 🚀 panic：ログを確認して",
+    "summary": "émoji ☕ 🚀 检查"
+  }
+}

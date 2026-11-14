@@ -156,6 +156,15 @@ SUPERVISED_POLL_SECS = 3.0         # orchestration worker-show poll interval
 ASK_INBOX_LIMIT = 100              # newest inbox rows scanned for worker asks
 ASK_TEXT_MAX = 160                 # ask summary length in the notify line
 
+# Mailbox spool sink (control-plane interface §14): one best-effort
+# envelope per report/ask/blocked on top of the direct notification
+# path, which stays authoritative. A turn is never failed by it.
+SPOOL_SUMMARY_CHARS = 200          # report.body.summary cap
+SPOOL_DROPPED_SOURCES = (
+    "interrupted",
+    "terminal_lost",
+)
+
 # Blocking screens (plan §2.2; policy in osw.blockers). A send Orca
 # refuses with `agent_prompt_blocked` never reached the agent, so it is
 # retried after the blocker is handled and the pane is ready again — at
@@ -547,6 +556,35 @@ def one_line(text: str, max_len: int = 0) -> str:
     return flat
 
 
+def _new_report_key(agent_id: str) -> str:
+    """One report dedupe key per turn (spec §7 dedupe)."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return f"report_{agent_id}_{stamp}_{os.urandom(3).hex()}"
+
+
+def _spool_report_outcome(final_state: str, source: str) -> str:
+    """Map a finished turn to a Mailbox report outcome (spec §7).
+
+    `ready` for a verified handoff or a completed turn, `failed` for an
+    error, `dropped` for a lost or interrupted turn.
+    """
+    if final_state == "lost" or source in SPOOL_DROPPED_SOURCES:
+        return "dropped"
+    return "ready" if final_state == "done" else "failed"
+
+
+def _write_spool_envelope(root: Path, envelope: dict) -> str:
+    """Write one control-plane envelope to the mailbox spool.
+
+    Imported lazily: the mailbox is optional and direct mode works
+    without it, so a missing control-plane slice must never break the
+    watcher's import (the caller treats any failure as best effort).
+    """
+    from osw.mailbox.spool import write_envelope
+
+    return write_envelope(root, envelope)
+
+
 def format_completion_report(
     agent_id: str, terminal: str, report_file: str,
     handoff_file: str = "", summary: str = "", outcome: str = "",
@@ -712,6 +750,92 @@ class Watcher:
             data=data,
         )
 
+    # ---- mailbox spool sink (control-plane interface §14) ---------------
+
+    def _thread_key(self) -> str:
+        """Local thread identity: the record's ticket, else the agent."""
+        return str(self.agent.get("ticket_id") or self.agent_id)
+
+    def _ensure_report_key(self) -> str:
+        """One stable report key per turn, minted at turn start.
+
+        Persisted on the agent record so a restarted watcher reuses it
+        instead of reporting the same turn a second time. Cleared when
+        the report is written, so the next turn gets a fresh key.
+        """
+        key = str(self.agent.get("report_key") or "")
+        if key:
+            return key
+        key = _new_report_key(self.agent_id)
+        self._update(report_key=key)
+        return key
+
+    def _spool(
+        self,
+        kind: str,
+        body: dict,
+        *,
+        dedupe_key: str = "",
+        correlation: dict | None = None,
+        priority: int | None = None,
+    ) -> None:
+        """Write one envelope to the Mailbox spool, best effort.
+
+        The direct notification path stays authoritative: a mailbox that
+        is absent, not running, or out of spool space must never fail or
+        end the turn, so every failure is a WARNING event only.
+        """
+        try:
+            envelope = {
+                "from": {"role": "watcher", "id": self.agent_id},
+                "to": {"role": "router", "id": ""},
+                "kind": kind,
+                "correlation": {"agent": self.agent_id, **(correlation or {})},
+                "thread_key": self._thread_key(),
+                "dedupe_key": (
+                    dedupe_key
+                    or (self._ensure_report_key() if kind == "report" else "")
+                ),
+                "body": body,
+            }
+            if priority is not None:
+                envelope["priority"] = priority
+            _write_spool_envelope(self.root, envelope)
+        except Exception as exc:  # the sink is never allowed to raise
+            log.warning(
+                "watcher(%s): spool_sink_failed kind=%s: %s",
+                self.agent_id, kind, exc,
+            )
+            try:
+                self._event(
+                    "spool_sink_failed",
+                    level="WARNING",
+                    message=str(exc),
+                    data={"kind": kind},
+                )
+            except Exception:  # the log itself may be unwritable
+                pass
+
+    def _mailbox_running(self) -> bool:
+        """True when a live Mailbox daemon owns this project (spec §14).
+
+        Watchers always write their report to the spool; the per-agent
+        direct completion line is only the direct-mode fallback, because
+        with a live Mailbox one conclusion per Ticket replaces them. The
+        import stays lazy and every failure — no mailbox package, an
+        unreadable lock, a dead pid — means direct mode, so the line is
+        sent exactly as before when the control plane is absent.
+        """
+        try:
+            from osw.mailbox.daemon import is_running
+        except Exception:  # mailbox absent or broken: direct mode
+            return False
+        try:
+            running, _pid = is_running(self.root)
+        except Exception:  # an unreadable lock is direct mode too
+            return False
+        return bool(running)
+
     def _discard_stale_stop_request(self) -> None:
         """Drop a stop request older than this run's record.
 
@@ -805,6 +929,7 @@ class Watcher:
             "blocker_notified",
             data={"kind": kind, "stopped": stopped, "note": note},
         )
+        self._spool("blocked", {"kind": kind, "screen": excerpt or ""})
         line = (f"# [osw] blocked agent={self.agent_id} kind={kind}"
                 f" terminal={self.handle}")
         if note:
@@ -1520,6 +1645,9 @@ class Watcher:
             self.agent_id, self.handle, os.getpid(),
         )
         self._discard_stale_stop_request()
+        # One report key per turn (interface §14): minted before the turn
+        # can end, persisted so a restart reuses it.
+        self._ensure_report_key()
 
         if self.agent.get("launch_mode") == "supervised":
             await self._run_supervised()
@@ -1745,6 +1873,15 @@ class Watcher:
             text = one_line(
                 str(message.get("body") or message.get("subject") or ""),
                 ASK_TEXT_MAX,
+            )
+            # The Orca message id is the dedupe key (spec §7): relaying
+            # the same question twice must not open two tickets.
+            self._spool(
+                "ask",
+                {"text": text},
+                dedupe_key=msg_id,
+                correlation={"ask": msg_id},
+                priority=1,
             )
             await self._notify(
                 f"# [osw] ask agent={self.agent_id} message={msg_id}"
@@ -3057,6 +3194,21 @@ class Watcher:
             "report_written",
             data={"report": str(report_path), "state": final_state, "source": source},
         )
+        # Control-plane copy of the turn's verdict, best effort; the
+        # direct notification below is unchanged. The report key is the
+        # dedupe key, resolved inside the sink's own guard.
+        self._spool(
+            "report",
+            {
+                "outcome": _spool_report_outcome(final_state, source),
+                "handoff_path": str(self.agent.get("handoff_path") or ""),
+                "summary": one_line(last_msg, SPOOL_SUMMARY_CHARS),
+                "completion_source": source,
+                "tools_observed": (
+                    self._task_tools_observed if self._task_turn_ran else None
+                ),
+            },
+        )
 
         settled = {
             "state": final_state,
@@ -3064,6 +3216,8 @@ class Watcher:
             "completion_source": source,
             "report_file": str(report_path),
             "finished_at": finished_at,
+            # The turn's report key is spent: the next turn mints its own.
+            "report_key": "",
         }
         if following:
             # The takeover is consumed: a later watcher on this record
@@ -3094,7 +3248,16 @@ class Watcher:
                 outcome=str(self.agent.get("orchestration_outcome") or ""),
                 warning=warning,
             )
-        await self._notify(line)
+        if self._mailbox_running():
+            # §14: the spool report above is this turn's conclusion and the
+            # Mailbox collapses them per Ticket, so no direct per-agent
+            # line is sent while the daemon lock names a live pid.
+            self._event(
+                "completion_notify_suppressed",
+                data={"state": final_state, "source": source},
+            )
+        else:
+            await self._notify(line)
         self._event(
             "watcher_finished",
             level="ERROR" if final_state == "error" else "INFO",

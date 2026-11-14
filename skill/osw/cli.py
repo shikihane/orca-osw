@@ -28,6 +28,7 @@ from osw.log import (
     setup_logging,
 )
 from osw import hosts as host_seam
+from osw import fanout as fanout_mod
 from osw.hosts import Host, HostError
 from osw.orca_cli import (
     OrcaError,
@@ -54,6 +55,9 @@ from osw.orca_cli import (
     worker_start_receipt,
     worktree_ps,
 )
+from osw.mailbox import identity as mailbox_identity
+from osw.mailbox.errors import MailboxError
+from osw.mailbox_cli import mailbox_app
 from osw.process import hidden_subprocess_kwargs
 from osw.providers import (
     SUPPORTED_PROVIDERS,
@@ -133,6 +137,21 @@ host_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(host_app, name="host")
+app.add_typer(mailbox_app, name="mailbox")
+
+
+def _refuse_router_identity(root: Path, command: str) -> None:
+    """A Router session writes Decisions; dispatch stays with the human.
+
+    The Router role owns judgment, never execution (spec §9.2). The
+    identity is the project role token, so a human in the same terminal
+    keeps it.
+    """
+    try:
+        mailbox_identity.require_human_identity(root, command=command)
+    except MailboxError as exc:
+        typer.echo(f"Error: {exc.code}: {exc.message}")
+        raise typer.Exit(1)
 
 
 def _host_or_exit(root: Path, on: str | None) -> Host:
@@ -1107,7 +1126,28 @@ def _mark_lost_if_orphaned(root: Path, agent: dict) -> dict:
         message="watcher process is gone; record marked lost",
         data={"previous_state": previous, "watcher_pid": pid},
     )
+    _spool_watcher_died(root, agent_id)
     return current
+
+
+def _spool_watcher_died(root: Path, agent_id: str) -> None:
+    """Best-effort system envelope so the control plane learns of the death.
+
+    Never allowed to break a listing: the record is already written.
+    """
+    try:
+        from osw.mailbox.spool import write_envelope
+
+        write_envelope(root, {
+            "from": {"role": "system", "id": "osw-cli"},
+            "to": {"role": "router", "id": ""},
+            "kind": "system",
+            "correlation": {"agent": agent_id},
+            "thread_key": agent_id,
+            "body": {"event": "watcher_died", "agent": agent_id},
+        })
+    except Exception as exc:  # never break a read path on a spool failure
+        log.warning("watcher_died spool write failed for %s: %s", agent_id, exc)
 
 
 def _row_host(agent: dict) -> str:
@@ -1320,6 +1360,7 @@ def new(
 ) -> None:
     """Create a new provider agent terminal and return after starting its watcher."""
     root = resolve_project_root()
+    _refuse_router_identity(root, "new")
     enable_file_logging(logs_dir(root))
     _read_state_or_exit(root)
     host = _host_or_exit(root, on)
@@ -1565,6 +1606,7 @@ def use(
 ) -> None:
     """Adopt an already-running terminal as a managed agent."""
     root = resolve_project_root()
+    _refuse_router_identity(root, "use")
     enable_file_logging(logs_dir(root))
     _read_state_or_exit(root)
     host = _host_or_exit(root, on)
@@ -1793,6 +1835,41 @@ def use(
         terminal=handle,
         message="agent adopted",
     )
+
+
+@app.command("super")
+def super_cmd(
+    tasks: list[str] = typer.Argument(None, metavar="[TASKS]...", help="Task prompts, one per argument; combined with --task"),
+    task: list[str] = typer.Option(None, "--task", help="Task prompt; repeat once per task"),
+    plan: Path = typer.Option(None, "--plan", help="JSON plan: provider/model/thinking/prefix/max_parallel plus a non-empty tasks array"),
+    provider: str = typer.Option(None, "--provider", help="Provider for every task: claude, codex, pi, omp, kimi, grok, or dsh (default: the project's batch fan-out policy)"),
+    model: str = typer.Option(None, "--model", "-m", help="Provider model value passed through unchanged"),
+    thinking: str = typer.Option(None, "--thinking", help="Provider thinking/effort value passed through unchanged"),
+    prefix: str = typer.Option(None, "--prefix", help="Agent id prefix for every task, e.g. code, review (default: code)"),
+    caller_terminal: str = typer.Option(None, "--caller-terminal", help="Terminal handle to receive completion reports"),
+    no_notify: bool = typer.Option(False, "--no-notify", help="Dispatch tasks without a caller terminal; completion will not be reported"),
+    mailbox: bool = typer.Option(True, "--mailbox/--no-mailbox", help="Start the mailbox daemon before dispatching"),
+    max_parallel: int = typer.Option(None, "--max-parallel", help="Concurrent dispatches, clamped to 1..32 (default: 32)"),
+    json_output: bool = typer.Option(False, "--json", help="Print one JSON object"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the argv lists without executing anything"),
+) -> None:
+    """Dispatch many tasks in parallel, one supervised agent each."""
+    code = fanout_mod.run(
+        root=resolve_project_root(),
+        provider=provider,
+        model=model,
+        thinking=thinking,
+        prefix=prefix,
+        caller_terminal=caller_terminal,
+        tasks=[*list(tasks or ()), *list(task or ())],
+        plan=plan,
+        mailbox=mailbox,
+        max_parallel=max_parallel,
+        no_notify=no_notify,
+        json_output=json_output,
+        dry_run=dry_run,
+    )
+    raise typer.Exit(code)
 
 
 def _enroll_record(

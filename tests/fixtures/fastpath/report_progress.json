@@ -1,0 +1,166 @@
+{
+  "rule": "report_progress",
+  "cases": [
+    {
+      "name": "a progress report settles the message and stages working",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T132300000Z_g10001",
+        "ts": "2026-11-14T13:23:00.000Z",
+        "from": {
+          "role": "watcher",
+          "id": "agent:code_001",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "report",
+        "correlation": {
+          "ticket": "code_001",
+          "agent": "code_001",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "code_001",
+        "reply_to": "",
+        "priority": 2,
+        "ttl_s": 0,
+        "dedupe_key": "code_001:turn:8",
+        "body": {
+          "outcome": "progress",
+          "summary": "wired the sink",
+          "tools_observed": true
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:23:30.000Z",
+        "tickets": [
+          {
+            "id": "code_001",
+            "stage": "working",
+            "thread_key": "code_001"
+          }
+        ],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "progress",
+        "attention": "fyi",
+        "priority": 2,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [
+          {
+            "op": "attach",
+            "ticket": "code_001",
+            "message_id": "msg_20261114T132300000Z_g10001",
+            "report": {
+              "message_id": "msg_20261114T132300000Z_g10001",
+              "outcome": "progress",
+              "report_key": "code_001:turn:8",
+              "body": {
+                "outcome": "progress",
+                "summary": "wired the sink",
+                "tools_observed": true
+              }
+            }
+          },
+          {
+            "op": "stage",
+            "ticket": "code_001",
+            "stage": "working"
+          },
+          {
+            "op": "settle",
+            "message_id": "msg_20261114T132300000Z_g10001",
+            "outcome": "progress"
+          }
+        ],
+        "reason": "report progress"
+      }
+    },
+    {
+      "name": "a waiting report stays queued",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T132300001Z_g10002",
+        "ts": "2026-11-14T13:23:00.000Z",
+        "from": {
+          "role": "watcher",
+          "id": "agent:code_001",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "report",
+        "correlation": {
+          "ticket": "code_001",
+          "agent": "code_001",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "code_001",
+        "reply_to": "",
+        "priority": 2,
+        "ttl_s": 0,
+        "dedupe_key": "code_001:turn:9",
+        "body": {
+          "outcome": "waiting",
+          "summary": "waiting on CI",
+          "tools_observed": true
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:23:30.000Z",
+        "tickets": [
+          {
+            "id": "code_001",
+            "stage": "working",
+            "thread_key": "code_001"
+          }
+        ],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "progress",
+        "attention": "fyi",
+        "priority": 2,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [
+          {
+            "op": "attach",
+            "ticket": "code_001",
+            "message_id": "msg_20261114T132300001Z_g10002",
+            "report": {
+              "message_id": "msg_20261114T132300001Z_g10002",
+              "outcome": "waiting",
+              "report_key": "code_001:turn:9",
+              "body": {
+                "outcome": "waiting",
+                "summary": "waiting on CI",
+                "tools_observed": true
+              }
+            }
+          },
+          {
+            "op": "stage",
+            "ticket": "code_001",
+            "stage": "working"
+          }
+        ],
+        "reason": "report waiting"
+      }
+    }
+  ]
+}

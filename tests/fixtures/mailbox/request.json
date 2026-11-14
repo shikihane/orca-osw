@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "from": {"role": "human", "id": "terminal:term_abc"},
+  "to": {"role": "router", "id": ""},
+  "kind": "request",
+  "thread_key": "chat:main",
+  "body": {
+    "text": "把 watcher 的超时改成可配置",
+    "summary": "配置化 watcher 超时"
+  }
+}

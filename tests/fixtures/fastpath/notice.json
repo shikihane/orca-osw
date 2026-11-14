@@ -1,0 +1,225 @@
+{
+  "rule": "notice",
+  "cases": [
+    {
+      "name": "notice stays fyi without a wake",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T133100001Z_i10001",
+        "ts": "2026-11-14T13:31:01.000Z",
+        "from": {
+          "role": "system",
+          "id": "adapter:build",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "notice",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 3,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "summary": "notice handled"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:31:30.000Z",
+        "tickets": [
+          {
+            "id": "code_001",
+            "stage": "working",
+            "thread_key": "code_001"
+          }
+        ],
+        "doorbell": "none",
+        "queued_router": 2
+      },
+      "expect": {
+        "intent": "notice",
+        "attention": "fyi",
+        "priority": 3,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [],
+        "reason": "notice notice"
+      }
+    },
+    {
+      "name": "ack stays fyi without a wake",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T133100002Z_i10002",
+        "ts": "2026-11-14T13:31:02.000Z",
+        "from": {
+          "role": "watcher",
+          "id": "agent:code_001",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "ack",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 3,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "summary": "ack handled"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:31:30.000Z",
+        "tickets": [
+          {
+            "id": "code_001",
+            "stage": "working",
+            "thread_key": "code_001"
+          }
+        ],
+        "doorbell": "none",
+        "queued_router": 2
+      },
+      "expect": {
+        "intent": "notice",
+        "attention": "fyi",
+        "priority": 3,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [],
+        "reason": "ack notice"
+      }
+    },
+    {
+      "name": "timer stays fyi without a wake",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T133100003Z_i10003",
+        "ts": "2026-11-14T13:31:03.000Z",
+        "from": {
+          "role": "timer",
+          "id": "timer:retry",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "timer",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 3,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "summary": "timer handled"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:31:30.000Z",
+        "tickets": [
+          {
+            "id": "code_001",
+            "stage": "working",
+            "thread_key": "code_001"
+          }
+        ],
+        "doorbell": "none",
+        "queued_router": 2
+      },
+      "expect": {
+        "intent": "notice",
+        "attention": "fyi",
+        "priority": 3,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [],
+        "reason": "timer notice"
+      }
+    },
+    {
+      "name": "system stays fyi without a wake",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T133100004Z_i10004",
+        "ts": "2026-11-14T13:31:04.000Z",
+        "from": {
+          "role": "system",
+          "id": "daemon",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "system",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 3,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "summary": "system handled"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:31:30.000Z",
+        "tickets": [
+          {
+            "id": "code_001",
+            "stage": "working",
+            "thread_key": "code_001"
+          }
+        ],
+        "doorbell": "none",
+        "queued_router": 2
+      },
+      "expect": {
+        "intent": "notice",
+        "attention": "fyi",
+        "priority": 3,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [],
+        "reason": "system notice"
+      }
+    }
+  ]
+}

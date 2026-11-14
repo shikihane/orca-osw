@@ -1,0 +1,10 @@
+{
+  "actions": ["accept","followup","answer","stop","retry","reject","escalate","noop","close"],
+  "answer": "free_text",
+  "max_retries": 2,
+  "max_workers": 4,
+  "providers": ["claude","codex","pi","omp","kimi","grok","dsh"],
+  "open_from": [],
+  "close": "router",
+  "expires_at": ""
+}

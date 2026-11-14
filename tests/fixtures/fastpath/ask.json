@@ -1,0 +1,194 @@
+{
+  "rule": "ask",
+  "cases": [
+    {
+      "name": "attaches by correlation ticket",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T132000000Z_d10001",
+        "ts": "2026-11-14T13:20:00.000Z",
+        "from": {
+          "role": "watcher",
+          "id": "agent:code_001",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "ask",
+        "correlation": {
+          "ticket": "code_001",
+          "agent": "code_001",
+          "dispatch": "",
+          "ask": "ask_orca_77",
+          "decision": ""
+        },
+        "thread_key": "code_001",
+        "reply_to": "",
+        "priority": 1,
+        "ttl_s": 0,
+        "dedupe_key": "ask_orca_77",
+        "body": {
+          "text": "Proceed with the migration?"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:20:30.000Z",
+        "tickets": [
+          {
+            "id": "code_001",
+            "stage": "working",
+            "thread_key": "code_001"
+          }
+        ],
+        "doorbell": "none",
+        "queued_router": 1
+      },
+      "expect": {
+        "intent": "answer",
+        "attention": "must_answer",
+        "priority": 1,
+        "wake": "doorbell",
+        "decision": null,
+        "bookkeeping": [
+          {
+            "op": "attach",
+            "ticket": "code_001",
+            "message_id": "msg_20261114T132000000Z_d10001",
+            "ask": "ask_orca_77",
+            "agent": "code_001"
+          },
+          {
+            "op": "stage",
+            "ticket": "code_001",
+            "stage": "waiting_answer"
+          }
+        ],
+        "reason": "worker question"
+      }
+    },
+    {
+      "name": "attaches by thread key when correlation is empty",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T132000001Z_d10002",
+        "ts": "2026-11-14T13:20:01.000Z",
+        "from": {
+          "role": "worker",
+          "id": "agent:code_002",
+          "trust": "untrusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "ask",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "code_001",
+        "reply_to": "",
+        "priority": 1,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "text": "Which branch?"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:20:30.000Z",
+        "tickets": [
+          {
+            "id": "code_001",
+            "stage": "working",
+            "thread_key": "code_001"
+          }
+        ],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "answer",
+        "attention": "must_answer",
+        "priority": 1,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [
+          {
+            "op": "attach",
+            "ticket": "code_001",
+            "message_id": "msg_20261114T132000001Z_d10002"
+          },
+          {
+            "op": "stage",
+            "ticket": "code_001",
+            "stage": "waiting_answer"
+          }
+        ],
+        "reason": "worker question"
+      }
+    },
+    {
+      "name": "an unmatched ticket leaves no bookkeeping",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T132000002Z_d10003",
+        "ts": "2026-11-14T13:20:02.000Z",
+        "from": {
+          "role": "watcher",
+          "id": "agent:code_001",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "ask",
+        "correlation": {
+          "ticket": "code_999",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 1,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "text": "Anything?"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:20:30.000Z",
+        "tickets": [
+          {
+            "id": "code_001",
+            "stage": "working",
+            "thread_key": "code_001"
+          }
+        ],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "answer",
+        "attention": "must_answer",
+        "priority": 1,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [],
+        "reason": "worker question"
+      }
+    }
+  ]
+}

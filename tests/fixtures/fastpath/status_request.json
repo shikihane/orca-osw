@@ -1,0 +1,129 @@
+{
+  "rule": "status_request",
+  "cases": [
+    {
+      "name": "one outbox notice carries the counts",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T133000000Z_h10001",
+        "ts": "2026-11-14T13:30:00.000Z",
+        "from": {
+          "role": "human",
+          "id": "terminal:term_abc",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "status",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 0,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "text": "how is it going"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:30:30.000Z",
+        "tickets": [],
+        "doorbell": "none",
+        "queued_router": 2,
+        "counts": {
+          "router": 2,
+          "human": 1,
+          "worker": 3
+        },
+        "dead": 0
+      },
+      "expect": {
+        "intent": "answer_status",
+        "attention": "fyi",
+        "priority": 0,
+        "wake": "doorbell",
+        "decision": null,
+        "bookkeeping": [
+          {
+            "op": "outbox",
+            "effect": "notify",
+            "key": "status:msg_20261114T133000000Z_h10001",
+            "payload": {
+              "line": "# [osw] status pending=2 human=1 worker=3 dead=0",
+              "conversation": "terminal:term_abc"
+            }
+          }
+        ],
+        "reason": "status request"
+      }
+    },
+    {
+      "name": "a pending doorbell is not rung twice",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T133000001Z_h10002",
+        "ts": "2026-11-14T13:30:01.000Z",
+        "from": {
+          "role": "human",
+          "id": "terminal:term_abc",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "status",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 0,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "text": "again"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:30:30.000Z",
+        "tickets": [],
+        "doorbell": "pending",
+        "queued_router": 1
+      },
+      "expect": {
+        "intent": "answer_status",
+        "attention": "fyi",
+        "priority": 0,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [
+          {
+            "op": "outbox",
+            "effect": "notify",
+            "key": "status:msg_20261114T133000001Z_h10002",
+            "payload": {
+              "line": "# [osw] status pending=1 human=0 worker=0 dead=0",
+              "conversation": "terminal:term_abc"
+            }
+          }
+        ],
+        "reason": "status request"
+      }
+    }
+  ]
+}

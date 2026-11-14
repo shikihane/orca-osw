@@ -6,9 +6,10 @@ degrades to the deterministic path, records ``jev_degraded``, and never
 raises into the watcher. The SDK is optional (``typesafe-sdk``); when it
 is absent or the key is missing every call degrades cleanly.
 
-The config file is the single source of the mode (Q3): no environment
-variable toggles Jev — ``TYPESAFE_API_KEY``/``TYPESAFE_BASE_URL`` only
-carry credentials.
+The machine-wide environment variable ``OSW_JEV_MODE`` is the only source
+of the mode: absent, or anything other than ``off``/``shadow``/``enforce``,
+means ``off``. No config file block sets or overrides it, and
+``TYPESAFE_API_KEY``/``TYPESAFE_BASE_URL`` only carry credentials.
 """
 
 from __future__ import annotations
@@ -129,7 +130,7 @@ class JevUnavailable(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Mode and configuration (single source: config.json)
+# Mode and configuration (single source: OSW_JEV_MODE)
 # ---------------------------------------------------------------------------
 
 def resolve_mode(root: Path) -> str:

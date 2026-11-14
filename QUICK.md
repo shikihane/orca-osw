@@ -182,3 +182,76 @@ python /path/to/orca-osw/skill/osw.py del fnnas/code_001 --close
 
 `host list` shows what is registered and whether each host answers right now;
 `host rm <name>` drops a record.
+
+## 13. Control plane (mailbox)
+
+Six lines, one round trip. The mailbox is optional; with it never started, every
+command above behaves as before.
+
+```bash
+python /path/to/orca-osw/skill/osw.py mailbox start
+python /path/to/orca-osw/skill/osw.py mailbox send --kind request --text "Fix the failing tests"
+python /path/to/orca-osw/skill/osw.py mailbox wait --as router --timeout 0
+python /path/to/orca-osw/skill/osw.py mailbox decide msg_... --action accept --ticket code_001 --reason "explicit human request"
+python /path/to/orca-osw/skill/osw.py mailbox status --json
+python /path/to/orca-osw/skill/osw.py mailbox stop
+```
+
+`wait` leases and acks the cards waiting for that role; `decide` prints the
+`decision_id` and the Dispatcher applies the decision through the normal `new`/
+`use`/`stop` paths. `mailbox tickets` lists the derived index when you need to
+find a ticket again. See [README.md](README.md#control-plane-mailbox).
+
+## 14. Dispatch many tasks at once
+
+`super` runs one `new` per task for you, a few at a time. Tasks are
+positional:
+
+```bash
+python /path/to/orca-osw/skill/osw.py super \
+    "Fix the failing tests" "Audit the provider layer"
+```
+
+Only a provider is required, and even that can come from the project: with no
+flag and no plan value, `provider`/`model`/`thinking`/`prefix`/`max_parallel`
+come from the `super` object in `.orca/osw/config.json`, then `OSW_PROVIDER` /
+`OSW_MODEL` / `OSW_THINKING` / `OSW_PREFIX` / `OSW_MAX_PARALLEL`, then the
+`batch fan-out` row of the `## OSW Provider Policy` table in `AGENTS.md`.
+Prefix finally defaults to `code`, `max_parallel` to 32. With no provider
+anywhere, the command names those three places and dispatches nothing.
+
+Flags tailor the run:
+
+```bash
+python /path/to/orca-osw/skill/osw.py super "Fix the failing tests" \
+    --provider pi --model <m> --thinking high --prefix code \
+    --max-parallel 4 --caller-terminal term_xxx
+```
+
+A plan file does the same, and each entry may override the defaults:
+
+```json
+{
+  "provider": "pi", "model": "<m>", "thinking": "high", "prefix": "code",
+  "max_parallel": 4,
+  "tasks": [
+    "Fix the failing tests",
+    {"task": "Review the provider layer", "prefix": "review", "provider": "codex"}
+  ]
+}
+```
+
+```bash
+python /path/to/orca-osw/skill/osw.py super --plan plan.json --json
+```
+
+- The mailbox is started first by default (`--no-mailbox` skips it); if it
+  cannot start, nothing is dispatched and the command exits 1 with that error.
+  `--plan` cannot be combined with tasks, positional or flag.
+- At most `--max-parallel` tasks run at once (default 32, clamped to 1..32),
+  each `new` capped at 300s. One failed task never aborts the rest; the command
+  exits 1 if any dispatch failed.
+- `--json` prints `{mailbox, requested, started, agents, errors}`; `--dry-run`
+  prints the argv lists and executes nothing, showing the resolved provider,
+  model and thinking first. Watch progress afterwards with `list` / `status`,
+  exactly as for any other agent.

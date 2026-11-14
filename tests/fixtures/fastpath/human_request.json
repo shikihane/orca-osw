@@ -1,0 +1,103 @@
+{
+  "rule": "human_request",
+  "cases": [
+    {
+      "name": "human request needs an answer",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T131500000Z_c10001",
+        "ts": "2026-11-14T13:15:00.000Z",
+        "from": {
+          "role": "human",
+          "id": "terminal:term_abc",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "request",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 0,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "text": "把 watcher 的超时改成可配置"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:15:30.000Z",
+        "tickets": [],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "request",
+        "attention": "must_answer",
+        "priority": 0,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [],
+        "reason": "human request"
+      }
+    },
+    {
+      "name": "a queued card rings the doorbell",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T131500001Z_c10002",
+        "ts": "2026-11-14T13:15:01.000Z",
+        "from": {
+          "role": "human",
+          "id": "terminal:term_abc",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "request",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 0,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "text": "now please"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:15:30.000Z",
+        "tickets": [],
+        "doorbell": "none",
+        "queued_router": 1
+      },
+      "expect": {
+        "intent": "request",
+        "attention": "must_answer",
+        "priority": 0,
+        "wake": "doorbell",
+        "decision": null,
+        "bookkeeping": [],
+        "reason": "human request"
+      }
+    }
+  ]
+}

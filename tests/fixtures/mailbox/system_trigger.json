@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "from": {"role": "system", "id": "adapter:build_result"},
+  "to": {"role": "router", "id": ""},
+  "kind": "system",
+  "thread_key": "build:ci-42",
+  "body": {
+    "event": "build_failed",
+    "summary": "BUILD FAILED in 3 targets",
+    "count": 1
+  }
+}

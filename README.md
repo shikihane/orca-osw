@@ -58,6 +58,7 @@ python skill/osw.py status
 | `host doctor <host> [--provider <provider>] [--json]` | Probe connection → workspace → worktree → provider, stopping at the first failure |
 | `new <provider> [--on <host>] [--prefix <prefix>] [--model <model>] [--thinking <value>] "<prompt>"` | Create a new agent terminal with a task |
 | `use <agent-id-or-terminal> [--on <host>] [--prefix <prefix>] "<prompt>"` | Adopt an existing Orca terminal or continue from an OSW agent id |
+| `super --provider <p> [--model <m>] [--thinking <t>] [--prefix <p>] [--max-parallel <n>] [--caller-terminal <h>] [--no-notify] [--mailbox\|--no-mailbox] (--task "<text>" ... \| --plan <file>) [--json] [--dry-run]` | Dispatch many tasks as `new` agents, at most N subprocesses in flight |
 | `enroll [--on <host>]` | Record this worktree's agent terminals that OSW did not start (`enrolled`, no watcher) |
 | `guard [<agent_id>...] [--caller-terminal <handle>]` | Become the guardian (notification target) of agents; follow a running turn |
 | `revive [<agent_id> [--session <id>]]` | List resumable agents, or reopen one agent's provider session in a new terminal |
@@ -66,6 +67,15 @@ python skill/osw.py status
 | `list [--all] [--json]` | List managed agents |
 | `logs [--agent <agent_id>] [--tail N]` | Show OSW logs and events |
 | `status [--all]` | Show OSW state and agent counts |
+| `mailbox start [--json]` | Start the local Mailbox daemon (control plane only); a second `start` is a success |
+| `mailbox stop [--json]` | Stop the daemon and wait for it to exit |
+| `mailbox status [--json]` | Queue depths, oldest age, spool lag, doorbell state and dead letters |
+| `mailbox send --kind <kind> --text "<text>" [--to-role <role>] [--ticket <id>] [--thread-key <key>] [--json]` | Write one envelope to the spool (default roles human → router) |
+| `mailbox wait [--as router\|human] [--timeout <secs>] [--max <n>] [--json]` | Lease and ack that role's decision cards; `--timeout 0` is one scan |
+| `mailbox show <message-id> [--json]` | Envelope, card and ticket for one message |
+| `mailbox trace <message-id-or-ticket> [--json]` | Message → ticket → decisions → effects → outbox |
+| `mailbox decide <message-id> --action <action> --reason "<reason>" [--ticket <id>] [--payload-json <json>] [--json]` | Validate and commit a Decision; prints its `decision_id` |
+| `mailbox tickets [--json]`, `mailbox ticket <id> [--json]` | The derived ticket index, and one ticket |
 | `jev status [--check]` | Show the global Jev switch, key/SDK/endpoint/proxy state; `--check` live-probes the endpoint |
 | — | **The mode is the global switch**: the machine-wide `OSW_JEV_MODE` environment variable (`enforce\|shadow\|off`; unset = `off`) is the only control — there is no per-project Jev config |
 
@@ -318,6 +328,134 @@ What each step guarantees:
 - POSIX remotes are the supported target; a Windows remote is best effort.
 - `guard` stays local — the guardian is a terminal or chat session on this machine.
 
+## Control Plane (Mailbox)
+
+OSW has an optional local control plane for coordination: a durable mailbox, a
+deterministic fast path, a Router role that makes decisions, and a Dispatcher
+that applies them through the paths the CLI already uses. Execution does not
+move — Orca owns Run/Task/DAG/Dispatch, the watchers own turns, providers own
+the code.
+
+```bash
+python skill/osw.py mailbox start
+python skill/osw.py mailbox send --kind request --text "review both PRs side by side" --thread-key chat:main
+python skill/osw.py mailbox wait --as router --timeout 0
+python skill/osw.py mailbox decide msg_... --action accept --ticket code_001 \
+    --reason "explicit human request" --payload-json '{"provider":"claude","model":"sonnet"}'
+python skill/osw.py mailbox status --json
+python skill/osw.py mailbox stop
+```
+
+- **Lifecycle** — `start` spawns the daemon detached and waits for the lock;
+  `status` reports `running`, `pid`, queue depths, `spool_lag`, doorbell state
+  and dead letters; `stop` writes the stop sidecar and waits. A second `start`
+  is a success, not an error.
+- **Producers only write to the spool** (`.orca/osw/mailbox/spool/`); the
+  daemon is the only writer of the SQLite store. Ingest is at-least-once with
+  idempotent application: the dedupe key (an ask's Orca message id, a report's
+  `report_key`, a decision's `decision_id`) absorbs repeats, so one worker,
+  one answer and one stop happen per Ticket.
+- **Cards and the doorbell** — `wait` returns cards of at most 1 KiB and
+  `decide` requires a reason. When a card is waiting, the daemon sends one line
+  through the same notify channel the watcher uses:
+  `# [osw] mail pending=<n> run="osw mailbox wait --as router --timeout 0"` — an
+  on-demand Router session gets a count and a command, nothing else. On lease
+  expiry it rings once more, then notifies a human.
+- **Ticket and Mandate** — a Ticket is the durable case file; the Mandate is a
+  closed-schema, human-owned `skill/osw/mandate.json` read from committed HEAD.
+  The Router may narrow it when opening a Ticket, never widen it, and the
+  Dispatcher records a violation as `mandate_denied` and refuses it.
+- **Answer authority** — the only Router-authored worker input is the fixed
+  single-line template `# [osw] answer <decision_id>: <text>`, at most 4 KiB,
+  sent after the Dispatcher rechecks that the ask is still open. Login,
+  permission, delete and payment screens are escalated to a human; blocker
+  handling stays with the watcher whitelist.
+- **Direct mode is a guarantee** — with the mailbox never started, or stopped,
+  `new`, `use`, `status`, `list`, `revive`, `stop` and the current notification
+  path behave exactly as before. The mailbox is a second line of defense beside
+  `notified_asks`; it never replaces the watcher, the handoff check or Orca's
+  own state. If the daemon dies, the spool keeps what producers wrote, a restart
+  ingests it, and `status` reports `mailbox_down`.
+- **Stays local** — one mailbox per project root under `.orca/osw/mailbox/`.
+  Remote events are written to the local spool by the local watcher through the
+  host seam; nothing runs on the remote host.
+
+## Super (One-Command Fan-Out)
+
+`super` is the fan-out front door for `new`: one command fills the worktree
+with independent workers instead of one dispatch per task. Tasks are
+positional, and repeated `--task` values are appended after them.
+
+```bash
+python skill/osw.py super "Fix the failing tests" "Audit the provider layer"
+```
+
+Only a provider is required, and even that can come from the project. Tailor
+the run with flags:
+
+```bash
+python skill/osw.py super "Fix the failing tests" "Audit the provider layer" \
+    --provider pi --model <m> --thinking high \
+    --prefix code --max-parallel 4 --caller-terminal term_xxx
+```
+
+Or put the same thing in a plan file and let each task pick its own defaults:
+
+```json
+{
+  "provider": "pi",
+  "model": "<m>",
+  "thinking": "high",
+  "prefix": "code",
+  "max_parallel": 4,
+  "tasks": [
+    "Fix the failing tests",
+    {"task": "Review the provider layer", "prefix": "review", "provider": "codex"}
+  ]
+}
+```
+
+```bash
+python skill/osw.py super --plan plan.json --json
+```
+
+- **Zero-flag defaults** — when `provider`, `model`, `thinking`, `prefix` or
+  `max_parallel` is not given by a flag or the plan, `super` resolves it from
+  the project, in this order: the `super` object in `.orca/osw/config.json`
+  (`{"super": {provider, model, thinking, prefix, max_parallel}}`; absent or
+  malformed is ignored), then `OSW_PROVIDER` / `OSW_MODEL` / `OSW_THINKING` /
+  `OSW_PREFIX` / `OSW_MAX_PARALLEL`, then the `## OSW Provider Policy` table
+  row whose first cell contains `batch fan-out`. Prefix finally defaults to
+  `code`, `max_parallel` to 32. Only `provider` is required: with none
+  anywhere, the command names the three places to set it and dispatches
+  nothing.
+- **Flags are defaults** — `--provider`, `--model`, `--thinking`, `--prefix`,
+  `--caller-terminal` and `--max-parallel` apply to every task and win over
+  everything else. The plan object may carry `provider`, `model`, `thinking`,
+  `prefix` and `max_parallel` as the same defaults (a flag you pass wins over
+  the plan, which wins over the project), and a task entry may be a plain
+  string or an object overriding `task`, `prefix`, `provider`, `model`,
+  `thinking` and `caller_terminal` for itself. `--plan` cannot be combined
+  with tasks, positional or flag.
+- **Mailbox first, default on** — with the mailbox enabled, `super` runs
+  `mailbox start --json` before dispatching. If it fails, the command aborts
+  with that typed error text and dispatches nothing; `--no-mailbox` skips it.
+- **Each task is a plain `new`** — one `[osw.py new <provider> "<task>"
+  --prefix ... --model ... --thinking ... --caller-terminal ...]` subprocess per
+  task, argv-only, in the project root. Empty flags are omitted, and `--no-notify`
+  is forwarded only when no caller terminal is known. `super` writes no state of
+  its own: records, watchers, reports and handoffs are the ones `new` produced.
+- **Isolation, not all-or-nothing** — a failing or timed-out dispatch is
+  reported in `errors` and never aborts the rest; the command exits 1 when any
+  dispatch failed. At most `max_parallel` subprocesses run at once (default 32,
+  clamped to 1..32), each with a 300s timeout.
+- **Output** — `--json` prints `{mailbox: {running, pid} | null, requested,
+  started, agents: [{index, task, agent_id, terminal}], errors: [{index, task,
+  error}]}`; otherwise one line per agent plus a `super: requested=... started=...
+  errors=...` summary. `--dry-run` prints the mailbox and per-task argv lists and
+  executes nothing, so the resolved provider, model and thinking are visible
+  before anything runs.
+
 ## Architecture
 
 ```
@@ -479,6 +617,11 @@ orca-osw/
       providers.py    # provider commands and model discovery
       sessions.py     # provider session ids from Orca's agent-hook cache
       blockers.py     # blocking-screen discovery, whitelist, update lock
+      fastpath.py     # deterministic classification and bookkeeping for ingest
+      mandate.py      # closed-schema Ticket limits (skill/osw/mandate.json)
+      dispatcher.py   # the only applier of Decisions
+      mailbox_cli.py  # mailbox verbs: start/stop/status/send/wait/decide/tickets
+      mailbox/        # control plane: envelope, store, spool, adapters, delivery, daemon
       state.py        # state model and file I/O
       watcher.py      # detached completion watcher
   tests/              # unit and integration tests
@@ -497,6 +640,7 @@ Created in the working directory where you run `init`:
       hosts.json      # registered machines (created by `host add`)
       agents/          # one JSON record per managed agent (+ <id>.stop requests)
       handoffs/        # worker handoff markdown files
+      mailbox/         # control plane: spool/, mailbox.db, daemon.lock, status.json
       logs/
       reports/
 ```

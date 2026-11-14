@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "from": {"role": "human", "id": "terminal:term_abc"},
+  "to": {"role": "router", "id": ""},
+  "kind": "request",
+  "correlation": {"ticket": "code_001"},
+  "thread_key": "chat:main",
+  "body": {"command": "osw stop agent_001"}
+}

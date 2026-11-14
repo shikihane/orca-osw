@@ -1,0 +1,425 @@
+{
+  "rule": "human_command",
+  "cases": [
+    {
+      "name": "new accepts a fresh worker",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T131001000Z_b10001",
+        "ts": "2026-11-14T13:10:00.000Z",
+        "from": {
+          "role": "human",
+          "id": "terminal:term_abc",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "request",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 0,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "command": "osw new claude --prefix code fix the watcher"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:10:00.000Z",
+        "tickets": [],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "command",
+        "attention": "fyi",
+        "priority": 0,
+        "wake": "",
+        "decision": {
+          "decision_id": "dec_msg_20261114T131001000Z_b10001",
+          "message_id": "msg_20261114T131001000Z_b10001",
+          "action": "accept",
+          "ticket": "",
+          "reason": "human command",
+          "payload": {
+            "command": "osw new claude --prefix code fix the watcher"
+          },
+          "author": "human",
+          "confidence": 1.0
+        },
+        "bookkeeping": [],
+        "reason": "human command"
+      }
+    },
+    {
+      "name": "use follows up on the ticket",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T131002000Z_b10002",
+        "ts": "2026-11-14T13:10:00.000Z",
+        "from": {
+          "role": "human",
+          "id": "terminal:term_abc",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "request",
+        "correlation": {
+          "ticket": "code_001",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 0,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "command": "osw use code_001 rerun the failed test"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:10:00.000Z",
+        "tickets": [],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "command",
+        "attention": "fyi",
+        "priority": 0,
+        "wake": "",
+        "decision": {
+          "decision_id": "dec_msg_20261114T131002000Z_b10002",
+          "message_id": "msg_20261114T131002000Z_b10002",
+          "action": "followup",
+          "ticket": "code_001",
+          "reason": "human command",
+          "payload": {
+            "command": "osw use code_001 rerun the failed test"
+          },
+          "author": "human",
+          "confidence": 1.0
+        },
+        "bookkeeping": [],
+        "reason": "human command"
+      }
+    },
+    {
+      "name": "stop interrupts the ticket",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T131003000Z_b10003",
+        "ts": "2026-11-14T13:10:00.000Z",
+        "from": {
+          "role": "human",
+          "id": "terminal:term_abc",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "request",
+        "correlation": {
+          "ticket": "code_001",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 0,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "command": "osw stop code_001"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:10:00.000Z",
+        "tickets": [],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "command",
+        "attention": "fyi",
+        "priority": 0,
+        "wake": "",
+        "decision": {
+          "decision_id": "dec_msg_20261114T131003000Z_b10003",
+          "message_id": "msg_20261114T131003000Z_b10003",
+          "action": "stop",
+          "ticket": "code_001",
+          "reason": "human command",
+          "payload": {
+            "command": "osw stop code_001"
+          },
+          "author": "human",
+          "confidence": 1.0
+        },
+        "bookkeeping": [],
+        "reason": "human command"
+      }
+    },
+    {
+      "name": "status is a noop decision",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T131004000Z_b10004",
+        "ts": "2026-11-14T13:10:00.000Z",
+        "from": {
+          "role": "human",
+          "id": "terminal:term_abc",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "request",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 0,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "command": "osw status"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:10:00.000Z",
+        "tickets": [],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "command",
+        "attention": "fyi",
+        "priority": 0,
+        "wake": "",
+        "decision": {
+          "decision_id": "dec_msg_20261114T131004000Z_b10004",
+          "message_id": "msg_20261114T131004000Z_b10004",
+          "action": "noop",
+          "ticket": "",
+          "reason": "human command",
+          "payload": {
+            "command": "osw status"
+          },
+          "author": "human",
+          "confidence": 1.0
+        },
+        "bookkeeping": [],
+        "reason": "human command"
+      }
+    },
+    {
+      "name": "list is a noop decision",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T131005000Z_b10005",
+        "ts": "2026-11-14T13:10:00.000Z",
+        "from": {
+          "role": "human",
+          "id": "terminal:term_abc",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "request",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 0,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "command": "osw list --json"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:10:00.000Z",
+        "tickets": [],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "command",
+        "attention": "fyi",
+        "priority": 0,
+        "wake": "",
+        "decision": {
+          "decision_id": "dec_msg_20261114T131005000Z_b10005",
+          "message_id": "msg_20261114T131005000Z_b10005",
+          "action": "noop",
+          "ticket": "",
+          "reason": "human command",
+          "payload": {
+            "command": "osw list --json"
+          },
+          "author": "human",
+          "confidence": 1.0
+        },
+        "bookkeeping": [],
+        "reason": "human command"
+      }
+    },
+    {
+      "name": "logs is a noop decision",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T131006000Z_b10006",
+        "ts": "2026-11-14T13:10:00.000Z",
+        "from": {
+          "role": "human",
+          "id": "terminal:term_abc",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "request",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 0,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "command": "osw logs code_001"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:10:00.000Z",
+        "tickets": [],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "command",
+        "attention": "fyi",
+        "priority": 0,
+        "wake": "",
+        "decision": {
+          "decision_id": "dec_msg_20261114T131006000Z_b10006",
+          "message_id": "msg_20261114T131006000Z_b10006",
+          "action": "noop",
+          "ticket": "",
+          "reason": "human command",
+          "payload": {
+            "command": "osw logs code_001"
+          },
+          "author": "human",
+          "confidence": 1.0
+        },
+        "bookkeeping": [],
+        "reason": "human command"
+      }
+    },
+    {
+      "name": "an existing decision id is reused",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T131007000Z_b10007",
+        "ts": "2026-11-14T13:10:00.000Z",
+        "from": {
+          "role": "human",
+          "id": "terminal:term_abc",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "request",
+        "correlation": {
+          "ticket": "code_001",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": "dec_human_0007"
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 0,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "command": "osw logs code_001"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:10:00.000Z",
+        "tickets": [],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "command",
+        "attention": "fyi",
+        "priority": 0,
+        "wake": "",
+        "decision": {
+          "decision_id": "dec_human_0007",
+          "message_id": "msg_20261114T131007000Z_b10007",
+          "action": "noop",
+          "ticket": "code_001",
+          "reason": "human command",
+          "payload": {
+            "command": "osw logs code_001"
+          },
+          "author": "human",
+          "confidence": 1.0
+        },
+        "bookkeeping": [],
+        "reason": "human command"
+      }
+    }
+  ]
+}

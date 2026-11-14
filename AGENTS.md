@@ -5,9 +5,10 @@
 This repository contains OSW, a Python CLI for managing Orca-backed agent sessions.
 Source code lives under `skill/osw/`, with `skill/osw.py` as the entry point.
 The deterministic readiness gate and the optional Jev (TypeSafe) integration
-live in `skill/osw/ready_gate.py` and `skill/osw/jev.py`; the offline
-evaluation harness is `tools/jev_eval.py`. `skill/osw/sessions.py` reads
-provider session ids from Orca's agent-hook cache
+live in `skill/osw/ready_gate.py` and `skill/osw/jev.py`; the machine-wide
+`OSW_JEV_MODE` is the only source of the Jev mode, and no project config block
+sets or overrides it. The offline evaluation harness is `tools/jev_eval.py`.
+`skill/osw/sessions.py` reads provider session ids from Orca's agent-hook cache
 (`%APPDATA%/orca/agent-hooks/last-status.json`, a non-public format checked
 by `version`). `skill/osw/blockers.py` holds the blocking-screen policy
 (detection, classification, the per-mode decision, the `(provider, kind)`
@@ -25,6 +26,16 @@ SSH implementation, the host registry `hosts.json` beside `state.json`,
 error taxonomy. Orca dispatch goes through pairing (`--environment`), data
 through SSH (`ssh`, `sftp`); nothing outside this module may build an
 `ssh`/`sftp` argument list or read or write a file on another machine.
+The control plane lives in the package `skill/osw/mailbox/` (envelope
+validation, paths, identity, the SQLite store, the spool, adapters, delivery
+and the daemon), with its rules and seams beside it in `skill/osw/`:
+`fastpath.py` (pure, first-match deterministic classification; one fixture per
+rule under `tests/fixtures/fastpath/`), `mandate.py` plus the human-owned
+`skill/osw/mandate.json` (closed-schema Ticket limits, read from the committed
+HEAD), `dispatcher.py` (the only applier of Decisions, through the existing
+`new`/`use`/`stop`/`orchestration reply` paths) and `mailbox_cli.py` (the
+`mailbox` verbs). Producers append envelopes to the spool under
+`.orca/osw/mailbox/spool/`; the daemon is the only writer of the store.
 The Codex skill guide is `skill/SKILL.md`. Tests live in `tests/`, with
 `conftest.py` adding the local package path. User-facing docs are in
 `README.md`, `README_zh.md`, `QUICK.md`, and `QUICK_zh.md`. Runtime state such
@@ -52,6 +63,13 @@ should not be treated as source.
   the guardian as `# [osw] ask ...` (ids in `notified_asks`); on Windows
   answer with `resources\bin\orca.exe orchestration reply`, since
   `orca.cmd` refuses it.
+- `python skill/osw.py mailbox --help` lists the control-plane verbs.
+  `mailbox start|stop|status --json` cover the daemon lifecycle (a second
+  `start` is a success); `mailbox send --kind request --text ...`,
+  `mailbox wait --as router --timeout 0`, `mailbox show|trace <id>`,
+  `mailbox decide <id> --action accept --reason ...` and `mailbox tickets`
+  exercise one request end to end. `mailbox status` reports daemon liveness;
+  the queue and ticket verbs only read the store.
 
 ## Coding Style & Naming Conventions
 
@@ -64,8 +82,49 @@ Agent ids use `<prefix>_NNN`, for example `agent_001`, `research_001`, or
 record; the CLI signals it through side files such as the stop request
 `.orca/osw/agents/<id>.stop`. OSW itself may inject only
 `watcher.HANDOFF_TEMPLATE`, `watcher.RESUME_TEMPLATE`, the keys of
-`blockers.WHITELIST` entries, and the resume command `revive` types into a
-confirmed empty shell.
+`blockers.WHITELIST` entries, the resume command `revive` types into a
+confirmed empty shell, and the Router answer template built by
+`dispatcher.ANSWER_TEMPLATE` (`# [osw] answer <decision_id>: <text>`): one
+line, at most 4 KiB, always carrying the decision id for audit.
+
+## Control Plane (Mailbox)
+
+- **Local control plane only.** The Mailbox daemon is a local process per
+  project root, under `.orca/osw/mailbox/`. It never executes work:
+  execution authority stays with Orca (Run/Task/DAG/Dispatch) and the existing
+  OSW paths, and the Dispatcher only calls `new`, `use`, `stop` and
+  `orchestration reply`.
+- **Direct mode is independent.** With the daemon never started or stopped,
+  `new`, `use`, `status`, `list`, `revive`, `stop` and the current watcher
+  notification path behave exactly as before. The spool keeps what producers
+  wrote, a restart ingests it, and `status` reports `mailbox_down`.
+- **One writer.** CLI, watchers and adapters only append envelopes to the
+  spool; only the Mailbox writes the SQLite store. Delivery is at-least-once
+  with idempotent application, so one worker, one answer and one stop happen
+  per Ticket. `notified_asks` stays; the dedupe key is a second line of
+  defense.
+- **Roles.** `guardian` remains a notification address; the Router is a
+  decision role, identified by `OSW_ROLE=router` plus a per-project role
+  token, so a human in the same terminal keeps the human identity and
+  `new`/`use` are refused with `router_forbidden`. The doorbell carries only a
+  count and the `mailbox wait` command.
+- **Mandate.** Ticket limits are a closed-schema, human-owned
+  `skill/osw/mandate.json`; the Router may narrow it when opening a Ticket,
+  never widen it, and a violation is recorded as `mandate_denied`.
+- **Stays local.** Spool, store, daemon, role token and locks are local
+  (`update-<provider>--<host>.lock` keeps the host key); remote events reach
+  the spool through the host seam. Nothing runs on the far side.
+
+## OSW Provider Policy
+
+Confirmed choice for this project. An explicit human choice in the current
+request overrides it; a task type with no row stays undecided (run
+`models <provider>` and ask once).
+
+| Task type | Provider | Model | Thinking |
+|---|---|---|---|
+| implementation | pi | magpie/workbuddy/deepseek-v4.1-flash | high |
+| batch fan-out (`osw super`) | pi | magpie/workbuddy/deepseek-v4.1-flash | high |
 
 ## Host Seam and Cross-Host Operation
 

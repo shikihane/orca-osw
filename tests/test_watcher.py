@@ -5886,3 +5886,349 @@ async def test_already_done_follow_claims_nothing_about_tools(tmp_path):
     report = json.loads(Path(agent["report_file"]).read_text(encoding="utf-8"))
     assert "tools_observed" not in report
     assert "warning=" not in send.await_args_list[-1].args[1]
+
+
+# ---------------------------------------------------------------------------
+# Mailbox spool sink (control-plane interface §14)
+#
+# Best effort only: the direct notification path stays authoritative, so
+# every test here records the envelopes a fake spool received instead of
+# requiring the real control plane.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def spool_writes(monkeypatch):
+    """Install a fake mailbox spool and return the written envelopes."""
+    import sys
+    from types import ModuleType
+
+    module = ModuleType("osw.mailbox.spool")
+    written: list[dict] = []
+
+    def write_envelope(root, envelope):
+        written.append(envelope)
+        return str(envelope.get("id") or "msg_test")
+
+    module.write_envelope = write_envelope
+    monkeypatch.setitem(sys.modules, "osw.mailbox.spool", module)
+    return written
+
+
+def _spool_agent(tmp_path, **extra) -> None:
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "working",
+        **extra,
+    })
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("final_state,source,outcome", [
+    ("done", "ps_done", "ready"),
+    ("done", "handoff_missing", "ready"),
+    ("error", "ready_failed", "failed"),
+    ("error", "interrupted", "dropped"),
+    ("error", "terminal_lost", "dropped"),
+])
+async def test_finalize_writes_report_envelope(
+    tmp_path, spool_writes, final_state, source, outcome,
+):
+    handoff = str(tmp_path / "handoffs" / "agent_001.md")
+    _spool_agent(tmp_path, ticket_id="tkt_001", handoff_path=handoff)
+    watcher = Watcher(tmp_path, "agent_001")
+    key = watcher._ensure_report_key()
+
+    await watcher._finalize(final_state, source)
+
+    assert len(spool_writes) == 1
+    envelope = spool_writes[0]
+    assert envelope["kind"] == "report"
+    assert envelope["from"] == {"role": "watcher", "id": "agent_001"}
+    assert envelope["to"] == {"role": "router", "id": ""}
+    assert envelope["thread_key"] == "tkt_001"
+    assert envelope["correlation"]["agent"] == "agent_001"
+    assert envelope["dedupe_key"] == key
+    body = envelope["body"]
+    assert body["outcome"] == outcome
+    assert body["handoff_path"] == handoff
+    assert body["completion_source"] == source
+    assert body["tools_observed"] is None
+    assert isinstance(body["summary"], str)
+
+    agent = state.read_agent(tmp_path, "agent_001")
+    assert agent["report_key"] == ""
+
+
+def test_report_key_is_stable_across_a_watcher_restart(tmp_path, spool_writes):
+    _spool_agent(tmp_path)
+
+    first = Watcher(tmp_path, "agent_001")
+    key = first._ensure_report_key()
+    assert key
+    assert state.read_agent(tmp_path, "agent_001")["report_key"] == key
+
+    restarted = Watcher(tmp_path, "agent_001")
+    assert restarted._ensure_report_key() == key
+    assert state.read_agent(tmp_path, "agent_001")["report_key"] == key
+    assert spool_writes == []
+
+
+@pytest.mark.anyio
+async def test_follow_turn_report_uses_ticket_thread(tmp_path, spool_writes):
+    _spool_agent(
+        tmp_path, ticket_id="", launch_mode="follow", follow_turn=True,
+    )
+    watcher = Watcher(tmp_path, "agent_001")
+
+    await watcher._finalize("done", "already_done")
+
+    assert spool_writes[0]["thread_key"] == "agent_001"
+
+
+@pytest.mark.anyio
+async def test_relayed_worker_ask_writes_ask_envelope(tmp_path, spool_writes):
+    _spool_agent(
+        tmp_path, launch_mode="supervised", dispatch_id="dispatch_1",
+    )
+    watcher = Watcher(tmp_path, "agent_001")
+    messages = [{
+        "id": "msg_ask_1",
+        "type": "question",
+        "from": "term-a",
+        "body": "which branch should I use?",
+    }]
+
+    with patch("osw.watcher.orchestration_inbox",
+               AsyncMock(return_value=messages)), \
+         patch.object(Watcher, "_notify", AsyncMock(return_value=None)):
+        await watcher._relay_worker_asks("dispatch_1")
+
+    asked = [env for env in spool_writes if env["kind"] == "ask"]
+    assert len(asked) == 1
+    envelope = asked[0]
+    assert envelope["dedupe_key"] == "msg_ask_1"
+    assert envelope["correlation"]["ask"] == "msg_ask_1"
+    assert envelope["correlation"]["agent"] == "agent_001"
+    assert envelope["thread_key"] == "agent_001"
+    assert envelope["priority"] == 1
+    assert envelope["body"] == {"text": "which branch should I use?"}
+
+
+@pytest.mark.anyio
+async def test_blocked_notice_writes_blocked_envelope(tmp_path, spool_writes):
+    _spool_agent(tmp_path)
+    watcher = Watcher(tmp_path, "agent_001")
+    notify = AsyncMock(return_value=None)
+
+    with patch.object(Watcher, "_notify", notify):
+        sent = await watcher._notify_blocked(
+            "update_prompt", "Update available | press enter")
+
+    assert sent
+    blocked = [env for env in spool_writes if env["kind"] == "blocked"]
+    assert len(blocked) == 1
+    assert blocked[0]["body"] == {
+        "kind": "update_prompt",
+        "screen": "Update available | press enter",
+    }
+    assert blocked[0]["correlation"]["agent"] == "agent_001"
+    notify.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_spool_sink_failure_never_fails_the_turn(tmp_path, monkeypatch):
+    import sys
+    from types import ModuleType
+
+    def broken(root, envelope):
+        raise RuntimeError("spool unavailable")
+
+    module = ModuleType("osw.mailbox.spool")
+    module.write_envelope = broken
+    monkeypatch.setitem(sys.modules, "osw.mailbox.spool", module)
+
+    _spool_agent(tmp_path)
+    watcher = Watcher(tmp_path, "agent_001")
+    notify = AsyncMock(return_value=None)
+
+    with patch.object(Watcher, "_notify", notify):
+        await watcher._finalize("done", "ps_done")
+
+    agent = state.read_agent(tmp_path, "agent_001")
+    assert agent["state"] == "done"
+    assert agent["completion_source"] == "ps_done"
+    assert Path(agent["report_file"]).read_text(encoding="utf-8")
+    notify.assert_awaited_once()
+    events = [
+        json.loads(line)
+        for line in (state.logs_dir(tmp_path) / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    failed = [e for e in events if e["event"] == "spool_sink_failed"]
+    assert len(failed) == 1
+    assert failed[0]["level"] == "WARNING"
+    assert failed[0]["data"]["kind"] == "report"
+
+
+@pytest.mark.anyio
+async def test_spool_sink_failure_does_not_stop_ask_relay(tmp_path, monkeypatch):
+    import sys
+    from types import ModuleType
+
+    def broken(root, envelope):
+        raise RuntimeError("spool unavailable")
+
+    module = ModuleType("osw.mailbox.spool")
+    module.write_envelope = broken
+    monkeypatch.setitem(sys.modules, "osw.mailbox.spool", module)
+
+    _spool_agent(tmp_path, launch_mode="supervised", dispatch_id="dispatch_1")
+    watcher = Watcher(tmp_path, "agent_001")
+    notify = AsyncMock(return_value=None)
+
+    with patch("osw.watcher.orchestration_inbox",
+               AsyncMock(return_value=[{
+                   "id": "msg_ask_1", "type": "question", "from": "term-a",
+                   "body": "which branch?",
+               }])), \
+         patch.object(Watcher, "_notify", notify):
+        await watcher._relay_worker_asks("dispatch_1")
+
+    notify.assert_awaited_once()
+    assert "msg_ask_1" in state.read_agent(tmp_path, "agent_001")["notified_asks"]
+
+
+# ---------------------------------------------------------------------------
+# Completion-line collapse with a live Mailbox (spec §14, §20)
+#
+# The spool report is always written; only the direct turn-completion line
+# is a direct-mode fallback, kept when the lock names no live pid. Ask and
+# blocked notices are unchanged and are always sent.
+# ---------------------------------------------------------------------------
+
+def _mailbox_lock(tmp_path, pid: int) -> Path:
+    """Write a daemon lock naming `pid`, as a live Mailbox would."""
+    from osw.mailbox.paths import ensure_mailbox_dirs, lock_path
+
+    ensure_mailbox_dirs(tmp_path)
+    path = lock_path(tmp_path)
+    path.write_text(
+        json.dumps({"pid": pid, "started_at": "2026-11-14T00:00:00+00:00"}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _dead_pid() -> int:
+    """A pid that has certainly exited, without patching the probe."""
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return int(proc.pid)
+
+
+@pytest.mark.anyio
+async def test_live_mailbox_lock_suppresses_direct_completion_line(
+    tmp_path, spool_writes,
+):
+    _spool_agent(tmp_path)
+    _mailbox_lock(tmp_path, os.getpid())
+    watcher = Watcher(tmp_path, "agent_001")
+    notify = AsyncMock(return_value=None)
+
+    with patch.object(Watcher, "_notify", notify):
+        await watcher._finalize("done", "ps_done")
+
+    assert [env["kind"] for env in spool_writes] == ["report"]
+    assert spool_writes[0]["body"]["outcome"] == "ready"
+    notify.assert_not_awaited()
+    agent = state.read_agent(tmp_path, "agent_001")
+    assert agent["state"] == "done"
+    assert Path(agent["report_file"]).read_text(encoding="utf-8")
+    events = [
+        json.loads(line)
+        for line in (state.logs_dir(tmp_path) / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    suppressed = [
+        e for e in events if e["event"] == "completion_notify_suppressed"
+    ]
+    assert len(suppressed) == 1
+    assert suppressed[0]["data"] == {"state": "done", "source": "ps_done"}
+
+
+@pytest.mark.anyio
+async def test_dead_mailbox_lock_notifies_completion(tmp_path, spool_writes):
+    _spool_agent(tmp_path)
+    _mailbox_lock(tmp_path, _dead_pid())
+    watcher = Watcher(tmp_path, "agent_001")
+    notify = AsyncMock(return_value=None)
+
+    with patch.object(Watcher, "_notify", notify):
+        await watcher._finalize("done", "ps_done")
+
+    assert [env["kind"] for env in spool_writes] == ["report"]
+    notify.assert_awaited_once()
+    assert notify.await_args.args[0].startswith("# [osw] task-finished")
+
+
+@pytest.mark.anyio
+async def test_missing_mailbox_lock_notifies_completion(
+    tmp_path, spool_writes,
+):
+    _spool_agent(tmp_path)
+    watcher = Watcher(tmp_path, "agent_001")
+    notify = AsyncMock(return_value=None)
+
+    with patch.object(Watcher, "_notify", notify):
+        await watcher._finalize("done", "ps_done")
+
+    assert [env["kind"] for env in spool_writes] == ["report"]
+    notify.assert_awaited_once()
+    assert notify.await_args.args[0].startswith("# [osw] task-finished")
+
+
+@pytest.mark.anyio
+async def test_live_mailbox_lock_keeps_ask_notice(tmp_path, spool_writes):
+    _spool_agent(
+        tmp_path, launch_mode="supervised", dispatch_id="dispatch_1",
+    )
+    _mailbox_lock(tmp_path, os.getpid())
+    watcher = Watcher(tmp_path, "agent_001")
+    notify = AsyncMock(return_value=None)
+
+    with patch("osw.watcher.orchestration_inbox",
+               AsyncMock(return_value=[{
+                   "id": "msg_ask_1", "type": "question", "from": "term-a",
+                   "body": "which branch?",
+               }])), \
+         patch.object(Watcher, "_notify", notify):
+        await watcher._relay_worker_asks("dispatch_1")
+
+    assert [env["kind"] for env in spool_writes] == ["ask"]
+    notify.assert_awaited_once()
+    assert notify.await_args.args[0].startswith("# [osw] ask")
+
+
+@pytest.mark.anyio
+async def test_live_mailbox_lock_keeps_blocked_notice(tmp_path, spool_writes):
+    _spool_agent(tmp_path)
+    _mailbox_lock(tmp_path, os.getpid())
+    watcher = Watcher(tmp_path, "agent_001")
+    notify = AsyncMock(return_value=None)
+
+    with patch.object(Watcher, "_notify", notify):
+        sent = await watcher._notify_blocked(
+            "update_prompt", "Update available | press enter")
+
+    assert sent
+    assert [env["kind"] for env in spool_writes] == ["blocked"]
+    notify.assert_awaited_once()
+    assert notify.await_args.args[0].startswith("# [osw] blocked")

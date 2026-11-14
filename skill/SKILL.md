@@ -21,6 +21,8 @@ directory containing this file.
 5. Decompose work, dispatch dependency-ready tasks, and keep integrating while
    detached watchers supervise workers.
 6. Accept results only after checking the handoff and actual workspace state.
+7. When the mailbox is running, route through it rather than dispatching
+   inline: `mailbox wait` for cards, `mailbox decide` for the decision.
 
 For multiple workers, dependencies, shared-worktree coordination, or model
 selection, read [references/orchestration.md](references/orchestration.md)
@@ -85,6 +87,98 @@ python <skill-dir>/osw.py stop <agent-id>
   `completion_source: interrupted` and no handoff.
 
 `list`/`status` show a mid-task agent whose watcher died as `lost`.
+
+## Mailbox
+
+The mailbox is the optional control plane: it records requests and results and
+holds the decision log. Use it once more than one worker is live or when a
+decision has to be auditable.
+
+```text
+python <skill-dir>/osw.py mailbox start
+python <skill-dir>/osw.py mailbox wait --as router --timeout 0
+python <skill-dir>/osw.py mailbox decide <message-id> --action <action> --reason "<reason>"
+python <skill-dir>/osw.py mailbox status --json
+python <skill-dir>/osw.py mailbox stop
+```
+
+- `wait` hands you cards of at most 1 KiB for the role you ask for; a card is a
+  summary, `mailbox show <id>` pulls the full message and ticket, and
+  `mailbox trace <id|ticket>` follows message → ticket → decisions → effects.
+- `decide` needs a reason and prints the `decision_id`. The Dispatcher applies
+  it through `new`, `use`, `stop` and `orchestration reply`; while acting as the
+  Router you do not call those yourself, and `new`/`use` are refused with
+  `router_forbidden`.
+- The only text the Router may put into a worker is the fixed answer template
+  `# [osw] answer <decision_id>: <text>` — one line, at most 4 KiB. Anything
+  outside the Ticket's `skill/osw/mandate.json` (login, permission, delete,
+  payment) goes to a human; blocking screens stay with the watcher whitelist.
+- With the mailbox never started, or stopped, every other command in this file
+  behaves exactly as before; a dead daemon keeps the spool and ingests it on
+  restart.
+
+## Super
+
+Invocation shortcut: a skill invocation whose text starts with `super`
+(for example `/osw super "task A" "task B"`) means run this command with the
+remaining text as one task per argument. Tasks are positional, and repeated
+`--task` values are appended after them.
+
+Free-form request (`/osw super 把 A、B、C 并行做完`): split it into independent
+outcomes first (one task per outcome), state the list in one line, then run
+`super` with those positional tasks. Do not ask the human for provider, model
+or thinking when the project policy names them, and do not require flags they
+did not write; ask only when the request cannot be split without guessing.
+
+When several tasks are independent, dispatch them with one command instead of
+one `new` per task:
+
+```text
+python <skill-dir>/osw.py super "Fix the failing tests" "Audit the provider layer"
+```
+
+Only a provider is required, and even that can come from the project. Flags
+tailor the run:
+
+```text
+python <skill-dir>/osw.py super "task one" "task two" \
+    --provider <provider> --prefix <role> --model <model> --thinking <level> \
+    --max-parallel <n> --caller-terminal <handle>
+```
+
+Or from a plan file whose top-level keys are the same defaults and whose
+`tasks` array mixes strings and per-task override objects:
+
+```text
+python <skill-dir>/osw.py super --plan plan.json --json
+```
+
+- **Zero-flag defaults** — with no flag and no plan value for
+  `provider`/`model`/`thinking`/`prefix`/`max_parallel`, resolve them from the
+  project in this order: the `super` object in
+  `.orca/osw/config.json` (absent or malformed is ignored), then
+  `OSW_PROVIDER`/`OSW_MODEL`/`OSW_THINKING`/`OSW_PREFIX`/`OSW_MAX_PARALLEL`,
+  then the `## OSW Provider Policy` table row whose first cell contains
+  `batch fan-out`. Prefix finally defaults to `code`, `max_parallel` to 32.
+  Only `provider` is required: with none anywhere the command names the three
+  places to set it and dispatches nothing.
+- **Flags are defaults** — an explicit flag wins, a plan's
+  `provider`/`model`/`thinking`/`prefix`/`max_parallel` stands in for a flag
+  you did not pass, and a task object may override `task`, `prefix`,
+  `provider`, `model`, `thinking` and `caller_terminal` for itself. `--plan`
+  cannot be combined with tasks, positional or flag.
+- The mailbox is started first by default (`--no-mailbox` skips it). If it
+  fails to start, nothing is dispatched and the command exits 1 with that typed
+  error.
+- Each task is one plain `new` in the project root; `super` keeps no state of
+  its own and its agents are watched, reported and handed off like any other.
+  At most `--max-parallel` run at once (default 32, clamped to 1..32, 300s each),
+  one failed dispatch never aborts the rest, and the command exits 1 if any
+  dispatch failed.
+- `--json` reports `{mailbox, requested, started, agents, errors}`; `--dry-run`
+  prints the argv lists without executing them, so the resolved provider, model
+  and thinking are visible before anything runs. Verify each result by reading
+  its handoff, exactly as for `new`.
 
 ## Cross-host workers
 

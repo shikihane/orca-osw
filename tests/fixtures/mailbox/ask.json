@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "from": {"role": "watcher", "id": "agent_001"},
+  "to": {"role": "router", "id": ""},
+  "kind": "ask",
+  "correlation": {"agent": "agent_001", "ask": "orca_msg_77"},
+  "thread_key": "agent_001",
+  "dedupe_key": "orca_msg_77",
+  "body": {"text": "should I update the lock file format?"}
+}

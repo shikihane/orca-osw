@@ -64,6 +64,15 @@ python skill/osw.py status
 | `list [--all] [--json]` | 列出受管 agent |
 | `logs [--agent <agent_id>] [--tail N]` | 查看 OSW 日志和事件 |
 | `status [--all]` | 显示 OSW 状态和 agent 统计 |
+| `mailbox start [--json]` | 启动本地邮箱守护进程（仅控制平面）；重复 `start` 视为成功 |
+| `mailbox stop [--json]` | 停止守护进程并等待退出 |
+| `mailbox status [--json]` | 各队列积压、最旧消息年龄、spool 滞后、门铃状态与死信 |
+| `mailbox send --kind <kind> --text "<文本>" [--to-role <角色>] [--ticket <id>] [--thread-key <键>] [--json]` | 向 spool 写入一条信封（默认角色 human → router） |
+| `mailbox wait [--as router\|human] [--timeout <秒>] [--max <n>] [--json]` | 为该角色租约并确认决策卡片；`--timeout 0` 为单次扫描 |
+| `mailbox show <消息 id> [--json]` | 查看单条消息的信封、卡片与 Ticket |
+| `mailbox trace <消息 id 或 Ticket> [--json]` | 消息 → Ticket → 决策 → 效果 → 发件箱 |
+| `mailbox decide <消息 id> --action <动作> --reason "<原因>" [--ticket <id>] [--payload-json <json>] [--json]` | 校验并提交决策；输出其 `decision_id` |
+| `mailbox tickets [--json]`、`mailbox ticket <id> [--json]` | 派生的 Ticket 索引，以及单个 Ticket |
 | `jev status [--check]` | 显示全局 Jev 开关、key/SDK/endpoint/代理状态；`--check` 实时探测端点 |
 | — | **模式就是全局开关**：机器级环境变量 `OSW_JEV_MODE`（`enforce\|shadow\|off`；未设置 = `off`）是唯一控制——不再有项目级 Jev 配置 |
 
@@ -212,6 +221,28 @@ python skill/osw.py del fnnas/code_001 --close
 - 支持的目标是 POSIX 远端；Windows 远端只做尽力支持。
 - `guard` 保持在本机——监护方是本机的一个终端。
 
+## 控制平面（Mailbox）
+
+OSW 有一个可选的本地控制平面：持久化邮箱、确定性快路径、做决策的 Router 角色，以及通过 CLI 既有路径执行决策的 Dispatcher。执行层不变——Run/Task/DAG/Dispatch 仍归 Orca，每一轮仍由 watcher 负责，代码仍由 provider 写。
+
+```bash
+python skill/osw.py mailbox start
+python skill/osw.py mailbox send --kind request --text "分别检查这两个 PR" --thread-key chat:main
+python skill/osw.py mailbox wait --as router --timeout 0
+python skill/osw.py mailbox decide msg_... --action accept --ticket code_001 \
+    --reason "明确人工请求" --payload-json '{"provider":"claude","model":"sonnet"}'
+python skill/osw.py mailbox status --json
+python skill/osw.py mailbox stop
+```
+
+- **生命周期** —— `start` 以 detached 方式启动守护进程并等待锁；`status` 报告 `running`、`pid`、各队列积压、`spool_lag`、门铃状态与死信；`stop` 写停止旁路文件并等待退出。重复 `start` 视为成功，不是错误。
+- **只有生产者写 spool**（`.orca/osw/mailbox/spool/`），守护进程是 SQLite store 的唯一写入方。摄入至少一次、应用幂等：去重键（提问用 Orca 消息 id，报告用 `report_key`，决策用 `decision_id`）吸收重复，因此每个 Ticket 只会启动一次 worker、回答一次、停止一次。
+- **卡片与门铃** —— `wait` 返回不超过 1 KiB 的卡片，`decide` 必须给出原因。有卡片在等时，守护进程通过与 watcher 相同的通知通道发一行 `# [osw] mail pending=<n> run="osw mailbox wait --as router --timeout 0"`——按需启动的 Router 会话只拿到一个计数和一条命令。租约过期后再响一次，仍无人处理则通知人。
+- **Ticket 与 Mandate** —— Ticket 是持久案卷；Mandate 是关闭 schema、由人维护的 `skill/osw/mandate.json`，从已提交的 HEAD 读取。Router 开 Ticket 时只能收窄、不能放宽；Dispatcher 把越界记为 `mandate_denied` 并拒绝执行。
+- **回答权限** —— Router 唯一能写进 worker 的内容是固定单行模板 `# [osw] answer <decision_id>: <text>`，最多 4 KiB，发送前 Dispatcher 会复查提问仍未关闭。登录、权限、删除、付费画面一律升级给人；阻塞画面仍由 watcher 的白名单策略处理。
+- **direct mode 是保证** —— 从不启动邮箱、或邮箱已停止时，`new`、`use`、`status`、`list`、`revive`、`stop` 与现有通知路径行为完全不变。邮箱只是 `notified_asks` 之外的第二道防线，不替代 watcher、交接校验和 Orca 自身状态。守护进程死掉时 spool 保留生产者写入的内容，重启后摄入，`status` 报告 `mailbox_down`。
+- **保持在本机** —— 每个项目根一个邮箱，位于 `.orca/osw/mailbox/`。远端事件由本机 watcher 经主机缝写入本机 spool；远端不运行任何东西。
+
 ## 架构
 
 ```
@@ -358,6 +389,11 @@ orca-osw/
       providers.py    # provider 命令构造与模型发现
       sessions.py     # 从 Orca agent-hook 缓存读取 provider 会话 id
       blockers.py     # 阻塞画面的发现、白名单与更新锁
+      fastpath.py     # 摄入阶段的确定性分类与簿记
+      mandate.py      # 关闭 schema 的 Ticket 限制（skill/osw/mandate.json）
+      dispatcher.py   # 唯一执行决策的组件
+      mailbox_cli.py  # mailbox 命令：start/stop/status/send/wait/decide/tickets
+      mailbox/        # 控制平面：信封、store、spool、适配器、投递、守护进程
       state.py        # 状态模型与文件 I/O
       watcher.py      # detached 完成状态 watcher
   tests/              # 单元与集成测试
@@ -376,6 +412,7 @@ orca-osw/
       hosts.json      # 已登记主机（`host add` 创建）
       agents/          # 每个受管 agent 一个 JSON 记录（以及 <id>.stop 停止请求）
       handoffs/        # worker 写入的交接 markdown
+      mailbox/         # 控制平面：spool/、mailbox.db、daemon.lock、status.json
       logs/
       reports/
 ```

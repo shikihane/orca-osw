@@ -1,0 +1,100 @@
+{
+  "rule": "expire_ttl",
+  "cases": [
+    {
+      "name": "notice past its ttl settles as expired",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T130000000Z_a1b2c3",
+        "ts": "2026-11-14T13:00:00.000Z",
+        "from": {
+          "role": "system",
+          "id": "adapter:log",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "notice",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 3,
+        "ttl_s": 60,
+        "dedupe_key": "",
+        "body": {
+          "summary": "build log grew"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:05:00.000Z",
+        "tickets": [],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "expire",
+        "attention": "fyi",
+        "priority": 3,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [
+          {
+            "op": "expire",
+            "message_id": "msg_20261114T130000000Z_a1b2c3"
+          }
+        ],
+        "reason": "ttl 60s expired"
+      }
+    },
+    {
+      "name": "notice still inside its ttl",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T130000001Z_a1b2c4",
+        "ts": "2026-11-14T13:00:00.000Z",
+        "from": {
+          "role": "system",
+          "id": "adapter:log",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "notice",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 3,
+        "ttl_s": 60,
+        "dedupe_key": "",
+        "body": {
+          "summary": "build log grew"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:00:30.000Z",
+        "tickets": [],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": null
+    }
+  ]
+}

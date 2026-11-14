@@ -1,0 +1,152 @@
+{
+  "rule": "wake",
+  "cases": [
+    {
+      "name": "an unclassified card rings a due doorbell",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T133200000Z_j10001",
+        "ts": "2026-11-14T13:32:00.000Z",
+        "from": {
+          "role": "worker",
+          "id": "agent:code_002",
+          "trust": "untrusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "answer",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 3,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "text": "done"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:32:30.000Z",
+        "tickets": [],
+        "doorbell": "none",
+        "queued_router": 2
+      },
+      "expect": {
+        "intent": "answer",
+        "attention": "fyi",
+        "priority": 3,
+        "wake": "doorbell",
+        "decision": null,
+        "bookkeeping": [],
+        "reason": "doorbell"
+      }
+    },
+    {
+      "name": "a pending doorbell suppresses the ring",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T133200001Z_j10002",
+        "ts": "2026-11-14T13:32:01.000Z",
+        "from": {
+          "role": "worker",
+          "id": "agent:code_002",
+          "trust": "untrusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "answer",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 3,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "text": "done"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:32:30.000Z",
+        "tickets": [],
+        "doorbell": "pending",
+        "queued_router": 1
+      },
+      "expect": {
+        "intent": "answer",
+        "attention": "fyi",
+        "priority": 3,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [],
+        "reason": "no matching rule"
+      }
+    },
+    {
+      "name": "nothing queued means no ring",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T133200002Z_j10003",
+        "ts": "2026-11-14T13:32:02.000Z",
+        "from": {
+          "role": "worker",
+          "id": "agent:code_002",
+          "trust": "untrusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "answer",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 3,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "text": "done"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:32:30.000Z",
+        "tickets": [],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "answer",
+        "attention": "fyi",
+        "priority": 3,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [],
+        "reason": "no matching rule"
+      }
+    }
+  ]
+}

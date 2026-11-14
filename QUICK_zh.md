@@ -156,3 +156,18 @@ python /path/to/orca-osw/skill/osw.py del fnnas/code_001 --close
 ```
 
 `host list` 显示已登记主机以及它们当前是否可达；`host rm <name>` 删除记录。
+
+## 13. 控制平面（mailbox）
+
+六行命令跑通一遍。邮箱是可选的；从不启动它时，前面所有命令行为不变。
+
+```bash
+python /path/to/orca-osw/skill/osw.py mailbox start
+python /path/to/orca-osw/skill/osw.py mailbox send --kind request --text "修复失败的测试"
+python /path/to/orca-osw/skill/osw.py mailbox wait --as router --timeout 0
+python /path/to/orca-osw/skill/osw.py mailbox decide msg_... --action accept --ticket code_001 --reason "明确人工请求"
+python /path/to/orca-osw/skill/osw.py mailbox status --json
+python /path/to/orca-osw/skill/osw.py mailbox stop
+```
+
+`wait` 为该角色租约并确认等待中的卡片；`decide` 输出 `decision_id`，随后由 Dispatcher 通过常规的 `new`/`use`/`stop` 路径执行。需要回查某个 Ticket 时用 `mailbox tickets`。细节见 [README_zh.md](README_zh.md)。

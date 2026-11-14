@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "from": {"role": "watcher", "id": "agent_001"},
+  "to": {"role": "router", "id": ""},
+  "kind": "report",
+  "correlation": {"agent": "agent_001"},
+  "thread_key": "agent_001",
+  "dedupe_key": "report_key_code_001_1",
+  "body": {
+    "outcome": "ready",
+    "handoff_path": ".orca/osw/handoffs/agent_001.md",
+    "summary": "watcher timeout is configurable",
+    "completion_source": "handoff",
+    "tools_observed": true
+  }
+}

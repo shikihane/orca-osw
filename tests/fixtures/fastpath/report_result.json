@@ -1,0 +1,245 @@
+{
+  "rule": "report_result",
+  "cases": [
+    {
+      "name": "a ready report stages review and rings",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T132200000Z_f10001",
+        "ts": "2026-11-14T13:22:00.000Z",
+        "from": {
+          "role": "watcher",
+          "id": "agent:code_001",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "report",
+        "correlation": {
+          "ticket": "code_001",
+          "agent": "code_001",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "code_001",
+        "reply_to": "",
+        "priority": 2,
+        "ttl_s": 0,
+        "dedupe_key": "code_001:turn:7",
+        "body": {
+          "outcome": "ready",
+          "handoff": "reports/code_001.md",
+          "completion_source": "handoff",
+          "tools_observed": true
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:22:30.000Z",
+        "tickets": [
+          {
+            "id": "code_001",
+            "stage": "working",
+            "thread_key": "code_001"
+          }
+        ],
+        "doorbell": "none",
+        "queued_router": 1
+      },
+      "expect": {
+        "intent": "accept_result",
+        "attention": "must_answer",
+        "priority": 2,
+        "wake": "doorbell",
+        "decision": null,
+        "bookkeeping": [
+          {
+            "op": "attach",
+            "ticket": "code_001",
+            "message_id": "msg_20261114T132200000Z_f10001",
+            "report": {
+              "message_id": "msg_20261114T132200000Z_f10001",
+              "outcome": "ready",
+              "report_key": "code_001:turn:7",
+              "body": {
+                "outcome": "ready",
+                "handoff": "reports/code_001.md",
+                "completion_source": "handoff",
+                "tools_observed": true
+              }
+            }
+          },
+          {
+            "op": "stage",
+            "ticket": "code_001",
+            "stage": "review"
+          }
+        ],
+        "reason": "report ready"
+      }
+    },
+    {
+      "name": "a failed report stages review without a second ring",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T132200001Z_f10002",
+        "ts": "2026-11-14T13:22:00.000Z",
+        "from": {
+          "role": "watcher",
+          "id": "agent:code_001",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "report",
+        "correlation": {
+          "ticket": "code_001",
+          "agent": "code_001",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "code_001",
+        "reply_to": "",
+        "priority": 2,
+        "ttl_s": 0,
+        "dedupe_key": "code_001:turn:7",
+        "body": {
+          "outcome": "failed",
+          "handoff": "reports/code_001.md",
+          "completion_source": "handoff",
+          "tools_observed": true
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:22:30.000Z",
+        "tickets": [
+          {
+            "id": "code_001",
+            "stage": "working",
+            "thread_key": "code_001"
+          }
+        ],
+        "doorbell": "pending",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "accept_result",
+        "attention": "must_answer",
+        "priority": 2,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [
+          {
+            "op": "attach",
+            "ticket": "code_001",
+            "message_id": "msg_20261114T132200001Z_f10002",
+            "report": {
+              "message_id": "msg_20261114T132200001Z_f10002",
+              "outcome": "failed",
+              "report_key": "code_001:turn:7",
+              "body": {
+                "outcome": "failed",
+                "handoff": "reports/code_001.md",
+                "completion_source": "handoff",
+                "tools_observed": true
+              }
+            }
+          },
+          {
+            "op": "stage",
+            "ticket": "code_001",
+            "stage": "review"
+          }
+        ],
+        "reason": "report failed"
+      }
+    },
+    {
+      "name": "a dropped report stages stopped",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T132200002Z_f10003",
+        "ts": "2026-11-14T13:22:00.000Z",
+        "from": {
+          "role": "watcher",
+          "id": "agent:code_001",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "report",
+        "correlation": {
+          "ticket": "code_001",
+          "agent": "code_001",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "code_001",
+        "reply_to": "",
+        "priority": 2,
+        "ttl_s": 0,
+        "dedupe_key": "code_001:turn:7",
+        "body": {
+          "outcome": "dropped",
+          "handoff": "reports/code_001.md",
+          "completion_source": "handoff",
+          "tools_observed": true
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:22:30.000Z",
+        "tickets": [
+          {
+            "id": "code_001",
+            "stage": "working",
+            "thread_key": "code_001"
+          }
+        ],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "accept_result",
+        "attention": "must_answer",
+        "priority": 2,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [
+          {
+            "op": "attach",
+            "ticket": "code_001",
+            "message_id": "msg_20261114T132200002Z_f10003",
+            "report": {
+              "message_id": "msg_20261114T132200002Z_f10003",
+              "outcome": "dropped",
+              "report_key": "code_001:turn:7",
+              "body": {
+                "outcome": "dropped",
+                "handoff": "reports/code_001.md",
+                "completion_source": "handoff",
+                "tools_observed": true
+              }
+            }
+          },
+          {
+            "op": "stage",
+            "ticket": "code_001",
+            "stage": "stopped"
+          }
+        ],
+        "reason": "report dropped"
+      }
+    }
+  ]
+}

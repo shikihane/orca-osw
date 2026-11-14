@@ -1,0 +1,128 @@
+{
+  "rule": "blocked",
+  "cases": [
+    {
+      "name": "a blocked ticket needs a human decision",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T132100000Z_e10001",
+        "ts": "2026-11-14T13:21:00.000Z",
+        "from": {
+          "role": "watcher",
+          "id": "agent:code_001",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "blocked",
+        "correlation": {
+          "ticket": "code_001",
+          "agent": "code_001",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "code_001",
+        "reply_to": "",
+        "priority": 1,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "kind": "auth",
+          "screen": "Permission required"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:21:30.000Z",
+        "tickets": [
+          {
+            "id": "code_001",
+            "stage": "working",
+            "thread_key": "code_001"
+          }
+        ],
+        "doorbell": "none",
+        "queued_router": 1
+      },
+      "expect": {
+        "intent": "resolve",
+        "attention": "must_answer",
+        "priority": 1,
+        "wake": "doorbell",
+        "decision": null,
+        "bookkeeping": [
+          {
+            "op": "attach",
+            "ticket": "code_001",
+            "message_id": "msg_20261114T132100000Z_e10001"
+          },
+          {
+            "op": "stage",
+            "ticket": "code_001",
+            "stage": "blocked"
+          }
+        ],
+        "reason": "blocked screen"
+      }
+    },
+    {
+      "name": "an unmatched blocker is still escalated",
+      "envelope": {
+        "v": 1,
+        "id": "msg_20261114T132100001Z_e10002",
+        "ts": "2026-11-14T13:21:01.000Z",
+        "from": {
+          "role": "watcher",
+          "id": "agent:code_001",
+          "trust": "trusted"
+        },
+        "to": {
+          "role": "router",
+          "id": ""
+        },
+        "kind": "blocked",
+        "correlation": {
+          "ticket": "",
+          "agent": "",
+          "dispatch": "",
+          "ask": "",
+          "decision": ""
+        },
+        "thread_key": "",
+        "reply_to": "",
+        "priority": 1,
+        "ttl_s": 0,
+        "dedupe_key": "",
+        "body": {
+          "kind": "auth",
+          "screen": "Permission required"
+        },
+        "state": "queued"
+      },
+      "context": {
+        "now": "2026-11-14T13:21:30.000Z",
+        "tickets": [
+          {
+            "id": "code_001",
+            "stage": "working",
+            "thread_key": "code_001"
+          }
+        ],
+        "doorbell": "none",
+        "queued_router": 0
+      },
+      "expect": {
+        "intent": "resolve",
+        "attention": "must_answer",
+        "priority": 1,
+        "wake": "",
+        "decision": null,
+        "bookkeeping": [],
+        "reason": "blocked screen"
+      }
+    }
+  ]
+}
