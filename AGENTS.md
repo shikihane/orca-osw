@@ -70,6 +70,15 @@ should not be treated as source.
   `mailbox decide <id> --action accept --reason ...` and `mailbox tickets`
   exercise one request end to end. `mailbox status` reports daemon liveness;
   the queue and ticket verbs only read the store.
+- `python skill/osw.py workflow --help` lists the run verbs, which turn a
+  phase plan into agents: `workflow run <name> --dry-run` prints the phases
+  and the agent count without creating a run, `workflow run <name>` executes
+  it (`--resume` reuses finished steps, `--policy strict|partial` sets what a
+  failed step does to its phase, `--verify none|suspect|all` grades handoffs),
+  `workflow status [<run>] [--watch]`, `workflow ls|show`, `workflow stop`,
+  and `workflow accept|reject|retry <run> <step> --reason ...` for a human
+  decision on one step. Definitions live in `.orca/osw/workflows/<name>.json`
+  (project first, then `~`); runs in `.orca/osw/runs/<run_id>/`.
 
 ## Coding Style & Naming Conventions
 
@@ -114,6 +123,54 @@ line, at most 4 KiB, always carrying the decision id for audit.
 - **Stays local.** Spool, store, daemon, role token and locks are local
   (`update-<provider>--<host>.lock` keeps the host key); remote events reach
   the spool through the host seam. Nothing runs on the far side.
+
+## Workflow Runs
+
+`super` fans one task list out once; a workflow turns a phase plan into agents
+and keeps going across phases. The plan is a closed-schema JSON a human writes
+— `.orca/osw/workflows/<name>.json` in the project (preferred) or the home
+directory — never a script an agent composes at run time.
+
+- **Shape.** `{name, max_agents?, approval?, phases[]}`; each phase is
+  `{id, mode: single|for_each, from?, task, schema?}`. Phases run in declared
+  order with a barrier: a phase starts only when every phase it names in
+  `from` is terminal. `for_each` expands one agent per item taken from the
+  array in the producer's output file — the path `{{output}}` names — or, for
+  a producer that predates it, the last fenced ```json block of its handoff. A
+  missing field or a missing file is refused (`no_items`) with the path named,
+  never guessed. The handoff stays the watcher's four-section markdown, so
+  machine-readable output has a channel of its own.
+- **Identity and resume.** `step_key = sha256(phase 0 index 0 prompt 0
+  schema_id)`, so a prompt must be a pure function of the definition and the
+  previous phase's structured output; `defs.py` rejects `{{now}}`, `{{uuid}}`,
+  `{{random}}` at load time for exactly that reason. `--resume` reuses every
+  step whose key is recorded `done` and dispatches the rest — no cascade, a
+  deliberate departure from Claude Code, whose agents share a prefix cache and
+  ours do not.
+- **Failure.** The watcher judges one pane; the scheduler judges the run. A
+  lost or errored step gets a new agent with the same prompt up to
+  `max_attempts` (default 2), then the step is `failed` and `--policy` decides:
+  `strict` stops the run at that barrier, `partial` continues and marks the
+  phase `partial` — a partial phase is never reported as success.
+- **Verification.** A verifier gets the artifact and the claim only (blind),
+  appends one line to `verdicts.jsonl`, and never calls OSW itself; the
+  artifact's sha256 is taken before and after, and a change discards the
+  verdict as `artifact_mutated`. An unparseable verdict gets one retry, then
+  the step is `unverifiable` and waits for a human.
+- **One writer per record.** The scheduler is the only writer of
+  `.orca/osw/runs/<run_id>/` (`run.json`, `steps/<key>.json`); the watcher
+  stays the only writer of agent records. Human verbs (`accept`, `reject`,
+  `retry`, `stop`) drop a request file that the next tick consumes, the same
+  side-file pattern as `.orca/osw/agents/<id>.stop` — never a second writer.
+- **Dispatch.** Every step is still one ordinary `new`. `new` needs a caller
+  terminal (its completion notification has nowhere to go otherwise), so the
+  scheduler passes `--caller-terminal` when the run was started inside a pane
+  and `--no-notify` when it was not: a workflow runs headless from a plain
+  shell or CI without changing what a supervised agent does.
+- **Guards.** `max_agents` (default 64) refuses rather than truncates; above
+  32 agents the run warns; `approval: "human"` refuses to start until the
+  operator passes `--yes`. `--dry-run` prints the phases and the agent count
+  and creates nothing.
 
 ## OSW Provider Policy
 

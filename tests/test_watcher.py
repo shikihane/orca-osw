@@ -5753,6 +5753,180 @@ async def test_stale_tool_name_on_a_done_row_is_not_activity(tmp_path):
     assert watcher._turn_tools_seen is False
 
 
+# ---------------------------------------------------------------------------
+# A stalled pane gets its prompt resent once per turn
+# ---------------------------------------------------------------------------
+
+def _stalled_working(now_ms: int, tool: str = "") -> list[dict]:
+    """A ps row that says "working" for this turn but has not moved."""
+    return _ps_with(
+        "working", now_ms - 500, prompt="do the task",
+        updatedAt=now_ms - 400_000, toolName=tool)
+
+
+async def _wait_stalled_turn(watcher, stale_polls, *, sent_text="do the task",
+                             show=None, absorb_echo=True):
+    """Drive one `_wait_turn_done` whose pane stays "working" but frozen
+    for `stale_polls` polls, then reports done."""
+    now_ms = int(time.time() * 1000)
+    rows = iter([_stalled_working(now_ms) for _ in range(stale_polls)])
+    done = _ps_with("done", now_ms + 1000, prompt=sent_text)
+    ps = AsyncMock(side_effect=lambda **_: next(rows, done))
+    send = AsyncMock(return_value=True)
+    notify = AsyncMock()
+    probe = AsyncMock()
+    watcher.deadline = time.monotonic() + 5
+
+    with patch("osw.watcher.worktree_ps", ps), \
+         patch("osw.watcher.terminal_show", show or _quiet_show(now_ms)), \
+         patch.object(Watcher, "_send_terminal", send), \
+         patch.object(Watcher, "_notify", notify), \
+         patch.object(Watcher, "_blocker_probe", probe), \
+         patch("osw.watcher.POLL_SECS", 0):
+        source = await watcher._wait_turn_done(
+            time.time() * 1000 - 1000, sent_text=sent_text,
+            receipt_hint=not absorb_echo, absorb_echo=absorb_echo)
+    return source, send, notify, probe
+
+
+@pytest.mark.anyio
+async def test_first_stall_resends_the_same_prompt_on_the_same_pane(tmp_path):
+    watcher = _turn_agent(tmp_path)
+
+    source, send, notify, probe = await _wait_stalled_turn(watcher, 1)
+
+    assert source == "ps_done"
+    assert [c.args for c in send.await_args_list] == [("do the task",)]
+    restarts = [e for e in _events(tmp_path) if e["event"] == "stall_restart"]
+    assert len(restarts) == 1
+    assert restarts[0]["data"]["attempt"] == 1
+    assert restarts[0]["data"]["no_activity"] >= 300
+    # The notice and the blocker look keep their old path and cadence.
+    stalled = [c.args[0] for c in notify.await_args_list
+               if "agent-stalled" in str(c.args[0])]
+    assert len(stalled) == 1 and "no-activity=" in stalled[0]
+    probe.assert_awaited_once_with("stall")
+
+
+@pytest.mark.anyio
+async def test_second_stall_does_not_resend_again(tmp_path):
+    watcher = _turn_agent(tmp_path)
+
+    source, send, _, _ = await _wait_stalled_turn(watcher, 6)
+
+    assert source == "ps_done"
+    assert send.await_count == 1          # the one resend, never a second
+    restarts = [e for e in _events(tmp_path) if e["event"] == "stall_restart"]
+    assert len(restarts) == 1
+
+
+@pytest.mark.anyio
+async def test_stall_does_not_resend_a_turn_that_used_a_tool(tmp_path):
+    watcher = _turn_agent(tmp_path)
+    now_ms = int(time.time() * 1000)
+    rows = iter([
+        _stalled_working(now_ms, "Bash"),
+        _stalled_working(now_ms),
+        _stalled_working(now_ms),
+    ])
+    done = _ps_with("done", now_ms + 1000, prompt="do the task")
+    send = AsyncMock(return_value=True)
+    notify = AsyncMock()
+    watcher.deadline = time.monotonic() + 5
+
+    with patch("osw.watcher.worktree_ps",
+               AsyncMock(side_effect=lambda **_: next(rows, done))), \
+         patch("osw.watcher.terminal_show", _quiet_show(now_ms)), \
+         patch.object(Watcher, "_send_terminal", send), \
+         patch.object(Watcher, "_notify", notify), \
+         patch.object(Watcher, "_blocker_probe", AsyncMock()), \
+         patch("osw.watcher.POLL_SECS", 0):
+        source = await watcher._wait_turn_done(
+            time.time() * 1000 - 1000, sent_text="do the task")
+
+    assert source == "ps_done"
+    assert watcher._turn_tools_seen is True
+    send.assert_not_awaited()
+    assert "stall_restart" not in _event_names(tmp_path)
+    assert any("agent-stalled" in str(c.args[0])
+               for c in notify.await_args_list)
+
+
+@pytest.mark.anyio
+async def test_stall_resend_leaves_no_tool_activity_untouched(tmp_path):
+    """The resend is not work: a turn that still showed no tool is
+    finalized exactly as before, warning included."""
+    watcher = _turn_agent(tmp_path)
+
+    source, send, _, _ = await _wait_stalled_turn(watcher, 1)
+    assert source == "ps_done"
+    assert send.await_count == 1
+    assert watcher._turn_tools_seen is False
+
+    watcher._task_turn_ran = True
+    watcher._task_tools_observed = watcher._note_turn_tools("task")
+    notify = AsyncMock()
+    with patch.object(Watcher, "_notify", notify), \
+         patch("osw.watcher.worktree_ps", AsyncMock(return_value=[])):
+        await watcher._finalize("done", "ps_done")
+
+    agent = state.read_agent(tmp_path, "agent_001")
+    report = json.loads(Path(agent["report_file"]).read_text(encoding="utf-8"))
+    assert report["state"] == "done"
+    assert report["tools_observed"] is False
+    lines = [str(c.args[0]) for c in notify.await_args_list]
+    assert any("warning=no_tool_activity" in line for line in lines)
+    assert "no_tool_activity" in _event_names(tmp_path)
+
+
+@pytest.mark.anyio
+async def test_followed_turn_is_never_resent(tmp_path):
+    """A followed turn's text is ps's clipped preview of a prompt this
+    watcher did not send, so a stall only notifies."""
+    watcher = _turn_agent(tmp_path)
+
+    source, send, notify, _ = await _wait_stalled_turn(
+        watcher, 3, absorb_echo=False)
+
+    assert source == "ps_done"
+    send.assert_not_awaited()
+    assert "stall_restart" not in _event_names(tmp_path)
+    assert any("agent-stalled" in str(c.args[0])
+               for c in notify.await_args_list)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("case,expected", [
+    ("limit", "already_restarted"),
+    ("no_prompt", "no_prompt"),
+    ("follow", "no_prompt"),
+    ("dsh", "tool_lane_less_provider"),
+    ("tool", "tool_activity"),
+    ("stop", "stop_requested"),
+    ("handoff", "handoff_written"),
+    ("clean", ""),
+])
+async def test_stall_restart_guard_names_why_it_refuses(
+        tmp_path, case, expected):
+    watcher = _turn_agent(tmp_path, **({"provider": "dsh"} if case == "dsh" else {}))
+    attempt, sent_text, own_prompt = 1, "do the task", case != "follow"
+    if case == "limit":
+        attempt = 2
+    elif case == "no_prompt":
+        sent_text = ""
+    elif case == "tool":
+        watcher._turn_tools_seen = True
+    elif case == "stop":
+        state.write_stop_request(tmp_path, "agent_001")
+    elif case == "handoff":
+        handoff = tmp_path / "handoff.md"
+        handoff.write_text("# handoff\n", encoding="utf-8")
+        watcher._update(handoff_path=str(handoff))
+
+    assert watcher._stall_restart_blocked(attempt, sent_text, own_prompt) \
+        == expected
+
+
 def _fake_wait(task_tracked, task_tools, task_truncated_at=0):
     """A _wait_turn_done stand-in setting the per-turn observation flags:
     the task turn as given, the handoff turn with tools (it writes a file)."""

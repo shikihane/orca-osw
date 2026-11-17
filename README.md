@@ -458,6 +458,64 @@ python skill/osw.py super --plan plan.json --json
   executes nothing, so the resolved provider, model and thinking are visible
   before anything runs.
 
+## Workflow (Phased Runs)
+
+`super` dispatches one task list once. `workflow` reads a phase plan, dispatches
+each phase, waits at the barrier, and decides what the next phase's agents are
+from what the last one produced — so a run that dies halfway can be finished
+instead of restarted.
+
+```bash
+python skill/osw.py workflow run audit-routes --dry-run   # phases and agent count, nothing created
+python skill/osw.py workflow run audit-routes             # execute
+python skill/osw.py workflow run audit-routes --resume    # only the steps not yet done
+python skill/osw.py workflow status --watch               # live table: phases, then the steps that need attention
+python skill/osw.py workflow ls ; workflow show <run>
+python skill/osw.py workflow accept|reject|retry <run> <step> --reason "..."
+python skill/osw.py workflow stop <run>
+```
+
+The definition is a closed-schema JSON in `.orca/osw/workflows/<name>.json`
+(project first, then `~/.orca/osw/workflows/`):
+
+```json
+{
+  "name": "audit-routes",
+  "max_agents": 64,
+  "phases": [
+    {"id": "scan", "mode": "single", "task": "List every HTTP route handler as JSON under 'json' and write it to {{output}}."},
+    {"id": "audit", "mode": "for_each", "from": "scan", "task": "Audit {{item}} for a missing auth check."},
+    {"id": "report", "mode": "single", "from": "audit", "task": "Merge the audits and rank them."}
+  ]
+}
+```
+
+- **Barrier** — a phase starts only when every phase named in `from` is terminal.
+- **`for_each`** — one agent per item, read from the array in the file
+  `{{output}}` names (the scheduler substitutes the run's path), falling back to
+  the last fenced ` ```json ` block of the previous phase's handoff. A missing
+  field or a missing file is refused (`no_items`) with the path in the message
+  instead of guessed: the handoff itself stays the watcher's four-section
+  markdown, so structured output gets its own file and OSW does not pretend to
+  validate a strong schema.
+- **Resume** — `step_key = sha256(phase 0 index 0 prompt 0 schema_id)`. Prompts
+  must be pure: `defs.py` rejects `{{now}}`, `{{uuid}}` and `{{random}}` when it
+  loads a definition, otherwise a key would never hit again. Unlike Claude Code,
+  a finished step is reused on its own key and nothing downstream is re-run.
+- **Failure policy** — a lost or errored step is re-dispatched as a new agent
+  with the same prompt, up to `--max-attempts` (default 2). Then the step is
+  `failed`, and `--policy strict` (default) stops the run at that barrier while
+  `--policy partial` carries on and marks the phase `partial`.
+- **Verification** — `--verify suspect|all` has a second agent grade the
+  handoff, blind and read-only. A run that changes the artifact under review is
+  recorded `artifact_mutated` and the verdict is discarded; an unreadable verdict
+  becomes `unverifiable` and waits for `workflow accept|reject`.
+- **Writers** — the run archive (`.orca/osw/runs/<run_id>/`) has one writer, the
+  scheduler; agent records keep their single writer, the watcher. The human verbs
+  drop a request file the next tick consumes.
+- **Limits** — over `max_agents` is refused, not truncated; above 32 agents the
+  run warns; `"approval": "human"` refuses to start without `--yes`.
+
 ## Architecture
 
 ```

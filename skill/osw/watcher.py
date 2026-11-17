@@ -149,6 +149,15 @@ BOOT_STARTING_WAIT_MS = 120_000
 FALLBACK_IDLE_STABLE_MS = 60_000   # untracked CLI: silent this long = turn over
 HARD_TIMEOUT_SECS = 3600           # give up on the whole task after this
 STUCK_NOTIFY_SECS = 300            # tracked agent frozen this long -> tell caller
+# A tracked pane that still reports "working" with no fresh activity has
+# usually had its submit eaten by a repaint; the same prompt written to
+# the same pane is the cheapest repair, and it costs the agent nothing
+# it has not already been asked for. One resend per turn is the whole
+# allowance: the counter counts stall events, so attempt 1 resends and
+# attempt 2 only notifies. A turn that showed work of its own — a tool
+# call, its handoff, or a stop request — is busy, not stuck, and is
+# never resent.
+STALL_RESTART_LIMIT = 2            # stall events per turn; only the first resends
 CLOCK_SKEW_MS = 5_000              # tolerance comparing our clock vs Orca's
 TRACK_LOST_IDLE_WAIT_MS = 1_000    # quick TUI idle check before slow fallback
 RECEIPT_TIMEOUT_MS = 90_000        # tracked pane must acknowledge the prompt
@@ -1110,6 +1119,37 @@ class Watcher:
                 self.root, self.agent_id, provider, frame, mode, point)
         await self._check_blocker(
             observation, answer, frame, act="notify", point=point)
+
+    def _stall_restart_blocked(
+        self, attempt: int, sent_text: str, own_prompt: bool,
+    ) -> str:
+        """Why this stall must not resend the prompt ("" = resend it).
+
+        Nothing here is a judgment call: each clause is evidence that
+        the pane is alive on its own (`tool_activity`), has already
+        delivered the turn's product (`handoff_written`), must not be
+        re-prompted (`stop_requested`), reports no tools at all
+        (`tool_lane_less_provider`), or has used up its one resend
+        (`already_restarted`). `own_prompt` is False for a followed
+        turn: the text ps reports there is a clipped preview of a
+        prompt someone else typed, and sending a clipped prompt is not
+        the same prompt.
+        """
+        provider = str(self.agent.get("provider") or "").strip().lower()
+        if provider in TOOL_LANE_LESS_PROVIDERS:
+            return "tool_lane_less_provider"
+        if not own_prompt or not sent_text:
+            return "no_prompt"
+        if attempt >= STALL_RESTART_LIMIT:
+            return "already_restarted"
+        if self._turn_tools_seen:
+            return "tool_activity"
+        if self._stop_requested():
+            return "stop_requested"
+        handoff = str(self.agent.get("handoff_path") or "")
+        if handoff and _handoff_ok(Path(handoff)):
+            return "handoff_written"
+        return ""
 
     def _note_turn_tools(self, phase: str) -> bool | None:
         """Tool activity of the turn that just ended (plan §3.1).
@@ -2907,12 +2947,17 @@ class Watcher:
         # scrollback echo already proves that; ps evidence adds to it.
         receipt = receipt_hint
         sent_flat = one_line(sent_text)
+        # Only a prompt this watcher sent may be resent on a stall: a
+        # followed turn carries ps's clipped preview of a prompt someone
+        # else typed, and that is not the same prompt.
+        prompt_sent = absorb_echo
         echo_absorbed = not absorb_echo
         pending_done_started = 0  # a done must be observed twice to count
         misses = 0
         activity_observed = False
         ask_notified = False
         stall_notified = False
+        stall_attempts = 0   # stall events this turn; only the first resends
         background_defer_notified = False
 
         while time.monotonic() < self.deadline:
@@ -3055,15 +3100,40 @@ class Watcher:
                         )
                     updated = int(entry.get("updatedAt") or 0)
                     frozen_ms = time.time() * 1000 - updated
-                    if (updated and frozen_ms > STUCK_NOTIFY_SECS * 1000
-                            and not stall_notified):
-                        stall_notified = True
-                        await self._notify(
-                            f"# [osw] agent-stalled agent={self.agent_id}"
-                            f" terminal={self.handle}"
-                            f" no-activity={int(frozen_ms / 1000)}s"
-                        )
-                        await self._blocker_probe("stall")
+                    if updated and frozen_ms > STUCK_NOTIFY_SECS * 1000:
+                        # One resend per turn: a submit eaten by a
+                        # repaint leaves the pane exactly here, and the
+                        # same prompt on the same pane is the repair.
+                        # The notice and the blocker look below keep
+                        # their old once-per-turn shape either way.
+                        stall_attempts += 1
+                        blocked = self._stall_restart_blocked(
+                            stall_attempts, sent_text, prompt_sent)
+                        if not blocked:
+                            self._event(
+                                "stall_restart",
+                                data={
+                                    "attempt": stall_attempts,
+                                    "no_activity": int(frozen_ms / 1000),
+                                },
+                            )
+                            try:
+                                await self._send_terminal(sent_text)
+                            except OrcaError as exc:
+                                self._event(
+                                    "stall_restart_failed",
+                                    level="WARNING",
+                                    message=one_line(str(exc), 200),
+                                    data={"attempt": stall_attempts},
+                                )
+                        if not stall_notified:
+                            stall_notified = True
+                            await self._notify(
+                                f"# [osw] agent-stalled agent={self.agent_id}"
+                                f" terminal={self.handle}"
+                                f" no-activity={int(frozen_ms / 1000)}s"
+                            )
+                            await self._blocker_probe("stall")
                 continue
 
             if entry_seen:

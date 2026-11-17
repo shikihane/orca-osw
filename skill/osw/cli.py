@@ -59,6 +59,7 @@ from osw.orca_cli import (
 from osw.mailbox import identity as mailbox_identity
 from osw.mailbox.errors import MailboxError
 from osw.mailbox_cli import mailbox_app
+from osw.workflow_cli import workflow_app
 from osw.process import hidden_subprocess_kwargs
 from osw.providers import (
     SUPPORTED_PROVIDERS,
@@ -139,6 +140,7 @@ host_app = typer.Typer(
 )
 app.add_typer(host_app, name="host")
 app.add_typer(mailbox_app, name="mailbox")
+app.add_typer(workflow_app, name="workflow")
 
 
 def _refuse_router_identity(root: Path, command: str) -> None:

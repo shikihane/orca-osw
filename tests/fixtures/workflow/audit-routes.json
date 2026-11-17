@@ -1,0 +1,35 @@
+{
+  "name": "audit-routes",
+  "max_agents": 64,
+  "phases": [
+    {
+      "id": "scan",
+      "mode": "single",
+      "task": "List every route table entry under src/routes and write one line per route to .orca/osw/handoffs/scan.md."
+    },
+    {
+      "id": "audit",
+      "mode": "for_each",
+      "from": "scan",
+      "task": "Audit the route {{item.path}} for missing auth checks; report each finding as a list item.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "findings": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    {
+      "id": "verify",
+      "mode": "for_each",
+      "from": "audit",
+      "task": "Re-check finding {{item.id}} against the code and mark it confirmed or refuted."
+    },
+    {
+      "id": "report",
+      "mode": "single",
+      "from": ["audit", "verify"],
+      "task": "Merge the confirmed findings into .orca/osw/handoffs/report.md with one section per route."
+    }
+  ]
+}
