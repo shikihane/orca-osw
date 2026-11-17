@@ -39,6 +39,8 @@ APPROVAL_VALUES = ("human",)
 
 # Anything that would make the prompt differ between two runs.
 UNSTABLE_TOKENS = frozenset({"now", "today", "timestamp", "uuid", "random"})
+#: The placeholders code substitutes; every other name is refused at load.
+SUBSTITUTED = frozenset({"output", "item"})
 PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -48,6 +50,7 @@ CODES = frozenset({
     "unknown_field",
     "bad_phase_ref",
     "unstable_placeholder",
+    "unknown_placeholder",
     "run_not_found",
     "not_implemented",
     "too_many_agents",
@@ -55,6 +58,8 @@ CODES = frozenset({
     "step_not_found",
     "approval_unavailable",
     "router_forbidden",
+    "definition_exists",
+    "plan_failed",
 })
 
 
@@ -272,12 +277,22 @@ def _parse_from(value: Any, where: str, path: Path) -> tuple[str, ...]:
 
 def _check_placeholders(text: str, where: str, path: Path) -> None:
     for match in PLACEHOLDER_RE.finditer(text):
-        head = match.group(1).split(".", 1)[0].lower()
+        name = match.group(1)
+        head = name.split(".", 1)[0].lower()
         if head in UNSTABLE_TOKENS:
             raise WorkflowError(
                 "unstable_placeholder",
                 f"{path}: {where} uses {match.group(0)}, which changes between runs; "
                 "prompts must be parameter-only",
+            )
+        # Only three names are ever substituted. Anything else would survive
+        # into the prompt as literal text — a plan that looks valid and fails at
+        # dispatch — so it is refused here instead.
+        if head not in SUBSTITUTED:
+            raise WorkflowError(
+                "unknown_placeholder",
+                f"{path}: {where} uses {match.group(0)}; only {', '.join(sorted(SUBSTITUTED))} "
+                f"and {{{{item.<field>}}}} are substituted",
             )
 
 

@@ -466,6 +466,7 @@ from what the last one produced — so a run that dies halfway can be finished
 instead of restarted.
 
 ```bash
+python skill/osw.py workflow plan "audit every HTTP route for missing auth"   # one agent drafts the plan
 python skill/osw.py workflow run audit-routes --dry-run   # phases and agent count, nothing created
 python skill/osw.py workflow run audit-routes             # execute
 python skill/osw.py workflow run audit-routes --resume    # only the steps not yet done
@@ -474,6 +475,12 @@ python skill/osw.py workflow ls ; workflow show <run>
 python skill/osw.py workflow accept|reject|retry <run> <step> --reason "..."
 python skill/osw.py workflow stop <run>
 ```
+
+`plan` writes the definition for you: one ordinary agent drafts
+`.orca/osw/workflows/<name>.json` from the sentence, `defs.py` judges it, and
+the expanded phases print before anything is dispatched. An invalid draft stays
+on disk so one line can be fixed rather than the whole thing; `--name` keeps two
+plans apart. Nothing is dispatched until `run`.
 
 The definition is a closed-schema JSON in `.orca/osw/workflows/<name>.json`
 (project first, then `~/.orca/osw/workflows/`):

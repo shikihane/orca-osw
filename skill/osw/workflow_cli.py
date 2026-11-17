@@ -183,6 +183,58 @@ def status(
     typer.echo(board.render_status(run))
 
 
+@workflow_app.command("plan")
+def plan(
+    request: str = typer.Argument(..., metavar="TEXT"),
+    name: str = typer.Option(
+        "", "--name", help="Definition file stem (default: taken from the request)",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
+) -> None:
+    """Turn one sentence into a definition, then show the plan it expands to.
+
+    One ordinary agent writes the file against the closed schema; the validator
+    decides whether it is usable. Nothing is dispatched and no run is created —
+    the next step is still ``run``, and ``--dry-run`` on it costs nothing.
+    """
+    root = resolve_project_root()
+    from osw.workflow import author
+
+    with _errors():
+        path, definition = author.author(root, request, name=name)
+    planned = expand(definition)
+    static_total = static_agent_total(planned)
+    runtime_fanout = has_runtime_fanout(planned)
+
+    if json_output:
+        _echo_json({
+            "definition": definition.name,
+            "path": str(path),
+            "max_agents": definition.max_agents,
+            "phases": [
+                {
+                    "id": phase.id,
+                    "mode": phase.mode,
+                    "from": list(phase.from_ids),
+                    "tasks": phase.tasks,
+                }
+                for phase in planned
+            ],
+            "agents": f"{static_total} + N" if runtime_fanout else str(static_total),
+        })
+        return
+
+    typer.echo(f"WROTE {path}")
+    typer.echo(board.render_dry_run(
+        definition.name,
+        planned,
+        definition_path=definition.path,
+        max_agents=definition.max_agents,
+        static_total=static_total,
+        runtime_fanout=runtime_fanout,
+    ))
+
+
 @workflow_app.command("run")
 def run(
     name: str = typer.Argument(..., metavar="NAME"),

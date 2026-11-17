@@ -127,9 +127,13 @@ line, at most 4 KiB, always carrying the decision id for audit.
 ## Workflow Runs
 
 `super` fans one task list out once; a workflow turns a phase plan into agents
-and keeps going across phases. The plan is a closed-schema JSON a human writes
-— `.orca/osw/workflows/<name>.json` in the project (preferred) or the home
-directory — never a script an agent composes at run time.
+and keeps going across phases. The plan is a closed-schema JSON —
+`.orca/osw/workflows/<name>.json` in the project (preferred) or the home
+directory — never a script an agent composes and executes at run time. A person
+does not have to write it by hand: `osw workflow plan "<one sentence>"` has one
+ordinary agent draft that file, `defs.py` judges it, and `run --dry-run` shows
+the expansion before anything is dispatched. The schema stays closed either
+way, so a bad draft is refused by name, not half-run.
 
 - **Shape.** `{name, max_agents?, approval?, phases[]}`; each phase is
   `{id, mode: single|for_each, from?, task, schema?}`. Phases run in declared

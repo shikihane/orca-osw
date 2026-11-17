@@ -137,7 +137,8 @@ those events and nothing else.
 |---|---|
 | `workflow/defs.py` | Delivered. Closed-schema load, expansion, refusal codes. |
 | `workflow/board.py` | Delivered. Read-only rendering of runs. |
-| `workflow_cli.py` | Delivered for `ls`/`show`/`status`/`run --dry-run`; extended with `run`, `stop`, `accept`, `reject`, `retry`. |
+| `workflow_cli.py` | Delivered for `ls`/`show`/`status`/`run --dry-run`; extended with `run`, `stop`, `accept`, `reject`, `retry`, `plan`. |
+| `workflow/author.py` | New. `plan`: one agent drafts a definition against the closed schema; `defs.py` judges the file, and nothing is dispatched. The schema stays closed — a draft is refused by name, never half-run. |
 | `workflow/executor.py` | New. The scheduler: `join()`, `judge()`, `dispatch()`, one `tick()` per poll interval. |
 | `workflow/archive.py` | New. `run.json`, step records, verdict ledger, request side files. The only writer of run state. |
 | `watch`/watcher | One behaviour added (stall resend); no structural change. |
