@@ -23,7 +23,8 @@ LOCAL = local_host()
 def _no_live_terminal_list():
     """Commands that check panes (`revive`) never reach a live Orca;
     a test's own `terminal_list` patch takes precedence."""
-    with patch("osw.cli.terminal_list", AsyncMock(return_value=[])):
+    with patch("osw.cli.terminal_list", AsyncMock(return_value=[])), \
+         patch("osw.reclaim.terminal_list", AsyncMock(return_value=[])):
         yield
 
 
@@ -4099,8 +4100,8 @@ def test_del_close_closes_terminal_orchestration_left_open(tmp_path, monkeypatch
 
     with patch("osw.cli.orchestration_worker_release", release), \
          patch("osw.cli.orchestration_worker_stop", stop), \
-         patch("osw.cli.terminal_list", terminals), \
-         patch("osw.cli.terminal_close", close):
+         patch("osw.reclaim.terminal_list", terminals), \
+         patch("osw.reclaim.terminal_close", close):
         result = runner.invoke(app, ["del", "misc_001", "--close"])
 
     assert result.exit_code == 0, result.output
@@ -4120,9 +4121,9 @@ def test_del_close_matches_leftover_terminal_by_handle_without_pane(tmp_path, mo
     close = AsyncMock(return_value={})
 
     with patch("osw.cli.orchestration_worker_release", AsyncMock(return_value={})), \
-         patch("osw.cli.terminal_list", AsyncMock(return_value=[
+         patch("osw.reclaim.terminal_list", AsyncMock(return_value=[
              {"handle": "term-cur", "tabId": "tab", "leafId": "w"}])), \
-         patch("osw.cli.terminal_close", close):
+         patch("osw.reclaim.terminal_close", close):
         result = runner.invoke(app, ["del", "misc_001", "--close"])
 
     assert result.exit_code == 0, result.output
@@ -4136,8 +4137,8 @@ def test_del_close_leftover_check_failure_still_removes_agent(tmp_path, monkeypa
     close = AsyncMock(return_value={})
 
     with patch("osw.cli.orchestration_worker_release", AsyncMock(return_value={})), \
-         patch("osw.cli.terminal_list", AsyncMock(side_effect=OrcaError("down", 1))), \
-         patch("osw.cli.terminal_close", close):
+         patch("osw.reclaim.terminal_list", AsyncMock(side_effect=OrcaError("down", 1))), \
+         patch("osw.reclaim.terminal_close", close):
         result = runner.invoke(app, ["del", "misc_001", "--close"])
 
     assert result.exit_code == 0, result.output
@@ -4151,11 +4152,189 @@ def test_del_close_leftover_close_failure_warns(tmp_path, monkeypatch):
     state_mod.write_agent(tmp_path, _supervised_record("done"))
 
     with patch("osw.cli.orchestration_worker_release", AsyncMock(return_value={})), \
-         patch("osw.cli.terminal_list", AsyncMock(return_value=[
+         patch("osw.reclaim.terminal_list", AsyncMock(return_value=[
              {"handle": "term-cur", "tabId": "tab", "leafId": "w"}])), \
-         patch("osw.cli.terminal_close", AsyncMock(side_effect=OrcaError("busy", 1))):
+         patch("osw.reclaim.terminal_close", AsyncMock(side_effect=OrcaError("busy", 1))):
         result = runner.invoke(app, ["del", "misc_001", "--close"])
 
     assert result.exit_code == 0
     assert "Warning: failed to close terminal: busy" in result.output
     assert state_mod.list_agents(tmp_path) == {}
+
+
+# ---------------------------------------------------------------------------
+# sweep: reclaim the panes of finished agents (terminal leak, 2026-11-17)
+# ---------------------------------------------------------------------------
+
+def _settled_record(agent_id: str, **extra) -> dict:
+    record = {
+        "agent_id": agent_id, "terminal": f"term-{agent_id}",
+        "pane_key": f"tab:{agent_id}", "state": "done", "origin": "new",
+    }
+    record.update(extra)
+    return record
+
+
+def _listed(*agent_ids: str) -> list[dict]:
+    return [
+        {"handle": f"term-{a}", "tabId": "tab", "leafId": a} for a in agent_ids
+    ]
+
+
+def test_sweep_closes_finished_panes_and_keeps_the_records(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    state_mod.write_agent(tmp_path, _settled_record("misc_001"))
+    state_mod.write_agent(tmp_path, _settled_record("misc_002"))
+    close = AsyncMock(return_value={})
+
+    with patch("osw.reclaim.terminal_list",
+               AsyncMock(return_value=_listed("misc_001", "misc_002"))), \
+         patch("osw.reclaim.terminal_close", close):
+        result = runner.invoke(app, ["sweep"])
+
+    assert result.exit_code == 0, result.output
+    assert close.await_count == 2
+    assert set(state_mod.list_agents(tmp_path)) == {"misc_001", "misc_002"}
+    record = state_mod.read_agent(tmp_path, "misc_001")
+    assert record["pane_reclaim"] == "sweep"
+    assert "Closed 2 panes" in result.output
+
+
+def test_sweep_keeps_a_running_agent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    state_mod.write_agent(
+        tmp_path, _settled_record("misc_001", state="working", watcher_pid=4242),
+    )
+    close = AsyncMock(return_value={})
+
+    with patch("osw.cli.pid_is_running", return_value=True), \
+         patch("osw.reclaim.terminal_list",
+               AsyncMock(return_value=_listed("misc_001"))), \
+         patch("osw.reclaim.terminal_close", close):
+        result = runner.invoke(app, ["sweep", "--json"])
+
+    assert result.exit_code == 0, result.output
+    close.assert_not_awaited()
+    payload = json.loads(result.output)
+    assert payload["closed"] == []
+    assert payload["kept"] == [
+        {"agent_id": "misc_001", "reason": "watcher_running"}]
+
+
+def test_sweep_never_touches_an_adopted_pane(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    state_mod.write_agent(tmp_path, _settled_record("misc_001", origin="use"))
+    close = AsyncMock(return_value={})
+
+    with patch("osw.reclaim.terminal_list",
+               AsyncMock(return_value=_listed("misc_001"))), \
+         patch("osw.reclaim.terminal_close", close):
+        result = runner.invoke(app, ["sweep", "--json"])
+
+    assert result.exit_code == 0, result.output
+    close.assert_not_awaited()
+    assert json.loads(result.output)["kept"] == [
+        {"agent_id": "misc_001", "reason": "adopted_pane"}]
+
+
+def test_sweep_force_reclaims_a_failed_turn(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    state_mod.write_agent(tmp_path, _settled_record("misc_001", state="error"))
+    close = AsyncMock(return_value={})
+
+    with patch("osw.reclaim.terminal_list",
+               AsyncMock(return_value=_listed("misc_001"))), \
+         patch("osw.reclaim.terminal_close", close):
+        result = runner.invoke(app, ["sweep"])
+
+    assert result.exit_code == 0, result.output
+    close.assert_not_awaited()
+    assert "(not_clean)" in result.output
+
+    with patch("osw.reclaim.terminal_list",
+               AsyncMock(return_value=_listed("misc_001"))), \
+         patch("osw.reclaim.terminal_close", close):
+        result = runner.invoke(app, ["sweep", "--force"])
+
+    assert result.exit_code == 0, result.output
+    close.assert_awaited_once_with("term-misc_001", host=LOCAL)
+
+
+def test_sweep_reports_a_pane_already_gone_as_kept(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    state_mod.write_agent(tmp_path, _settled_record("misc_001"))
+
+    with patch("osw.reclaim.terminal_list", AsyncMock(return_value=[])):
+        result = runner.invoke(app, ["sweep", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["kept"] == [
+        {"agent_id": "misc_001", "reason": "pane_gone"}]
+
+
+def test_sweep_survives_one_host_failing_to_list(tmp_path, monkeypatch):
+    """A dead host must not hide the panes of the others."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    state_mod.write_agent(tmp_path, _settled_record("misc_001"))
+    close = AsyncMock(return_value={})
+
+    with patch("osw.reclaim.terminal_list",
+               AsyncMock(side_effect=OrcaError("down", 1))), \
+         patch("osw.reclaim.terminal_close", close):
+        result = runner.invoke(app, ["sweep", "--json"])
+
+    assert result.exit_code == 0, result.output
+    close.assert_not_awaited()
+    payload = json.loads(result.output)
+    assert payload["kept"] == [
+        {"agent_id": "misc_001", "reason": "list_failed", "detail": "down"}]
+
+
+def test_sweep_warns_when_a_close_fails(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    state_mod.write_agent(tmp_path, _settled_record("misc_001"))
+
+    with patch("osw.reclaim.terminal_list",
+               AsyncMock(return_value=_listed("misc_001"))), \
+         patch("osw.reclaim.terminal_close",
+               AsyncMock(side_effect=OrcaError("busy", 1))):
+        result = runner.invoke(app, ["sweep"])
+
+    assert result.exit_code == 0, result.output
+    assert "(close_failed: busy)" in result.output
+    assert "Closed 0 panes" in result.output
+    assert "pane_reclaim" not in state_mod.read_agent(tmp_path, "misc_001")
+
+
+def test_use_names_revive_when_a_finished_agents_pane_is_gone(tmp_path, monkeypatch):
+    """The watcher closes a finished agent's pane, so `use` on that record
+    finds no terminal: the error has to point at `revive`."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "code_001",
+        "terminal": "term-gone",
+        "pane_key": "tab:leaf",
+        "worktree_path": str(tmp_path),
+        "state": "done",
+        "origin": "new",
+        "prompt": "old task",
+    })
+    spawn = Mock(return_value=9876)
+
+    with patch("osw.cli.terminal_show",
+               AsyncMock(side_effect=OrcaError("no such terminal", 1))), \
+         patch("osw.cli._spawn_watcher", spawn):
+        result = runner.invoke(app, ["use", "code_001", "--no-notify", "again"])
+
+    assert result.exit_code == 1
+    assert "Error: no such terminal" in result.output
+    assert "osw revive code_001" in result.output
+    spawn.assert_not_called()

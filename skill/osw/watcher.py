@@ -109,7 +109,7 @@ from osw.ready_gate import (
     normalized_hash,
     sanitize_frame,
 )
-from osw import blockers
+from osw import blockers, reclaim
 from osw.jev import (
     HOLD_BUDGET_MS,
     HOLD_FALSE_HOLD_CAP_MS,
@@ -588,7 +588,7 @@ def _write_spool_envelope(root: Path, envelope: dict) -> str:
 def format_completion_report(
     agent_id: str, terminal: str, report_file: str,
     handoff_file: str = "", summary: str = "", outcome: str = "",
-    warning: str = "",
+    warning: str = "", cleanup: str = "",
 ) -> str:
     """Single-line completion notification sent to the caller terminal.
 
@@ -607,6 +607,10 @@ def format_completion_report(
         message += f" handoff={handoff_file}"
     if summary:
         message += f" summary={one_line(summary, 160)}"
+    if cleanup:
+        # Not an action: `sweep` is the supervisor's, and this turn's pane
+        # is reclaimable. `skill/SKILL.md` makes it a required step.
+        message += f" cleanup={cleanup}"
     return message
 
 
@@ -3241,12 +3245,17 @@ class Watcher:
                 f" report={report_path}"
             )
         else:
+            reclaimable = reclaim.decision(
+                {**self.agent, "state": final_state},
+                human_turn=following or resuming,
+            )[0]
             line = format_completion_report(
                 self.agent_id, self.handle, str(report_path),
                 handoff_file=self.agent.get("handoff_path") or "",
                 summary=last_msg,
                 outcome=str(self.agent.get("orchestration_outcome") or ""),
                 warning=warning,
+                cleanup="sweep" if reclaimable else "",
             )
         if self._mailbox_running():
             # §14: the spool report above is this turn's conclusion and the
@@ -3266,7 +3275,6 @@ class Watcher:
         )
         log.info("watcher(%s): finished  state=%s source=%s",
                  self.agent_id, final_state, source)
-
 
 def _handoff_ok(path: Path) -> bool:
     try:

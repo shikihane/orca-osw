@@ -29,6 +29,7 @@ from osw.log import (
 )
 from osw import hosts as host_seam
 from osw import fanout as fanout_mod
+from osw import reclaim
 from osw.hosts import Host, HostError
 from osw.orca_cli import (
     OrcaError,
@@ -724,22 +725,15 @@ async def _close_if_still_open(
     """Close the agent's terminal if it is still listed; True if closed.
 
     Matched by pane identity first (handles go stale), then by handle.
-    A listing failure means unknown, so nothing is closed.
+    A listing failure means unknown, so nothing is closed; a close
+    failure propagates, so the caller can warn about it.
     """
     host = host or host_seam.local_host()
     try:
-        terminals = await terminal_list(host.worktree_selector(str(root)), host=host)
+        terminals = await reclaim.list_open(root, host)
     except OrcaError:
         return False
-    pane = str(agent.get("pane_key") or agent.get("paneKey") or "")
-    handle = str(agent.get("terminal") or "")
-    terminal = _pane_terminal(terminals, pane) or next(
-        (t for t in terminals if handle and t.get("handle") == handle), None,
-    )
-    if terminal is None:
-        return False
-    await terminal_close(str(terminal["handle"]), host=host)
-    return True
+    return await reclaim.close_if_open(root, agent, host, terminals)
 
 
 async def _close_agent_terminal(
@@ -1662,6 +1656,12 @@ def use(
                 message=exc.message,
             )
             typer.echo(f"Error: {exc.message}")
+            if existing_agent:
+                typer.echo(
+                    f"Hint: '{target}' has no open pane (a finished agent's "
+                    f"pane is reclaimed); resume its session with: "
+                    f"osw revive {target}"
+                )
             raise typer.Exit(1)
         emit_event(
             logs_dir(root),
@@ -2302,7 +2302,7 @@ async def _confirm_empty_shell(
     mode = resolve_mode(root)
     if mode == "off":
         return "", "", "jev_off"
-    terminal = _pane_terminal(terminals, pane_key)
+    terminal = reclaim.pane_terminal(terminals, pane_key)
     if terminal is None:
         return "", "", "pane_gone"
     if terminal.get("agentIdentity"):
@@ -2338,17 +2338,6 @@ async def _confirm_empty_shell(
     return handle, line, ""
 
 
-def _pane_terminal(terminals: list[dict], pane_key: str) -> dict | None:
-    """The listed terminal currently occupying `pane_key`, if any."""
-    if not pane_key:
-        return None
-    return next(
-        (t for t in terminals
-         if f"{t.get('tabId')}:{t.get('leafId')}" == pane_key and t.get("handle")),
-        None,
-    )
-
-
 def _pane_agent(terminals: list[dict], agent: dict) -> str:
     """Agent identity Orca reports running in the record's pane, or "".
 
@@ -2356,7 +2345,7 @@ def _pane_agent(terminals: list[dict], agent: dict) -> str:
     resuming that session again would run it twice.
     """
     pane = str(agent.get("pane_key") or agent.get("paneKey") or "")
-    terminal = _pane_terminal(terminals, pane)
+    terminal = reclaim.pane_terminal(terminals, pane)
     return str((terminal or {}).get("agentIdentity") or "")
 
 
@@ -2811,6 +2800,126 @@ def del_(
         agent_id=agent_id,
         terminal=agent.get("terminal", ""),
         data={"host": host.name},
+    )
+
+
+@app.command()
+def sweep(
+    force: bool = typer.Option(
+        False, "--force",
+        help="Also reclaim panes kept for a failed turn (error/lost)",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
+) -> None:
+    """Close the terminals of finished agents; records and sessions stay.
+
+    A finished agent's pane holds nothing its record does not: `revive`
+    resumes the provider session in a fresh one. `use`/`enroll` panes and
+    supervised dispatch terminals are never touched (see `reclaim`).
+    """
+    root = resolve_project_root()
+    enable_file_logging(logs_dir(root))
+    _read_state_or_exit(root)
+
+    closed: list[dict] = []
+    kept: list[dict] = []
+    terminals_by_host: dict[str, list[dict] | None] = {}
+    list_error = ""
+    for agent_id, record in sorted(list_agents(root).items()):
+        agent = _mark_lost_if_orphaned(root, record)
+        pid = int(agent.get("watcher_pid") or 0)
+        if pid and pid_is_running(pid):
+            # A live watcher is the only writer of its record and may still
+            # be finishing its turn: never pull the pane out from under it.
+            kept.append({"agent_id": agent_id, "reason": "watcher_running"})
+            continue
+        allowed, reason = reclaim.decision(agent, force=force)
+        if not allowed:
+            kept.append({"agent_id": agent_id, "reason": reason})
+            continue
+        try:
+            host = host_seam.host_for_agent(root, agent)
+        except HostError as exc:
+            kept.append({"agent_id": agent_id, "reason": exc.code})
+            continue
+        name = _row_host(agent)
+        if name not in terminals_by_host:
+            try:
+                terminals_by_host[name] = _run_async(
+                    reclaim.list_open, root, host,
+                )
+            except OrcaError as exc:
+                # One unreadable host never hides the others.
+                list_error = exc.message
+                terminals_by_host[name] = None
+                emit_event(
+                    logs_dir(root),
+                    component="cli",
+                    event="terminal_list_failed",
+                    level="ERROR",
+                    agent_id=agent_id,
+                    message=exc.message,
+                    data={"host": name},
+                )
+        terminals = terminals_by_host[name]
+        if terminals is None:
+            kept.append({
+                "agent_id": agent_id, "reason": "list_failed",
+                "detail": list_error,
+            })
+            continue
+        try:
+            was_closed = _run_async(
+                reclaim.close_if_open, root, agent, host, terminals,
+            )
+        except OrcaError as exc:
+            kept.append({
+                "agent_id": agent_id, "reason": "close_failed",
+                "detail": exc.message,
+            })
+            emit_event(
+                logs_dir(root),
+                component="cli",
+                event="pane_reclaim_failed",
+                level="WARNING",
+                agent_id=agent_id,
+                terminal=agent.get("terminal", ""),
+                message=exc.message,
+                data={"host": name},
+            )
+            continue
+        if not was_closed:
+            kept.append({"agent_id": agent_id, "reason": "pane_gone"})
+            continue
+        write_agent(root, {
+            **agent,
+            "pane_reclaim": "sweep",
+            "pane_reclaimed_at": now_iso(),
+        })
+        closed.append({"agent_id": agent_id, "terminal": agent.get("terminal", "")})
+        emit_event(
+            logs_dir(root),
+            component="cli",
+            event="pane_reclaimed",
+            agent_id=agent_id,
+            terminal=agent.get("terminal", ""),
+            data={"host": name, "by": "sweep"},
+        )
+
+    payload = {"closed": closed, "kept": kept}
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    for entry in closed:
+        typer.echo(f"closed {entry['agent_id']} {entry['terminal']}")
+    for entry in kept:
+        detail = entry.get("detail") or ""
+        suffix = f": {detail}" if detail else ""
+        typer.echo(f"kept   {entry['agent_id']} ({entry['reason']}{suffix})")
+    typer.echo(
+        f"Closed {len(closed)} panes, kept {len(kept)}. "
+        f"Records stay: resume one with `osw revive <agent_id>`."
     )
 
 

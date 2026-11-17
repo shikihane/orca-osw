@@ -6232,3 +6232,66 @@ async def test_live_mailbox_lock_keeps_blocked_notice(tmp_path, spool_writes):
     assert [env["kind"] for env in spool_writes] == ["blocked"]
     notify.assert_awaited_once()
     assert notify.await_args.args[0].startswith("# [osw] blocked")
+
+
+
+# --- panes are never closed behind a running watcher ---------------------
+
+@pytest.mark.anyio
+async def test_finalize_never_closes_the_pane_itself(tmp_path, spool_writes):
+    """Cleanup is the supervisor's (`osw sweep`), not the watcher's: a
+    finished turn leaves its pane exactly as it is."""
+    _spool_agent(tmp_path, origin="new", pane_key="tab-a:leaf-b")
+    watcher = Watcher(tmp_path, "agent_001")
+    close = AsyncMock(return_value={})
+
+    with patch("osw.reclaim.terminal_list",
+               AsyncMock(return_value=[
+                   {"handle": "term-a", "tabId": "tab-a", "leafId": "leaf-b"}])), \
+         patch("osw.reclaim.terminal_close", close):
+        await watcher._finalize("done", "ps_done")
+
+    close.assert_not_awaited()
+    record = state.read_agent(tmp_path, "agent_001")
+    assert "pane_reclaim" not in record
+    assert "pane_reclaimed_at" not in record
+
+
+def test_completion_report_flags_a_reclaimable_pane():
+    line = format_completion_report(
+        "agent_001", "term-a", "report.json", cleanup="sweep",
+    )
+    assert line.endswith(" cleanup=sweep")
+    assert "\n" not in line
+
+
+@pytest.mark.anyio
+async def test_finalize_flags_the_pane_for_the_supervisor(tmp_path, spool_writes):
+    """The watcher never closes a pane; it tells the supervisor that this
+    one is reclaimable, and the skill makes sweeping it mandatory."""
+    _spool_agent(tmp_path, origin="new", pane_key="tab-a:leaf-b")
+    watcher = Watcher(tmp_path, "agent_001")
+    sent: list[str] = []
+
+    async def fake_notify(self, message):
+        sent.append(message)
+
+    with patch.object(Watcher, "_notify", fake_notify):
+        await watcher._finalize("done", "ps_done")
+
+    assert sent and "cleanup=sweep" in sent[0]
+
+
+@pytest.mark.anyio
+async def test_finalize_does_not_flag_an_adopted_pane(tmp_path, spool_writes):
+    _spool_agent(tmp_path, origin="use", pane_key="tab-a:leaf-b")
+    watcher = Watcher(tmp_path, "agent_001")
+    sent: list[str] = []
+
+    async def fake_notify(self, message):
+        sent.append(message)
+
+    with patch.object(Watcher, "_notify", fake_notify):
+        await watcher._finalize("done", "ps_done")
+
+    assert sent and "cleanup=" not in sent[0]
