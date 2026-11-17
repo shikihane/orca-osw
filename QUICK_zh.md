@@ -110,6 +110,15 @@ python /path/to/orca-osw/skill/osw.py del agent_001          # 仅从管理中�
 python /path/to/orca-osw/skill/osw.py del agent_001 --close  # 同时关闭终端
 ```
 
+关掉已完成 worker 的终端不是可选项。OSW 自己从不关 pane：一轮完成的通知行末尾
+带 `cleanup=sweep`，你在报告任务完成之前跑 `sweep`。记录保留，所以
+`revive agent_001` 随时能在新终端里恢复会话。
+
+```bash
+python /path/to/orca-osw/skill/osw.py sweep           # 只处理已完成的 agent
+python /path/to/orca-osw/skill/osw.py sweep --force   # 连失败的一轮也处理
+```
+
 ## 11. 状态与模型发现
 
 项目状态刻意保持很小：

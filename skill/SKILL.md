@@ -23,6 +23,13 @@ directory containing this file.
 6. Accept results only after checking the handoff and actual workspace state.
 7. When the mailbox is running, route through it rather than dispatching
    inline: `mailbox wait` for cards, `mailbox decide` for the decision.
+8. **MANDATORY — reclaim the terminals before you report done.** Every task
+   turn whose completion line carries `cleanup=sweep` left a finished agent's
+   pane open; close it with `python <skill-dir>/osw.py sweep`. A finished
+   agent's terminal is never left open at the end of your task or batch, and
+   an idle fleet of finished agents is a defect, not tidiness: panes pile up
+   until the Orca UI crawls. OSW never closes a pane on its own, so this step
+   is yours and skipping it is a failed task.
 
 For multiple workers, dependencies, shared-worktree coordination, or model
 selection, read [references/orchestration.md](references/orchestration.md)
@@ -85,6 +92,22 @@ python <skill-dir>/osw.py stop <agent-id>
   rest of the turn.
 - `stop` interrupts the current turn; it ends as `error` with
   `completion_source: interrupted` and no handoff.
+
+Close the terminals finished agents leave behind — your job, every time:
+
+```text
+python <skill-dir>/osw.py sweep [--force] [--json]
+```
+
+OSW does not close panes by itself. The watcher only reports: a completion
+line of a `done` turn OSW launched carries `cleanup=sweep`, which means that
+pane is reclaimable. Run `sweep` after collecting the handoff; it closes the
+panes of `done` agents (`--force` adds `error`/`lost`) and prints what it
+kept and why. Records and `session_id` stay, so `revive <agent-id>` resumes
+the session in a fresh pane later. Never reclaimed: adopted panes
+(`use`/`enroll`), supervised dispatch terminals (Orca owns them;
+`del <id> --close` releases the worker first), and human-reopened turns
+(`guard`/`revive`).
 
 `list`/`status` show a mid-task agent whose watcher died as `lost`.
 
@@ -273,3 +296,9 @@ Notifications to expect besides `task-finished` / `task-error`:
   clearing the inherited `ORCA_*` environment variables.
 - Use provider autonomy flags only in a trusted, externally controlled
   worktree.
+- **Never leave a finished agent holding a terminal.** Run
+  `osw sweep` (or `osw del <id> --close` for a record you will never revive)
+  before you report a task or batch complete, and whenever `list` shows a
+  settled agent you are done with. Keep the record — `revive` needs it — and
+  close only panes OSW created; `sweep` decides that for you and prints why
+  it kept what it kept. This rule has no exceptions and no opt-out.

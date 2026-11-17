@@ -61,6 +61,7 @@ python skill/osw.py status
 | `revive [<agent_id> [--session <id>]]` | 列出可恢复的 agent，或在新终端中恢复某个 agent 的 provider 会话 |
 | `stop <agent_id>` | 中断 agent 当前这一轮 |
 | `del <agent_id> [--close]` | 移除 agent |
+| `sweep [--force] [--json]` | 关闭已完成 agent 的终端；记录与会话保留 |
 | `list [--all] [--json]` | 列出受管 agent |
 | `logs [--agent <agent_id>] [--tail N]` | 查看 OSW 日志和事件 |
 | `status [--all]` | 显示 OSW 状态和 agent 统计 |
@@ -91,6 +92,7 @@ python skill/osw.py status
 - OSW 默认添加 provider 的非阻塞/批准类启动参数：`claude --dangerously-skip-permissions`、`codex --dangerously-bypass-approvals-and-sandbox`、`pi --approve`、`omp --auto-approve`、`kimi --yolo`、`grok --always-approve --trust`。
 - `new` 和 `use` 支持 `--caller-terminal <句柄>`，指定接收完成报告的父终端。在 Orca 对话（结构化 agent 会话，没有终端句柄）里运行时，调用方取自注入的 `ORCA_AGENT_SESSION_ID`，记为 `caller_session: orca_session_id:<id>`；watcher 通过 `orca orchestration send` 投递，Orca 会把它作为用户轮注入该对话。
 - `del --close` 同时让 Orca 关闭终端。
+- **关闭已完成的终端是 supervisor 的强制职责。** OSW 不自己关 pane：一轮完成的通知行末尾带 `cleanup=sweep`，你在报告任务完成之前用 `osw sweep` 把它关掉。记录和 `session_id` 保留，之后 `revive <agent_id>` 可在新终端恢复该会话。刻意保留的 pane：接管的（`use`/`enroll`）、supervised 派发终端（归 Orca 管，用 `del <id> --close` 释放）、失败的一轮（`error`/`lost`，直到 `sweep --force`）、人工重开的一轮（`guard`/`revive`），以及 watcher 仍在运行的记录。
 - `list --json` 输出原始 JSON。
 
 ## Orca 兼容性

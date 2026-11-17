@@ -64,6 +64,7 @@ python skill/osw.py status
 | `revive [<agent_id> [--session <id>]]` | List resumable agents, or reopen one agent's provider session in a new terminal |
 | `stop <agent_id>` | Interrupt an agent's current turn |
 | `del <agent_id> [--close]` | Remove an agent from management |
+| `sweep [--force] [--json]` | Close the terminals of finished agents; records and sessions stay |
 | `list [--all] [--json]` | List managed agents |
 | `logs [--agent <agent_id>] [--tail N]` | Show OSW logs and events |
 | `status [--all]` | Show OSW state and agent counts |
@@ -94,6 +95,7 @@ python skill/osw.py status
 - OSW adds the provider's non-blocking autonomy flag by default: `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`, `pi --approve`, `omp --auto-approve`, `kimi --yolo`, or `grok --always-approve --trust`.
 - `new` and `use` accept `--caller-terminal <handle>` to receive completion reports on a parent terminal. Run from an Orca chat (a structured agent session, which has no terminal handle), the caller is the injected `ORCA_AGENT_SESSION_ID`, recorded as `caller_session: orca_session_id:<id>`; the watcher delivers through `orca orchestration send`, which Orca injects into that chat as a user turn.
 - `del --close` also asks Orca to close the terminal.
+- **Closing finished terminals is the supervisor's duty, and it is mandatory.** OSW never closes a pane by itself: a completed turn's notification ends with `cleanup=sweep`, and you close it with `osw sweep` before reporting the task done. Records and `session_id` stay, so `revive <agent_id>` resumes the session in a fresh terminal. Panes kept on purpose: adopted ones (`use`/`enroll`), supervised dispatch terminals (Orca owns them; `del <id> --close` releases them), failed turns (`error`/`lost`, until `sweep --force`), human-reopened turns (`guard`/`revive`), and records whose watcher is still alive.
 - `list --json` outputs raw JSON.
 
 ## Orca Compatibility

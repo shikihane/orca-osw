@@ -110,6 +110,16 @@ python /path/to/orca-osw/skill/osw.py del agent_001          # remove from manag
 python /path/to/orca-osw/skill/osw.py del agent_001 --close  # also close the terminal
 ```
 
+Closing a finished worker's terminal is not optional. OSW never closes a pane
+by itself: a completed turn's notification ends with `cleanup=sweep`, and you
+run `sweep` before reporting the task done. Records stay, so `revive agent_001`
+brings the session back in a fresh terminal.
+
+```bash
+python /path/to/orca-osw/skill/osw.py sweep           # finished agents only
+python /path/to/orca-osw/skill/osw.py sweep --force   # also failed turns
+```
+
 ## 11. State and model discovery
 
 Project state is intentionally small:

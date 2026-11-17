@@ -372,11 +372,41 @@ dispatch explicitly opted out with `--no-notify`.
 
 ```text
 python <skill-dir>/osw.py stop <agent-id>
+python <skill-dir>/osw.py sweep [--force] [--json]
 python <skill-dir>/osw.py del <agent-id> [--close]
 ```
 
 Use `stop` to interrupt a worker's current turn (see Takeover and Recovery).
 `del` removes the management record; `--close` also closes the Orca terminal.
+
+**`sweep` is mandatory, not optional.** OSW never closes a pane by itself: the
+watcher finishes a turn, writes the report and notifies, and leaves the
+terminal exactly where Orca put it. A completion line for a `done` turn OSW
+launched ends with `cleanup=sweep` — that is the flag that this pane is
+reclaimable. Close it before reporting the task or batch complete:
+
+```text
+python <skill-dir>/osw.py sweep           # every pane of a done agent
+python <skill-dir>/osw.py sweep --force   # also error/lost turns
+```
+
+`sweep` closes panes, never records: the record keeps `session_id`, so
+`revive <agent-id>` reopens the session in a fresh terminal. Its policy:
+
+| record | pane | why |
+|---|---|---|
+| `origin: new`, `done` | closed | OSW opened it for a turn that is over |
+| `origin: new`, `error`/`lost` | kept | the failed turn stays inspectable; `--force` overrides |
+| `origin: use`/`enroll` | kept | a human opened that pane, OSW only adopted it |
+| `launch_mode: supervised` | kept | Orca owns a dispatch terminal; `del <id> --close` releases the worker first |
+| `follow_turn`/`resume_turn`, `guard`/`revive` | kept | a human just reopened that pane |
+| live watcher (`watcher_running`) | kept | never pull a pane out from under a running turn |
+
+Each record's outcome is printed as `closed <id> <handle>` or
+`kept <id> (<reason>)`; `--json` gives
+`{"closed": [...], "kept": [{"agent_id", "reason", "detail"?}]}`. An agent
+that finished and still holds a pane is the leak this command exists for, so
+run it rather than tolerating the pile.
 
 All terminal messages must be single-line because Windows transport can
 truncate text at newlines. OSW itself only ever types four things into a
