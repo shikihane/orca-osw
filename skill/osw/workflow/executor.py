@@ -105,6 +105,9 @@ JSON_FENCE_RE = re.compile(r"```json[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNOREC
 # in its log rather than refusing and leaving the caller to go find config.
 DEFAULT_PROVIDER = "pi"
 
+#: Seconds between two agent starts in the same tick. See ``_stagger_before_start``.
+DISPATCH_STAGGER_SECONDS = 2.0
+
 
 # ---------------------------------------------------------------------------
 # The dispatch seam
@@ -958,11 +961,30 @@ def _dispatch(
         if step.get("verify_pending"):
             _dispatch_verifier(root, run, step, dispatch, definition, phase, stamp)
         elif step["state"] == PENDING:
+            if dispatch is default_dispatch:
+                _stagger_before_start()
             _dispatch_step(root, run, step, dispatch, definition, phase, stamp)
         else:
             continue
         if run.get("state") in _RUN_TERMINAL:
             return
+
+
+def _stagger_before_start() -> None:
+    """Space agent starts out instead of booting a whole phase at once.
+
+    A provider harness opens shared state at startup (pi's context store is one
+    SQLite file for every session), and several of them booting inside the same
+    second collide with `database is locked` — the harness then dies before its
+    first turn, which is the worst possible moment. Discrete starts cost seconds
+    and remove that collision. ``OSW_WORKFLOW_STAGGER_SECONDS=0`` disables it.
+    """
+    try:
+        seconds = float(os.environ.get("OSW_WORKFLOW_STAGGER_SECONDS", ""))
+    except ValueError:
+        seconds = DISPATCH_STAGGER_SECONDS
+    if seconds > 0:
+        time.sleep(seconds)
 
 
 def _active_phase(

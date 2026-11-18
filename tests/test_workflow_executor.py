@@ -694,3 +694,24 @@ def test_a_failed_draft_stays_visible_until_someone_reads_it(tmp_path):
     assert [job["stem"] for job in jobs] == ["audit"]
     assert jobs[0]["state"] == "failed"
     assert jobs[0]["error"] == "no_items: nothing found"
+
+
+def test_the_stagger_keeps_starts_apart_by_default(monkeypatch):
+    """A harness opening shared state at boot cannot share the second."""
+    slept: list[float] = []
+    monkeypatch.setattr(executor.time, "sleep", slept.append)
+    monkeypatch.delenv("OSW_WORKFLOW_STAGGER_SECONDS", raising=False)
+
+    executor._stagger_before_start()
+
+    assert slept == [executor.DISPATCH_STAGGER_SECONDS]
+
+
+def test_the_stagger_can_be_turned_off(monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr(executor.time, "sleep", slept.append)
+    monkeypatch.setenv("OSW_WORKFLOW_STAGGER_SECONDS", "0")
+
+    executor._stagger_before_start()
+
+    assert slept == []

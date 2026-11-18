@@ -184,7 +184,11 @@ newest run plus any job still drafting), never from panes or that log.
   terminal (its completion notification has nowhere to go otherwise), so the
   scheduler passes `--caller-terminal` when the run was started inside a pane
   and `--no-notify` when it was not: a workflow runs headless from a plain
-  shell or CI without changing what a supervised agent does.
+  shell or CI without changing what a supervised agent does. Starts are spaced
+  by `OSW_WORKFLOW_STAGGER_SECONDS` (default 2, `0` disables): a provider
+  harness opens shared state at boot — pi's context store is one SQLite file
+  for every session — and several booting in the same second collide with
+  `database is locked`, which kills the agent before its first turn.
 - **Guards.** `max_agents` (default 64) refuses rather than truncates; above
   32 agents the run warns; `approval: "human"` refuses to start until the
   operator passes `--yes`. `--dry-run` prints the phases and the agent count

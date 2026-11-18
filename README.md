@@ -485,7 +485,9 @@ read from `workflow status` (the archive) — the newest run plus any job still
 drafting — and a drafting failure stays visible there as
 `planning <slug> ... <code>: <reason>`. A run that hits a refusal records it in
 its own `run.json` as `failed`; nothing is retried, no config is rewritten.
-`/osw workflow "<sentence>"` routes here.
+`/osw workflow "<sentence>"` routes here. Agent starts are staggered by
+`OSW_WORKFLOW_STAGGER_SECONDS` (default 2 s, `0` off): provider harnesses open
+shared state at boot, and several starting in the same second can collide on it.
 
 `plan` writes the definition for you: one ordinary agent drafts
 `.orca/osw/workflows/<name>.json` from the sentence, `defs.py` judges it, and
