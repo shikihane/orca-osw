@@ -965,7 +965,8 @@ def test_new_keeps_env_handle_on_transient_orca_error(tmp_path, monkeypatch):
     assert agent["caller_terminal"] == "term-host"
 
 
-def test_spawn_watcher_hides_detached_process_on_windows(tmp_path):
+def test_spawn_watcher_hides_its_window_rather_than_detaching(tmp_path):
+    """DETACHED_PROCESS next to CREATE_NO_WINDOW opens an empty console window."""
     hidden_flags = 0x100
     startupinfo = object()
     with patch("osw.cli.os.name", "nt"), \
@@ -985,9 +986,9 @@ def test_spawn_watcher_hides_detached_process_on_windows(tmp_path):
     assert kwargs["startupinfo"] is startupinfo
     assert kwargs["creationflags"] & hidden_flags
     detached = getattr(subprocess, "DETACHED_PROCESS", 0)
-    new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     if detached:
-        assert kwargs["creationflags"] & detached
+        assert not kwargs["creationflags"] & detached
+    new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     if new_group:
         assert kwargs["creationflags"] & new_group
 

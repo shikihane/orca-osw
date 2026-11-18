@@ -145,6 +145,10 @@ def author(
         )
     if not request.strip():
         raise defs.WorkflowError("definition_invalid", "empty request")
+    # The drafting agent is one ordinary `new`, which refuses to dispatch in a
+    # project that has never been initialized.
+    if not state.state_file(root).exists():
+        state.init_state_dir(root)
 
     plan = {"prompt": prompt_for(root, wanted, request), "index": 0, "phase": "plan"}
     outcome = dispatch(plan, None, root)

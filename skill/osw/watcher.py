@@ -431,7 +431,7 @@ def _shares_run(a: str, b: str, width: int = 12) -> bool:
     return False
 
 
-def _foreign_done(entry: dict, sent_flat: str) -> bool:
+def _foreign_done(entry: dict, sent_flat: str, also_ours: str = "") -> bool:
     """Whether a fresh "done" belongs to a foreign agent session.
 
     A nested agent launched inside this pane with the pane's inherited
@@ -443,13 +443,20 @@ def _foreign_done(entry: dict, sent_flat: str) -> bool:
     text sharing no 12-char run with our prompt is what proves a
     different session. Anything unreadable fails open to "not foreign";
     the persistence and silence guards still apply on their own.
+
+    `also_ours` is a second prompt this pane legitimately carries. Some
+    providers keep reporting the prompt the pane was launched with, so
+    during the handoff turn ps still shows the task text: judging only
+    the text just sent would call that done foreign and wait forever.
     """
     reported = one_line(str(entry.get("prompt") or ""))
-    if not reported or not sent_flat or not reported.isascii():
+    ours = [text for text in (sent_flat, one_line(also_ours)) if text]
+    if not reported or not ours or not reported.isascii():
         return False
-    if reported == sent_flat or reported.startswith(sent_flat[:32]):
-        return False
-    return not _shares_run(reported, sent_flat)
+    for text in ours:
+        if reported == text or reported.startswith(text[:32]):
+            return False
+    return not any(_shares_run(reported, text) for text in ours)
 
 
 def _paste_payload(text: str) -> str:
@@ -1827,6 +1834,9 @@ class Watcher:
             # attempt 2 cannot prove this send was received.
             handoff_source = await self._run_turn(
                 instruction, phase="handoff", echo_receipt=attempt == 1,
+                # ps keeps reporting the prompt the pane was launched with,
+                # so a done in this turn still carries the task text.
+                also_ours=one_line(self.agent.get("prompt") or ""),
             )
             if handoff_source == "interrupted" or self._stop_requested():
                 if not _handoff_ok(handoff):
@@ -2759,6 +2769,7 @@ class Watcher:
 
     async def _run_turn(
         self, text: str, phase: str, echo_receipt: bool = True,
+        also_ours: str = "",
     ) -> str:
         """Send one prompt and wait for the turn to complete.
 
@@ -2911,6 +2922,7 @@ class Watcher:
         source = await self._wait_turn_done(
             sent_at_ms, baseline_state_started, sent_text=text,
             receipt_hint=echo_receipt and echoed is True,
+            also_ours=also_ours,
         )
         await self._record_session()
         tools = self._note_turn_tools(phase)
@@ -2954,7 +2966,7 @@ class Watcher:
     async def _wait_turn_done(
         self, sent_at_ms: float, baseline_state_started: int = 0,
         sent_text: str = "", receipt_hint: bool = False,
-        absorb_echo: bool = True,
+        absorb_echo: bool = True, also_ours: str = "",
     ) -> str:
         """Wait for the turn that started at `sent_at_ms` to complete.
 
@@ -3080,7 +3092,7 @@ class Watcher:
                     # reporting under this pane must not end our turn,
                     # the done must persist across two polls, and the
                     # pane's output must have gone quiet first.
-                    if _foreign_done(entry, sent_flat):
+                    if _foreign_done(entry, sent_flat, also_ours):
                         if pending_done_started != state_started:
                             pending_done_started = state_started
                             self._event(

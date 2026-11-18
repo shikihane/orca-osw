@@ -780,9 +780,11 @@ def _spawn_watcher(root: Path, agent_id: str) -> int:
         **hidden_subprocess_kwargs(),
     }
     if os.name == "nt":
-        kwargs["creationflags"] = kwargs.get("creationflags", 0) | (
-            getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        # `hidden_subprocess_kwargs()` already asks for CREATE_NO_WINDOW. Adding
+        # DETACHED_PROCESS contradicts it — Windows 11 then opens an empty
+        # terminal window for the child instead of hiding it.
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
         )
     else:
         kwargs["start_new_session"] = True

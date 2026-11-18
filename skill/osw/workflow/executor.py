@@ -242,7 +242,13 @@ def start_run(
 
     A detached scheduler needs the run id before it exists as a process, so the
     caller that spawns it creates the archive first and hands the id over.
+
+    A first run in a fresh checkout has no `state.json` yet, and `new` refuses
+    to dispatch without one. The workflow owns that first step: nobody should
+    have to know `osw init` exists to run a plan.
     """
+    if not state.state_file(root).exists():
+        state.init_state_dir(root)
     run = archive.create_run(
         root, definition,
         policy=policy, verify=verify, max_attempts=max_attempts,
@@ -256,8 +262,7 @@ def _spawn_detached(argv: list[str], root: Path, sink: Any) -> subprocess.Popen:
     """Start a child that outlives this process, with no window of its own."""
     if os.name == "nt":
         flags = (
-            getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         )
         return subprocess.Popen(
@@ -637,7 +642,12 @@ def _join_candidate(root: Path, run: dict, step: dict, stamp: str) -> None:
         return
     state_name = str(record.get("state") or "")
     if state_name not in AGENT_TERMINAL:
-        return  # still working; the watcher is the only writer that decides
+        if not _watcher_gone(record):
+            return  # still working; the watcher is the only writer that decides
+        # Its watcher is dead, so no state change will ever arrive: without
+        # this the step stays `running` for as long as the run exists.
+        _settle_attempt(root, run, step, "lost", "watcher process is gone", stamp)
+        return
     terminal = AGENT_TERMINAL[state_name]
     reason = str(record.get("completion_source") or terminal)
     handoff = str(record.get("handoff_path") or "")
@@ -660,6 +670,16 @@ def _agent_record(root: Path, agent: str) -> dict | None:
     except (OSError, json.JSONDecodeError) as exc:
         log.warning("agent record %s unreadable: %s", agent, exc)
         return None
+
+
+def _watcher_gone(record: Mapping[str, Any]) -> bool:
+    """The record names a watcher process that is no longer running.
+
+    A record still `running` under a dead watcher never settles on its own,
+    so the scheduler must judge the attempt rather than wait for it.
+    """
+    pid = int(record.get("watcher_pid") or 0)
+    return bool(pid) and not state.pid_is_running(pid)
 
 
 def _agent_report(root: Path, record: Mapping[str, Any]) -> dict:
@@ -748,7 +768,9 @@ def _join_verifier(root: Path, run: dict, step: dict, stamp: str) -> None:
         return
     state_name = str(record.get("state") or "")
     if state_name not in AGENT_TERMINAL:
-        return
+        if not _watcher_gone(record):
+            return
+        state_name = "lost"  # a dead watcher can never report a verdict
     reason = ""
     if state_name != "done":
         reason = str(record.get("completion_source") or state_name)

@@ -120,9 +120,11 @@ def _spawn_serve(root: Path) -> int:
         **hidden_subprocess_kwargs(),
     }
     if os.name == "nt":
-        kwargs["creationflags"] = kwargs.get("creationflags", 0) | (
-            getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        # CREATE_NO_WINDOW is already set by `hidden_subprocess_kwargs()`;
+        # DETACHED_PROCESS would contradict it and Windows 11 shows an empty
+        # terminal window for the child.
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
         )
     else:
         kwargs["start_new_session"] = True

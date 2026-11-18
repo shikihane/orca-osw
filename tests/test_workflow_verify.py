@@ -10,12 +10,21 @@ half-written line.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 from osw import state
 from osw.workflow import archive, board, defs, executor
 
 SCAN = {"id": "scan", "mode": "single", "task": "Audit the route table"}
+
+
+def dead_pid() -> int:
+    """A pid that existed and exited: a record it names is truly orphaned."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=60)
+    return proc.pid
 
 
 def install(root: Path, phases: list[dict], *, name: str = "flow",
@@ -193,6 +202,31 @@ def test_an_unreadable_verdict_gets_one_more_verifier_then_waits(tmp_path):
     assert settled["verdict"] == ""
     assert len(fake.agents) == 3
     assert len(settled["verifications"]) == 2
+
+
+def test_a_verifier_whose_watcher_died_is_not_waited_on_forever(tmp_path):
+    definition = install(tmp_path, [SCAN])
+    run = archive.create_run(tmp_path, definition, verify="suspect")
+    fake = Fake(tmp_path)
+
+    warned_step(tmp_path, run["run_id"], fake)
+    assert [plan["kind"] for plan in fake.plans] == ["step", "verify"]
+
+    # The verifier's pane is open but its watcher is gone: no verdict can
+    # ever arrive, so the channel must move on to its one retry.
+    verifier = fake.agents[1]
+    state.write_agent(tmp_path, {
+        "agent_id": verifier,
+        "terminal": f"term_{verifier}",
+        "state": "running",
+        "watcher_pid": dead_pid(),
+    })
+
+    assert executor.tick(tmp_path, run["run_id"], dispatch=fake) == "running"
+    assert [plan["kind"] for plan in fake.plans] == ["step", "verify", "verify"]
+    step = step_of(tmp_path, run["run_id"])
+    assert step["verify_attempts"] == 1
+    assert [entry["terminal"] for entry in step["verifications"]] == ["lost", ""]
 
 
 def test_an_unknown_verdict_word_is_not_a_verdict(tmp_path):

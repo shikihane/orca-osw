@@ -1431,8 +1431,8 @@ async def test_handoff_retry_does_not_reuse_stale_echo_as_receipt(tmp_path):
 
     turns = []
 
-    async def fake_run_turn(self, text, phase, echo_receipt=True):
-        turns.append((phase, echo_receipt))
+    async def fake_run_turn(self, text, phase, echo_receipt=True, also_ours=""):
+        turns.append((phase, echo_receipt, also_ours))
         return "ps_done"  # handoff file never appears -> retry fires
 
     with patch.object(Watcher, "_wait_ready", AsyncMock(return_value="ps_idle")), \
@@ -1440,9 +1440,11 @@ async def test_handoff_retry_does_not_reuse_stale_echo_as_receipt(tmp_path):
         await Watcher(tmp_path, "agent_001").run()
 
     assert turns == [
-        ("task", True),
-        ("handoff", True),
-        ("handoff", False),  # identical resend: stale echo proves nothing
+        ("task", True, ""),
+        # The handoff turn names the task prompt too: a pane that keeps
+        # reporting it must still be able to end the turn.
+        ("handoff", True, "do the task"),
+        ("handoff", False, "do the task"),  # identical resend: stale echo proves nothing
     ]
 
 
@@ -2652,6 +2654,18 @@ def test_foreign_done_helper_rules():
     # CJK or empty ps prompts are never judged
     assert not _foreign_done({"prompt": "任务（实现）"}, "do the task")
     assert not _foreign_done({}, "do the task")
+
+
+def test_foreign_done_accepts_the_prompt_the_pane_was_launched_with():
+    """Some providers keep reporting the launch prompt during the handoff turn."""
+    task = "You are working inside the repository checkout. Review the exception handling."
+    handoff = "Write the handoff document at D:/x/handoffs/agent_001.md"
+    # The pane still reports the task text: ours, so the done is ours.
+    assert not _foreign_done({"prompt": task}, handoff, task)
+    # A third session's text stays foreign even with the task text allowed.
+    assert _foreign_done(
+        {"prompt": "Reply with exactly one word: OK"}, handoff, task,
+    )
 
 
 def test_prompt_truncated_at_helper_rules():

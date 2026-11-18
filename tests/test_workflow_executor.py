@@ -9,6 +9,9 @@ a watcher would. Nothing here starts Orca.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -94,6 +97,23 @@ def finish(
         payload["report_file"] = str(report_path)
     state.write_agent(root, payload)
     return str(payload.get("handoff_path") or "")
+
+
+def dead_pid() -> int:
+    """A pid that existed and exited: a record it names is truly orphaned."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=60)
+    return proc.pid
+
+
+def running(root: Path, agent: str, *, watcher_pid: int) -> None:
+    """The record a watcher leaves while its turn is still open."""
+    state.write_agent(root, {
+        "agent_id": agent,
+        "terminal": f"term_{agent}",
+        "state": "running",
+        "watcher_pid": watcher_pid,
+    })
 
 
 def step_of(root: Path, run_id: str, phase_id: str, index: int = 0) -> dict:
@@ -264,6 +284,37 @@ def test_a_missing_agent_record_is_a_lost_attempt(tmp_path):
     assert step["attempts"][0]["reason"] == "agent record missing"
     assert step["state"] == "running"
     assert len(fake.agents) == 2
+
+
+def test_a_running_agent_whose_watcher_died_is_a_lost_attempt(tmp_path):
+    definition = install(tmp_path, [SCAN])
+    run = start(tmp_path, definition, max_attempts=2)
+    fake = Fake(tmp_path)
+
+    executor.tick(tmp_path, run["run_id"], dispatch=fake)
+    running(tmp_path, fake.agents[0], watcher_pid=dead_pid())
+    assert executor.tick(tmp_path, run["run_id"], dispatch=fake) == "running"
+
+    step = step_of(tmp_path, run["run_id"], "scan")
+    assert step["attempts"][0]["terminal"] == "lost"
+    assert step["attempts"][0]["reason"] == "watcher process is gone"
+    assert step["state"] == "running"
+    assert len(fake.agents) == 2
+
+
+def test_a_running_agent_with_a_live_watcher_is_left_alone(tmp_path):
+    definition = install(tmp_path, [SCAN])
+    run = start(tmp_path, definition, max_attempts=2)
+    fake = Fake(tmp_path)
+
+    executor.tick(tmp_path, run["run_id"], dispatch=fake)
+    running(tmp_path, fake.agents[0], watcher_pid=os.getpid())
+    assert executor.tick(tmp_path, run["run_id"], dispatch=fake) == "running"
+
+    step = step_of(tmp_path, run["run_id"], "scan")
+    assert not step["attempts"][0]["ended_at"]
+    assert step["state"] == "running"
+    assert len(fake.agents) == 1
 
 
 def test_a_done_agent_without_a_handoff_file_does_not_finish_the_step(tmp_path):
@@ -715,3 +766,14 @@ def test_the_stagger_can_be_turned_off(monkeypatch):
     executor._stagger_before_start()
 
     assert slept == []
+
+
+def test_a_first_run_initializes_a_fresh_checkout(tmp_path):
+    """`new` refuses to dispatch without state.json; a run creates it itself."""
+    definition = install(tmp_path, [SCAN])
+    assert not (tmp_path / ".orca" / "osw" / "state.json").exists()
+
+    run = executor.start_run(tmp_path, definition)
+
+    assert run["state"] == "running"
+    assert (tmp_path / ".orca" / "osw" / "state.json").is_file()
