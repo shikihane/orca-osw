@@ -82,6 +82,11 @@ def _slug(text: str) -> str:
     return stem or "plan"
 
 
+def stem_for(request: str, name: str = "") -> str:
+    """The file stem this request will be saved under."""
+    return (name or "").strip() or _slug(request)
+
+
 def definition_path(root: Path, name: str) -> Path:
     """Where a project definition of ``name`` lives."""
     return Path(root) / ".orca" / "osw" / "workflows" / f"{name}.json"
@@ -131,7 +136,7 @@ def author(
     person can fix one line instead of starting over.
     """
     root = Path(root)
-    wanted = (name or _slug(request)).strip()
+    wanted = stem_for(request, name)
     path = definition_path(root, wanted)
     if path.exists():
         raise defs.WorkflowError(

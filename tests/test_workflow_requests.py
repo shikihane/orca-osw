@@ -17,7 +17,7 @@ from typer.testing import CliRunner
 
 from osw.cli import app
 from osw.mailbox import identity
-from osw.workflow import archive, board, defs
+from osw.workflow import archive, board, defs, executor
 
 runner = CliRunner()
 
@@ -376,5 +376,38 @@ def test_help_lists_every_verb():
     result = runner.invoke(app, ["workflow", "--help"])
 
     assert result.exit_code == 0, result.output
-    for verb in ("ls", "show", "status", "run", "stop", "accept", "reject", "retry"):
+    for verb in ("ls", "show", "status", "run", "stop", "accept", "reject", "retry",
+                 "plan", "go"):
         assert verb in result.output
+
+
+# ---------------------------------------------------------------------------
+# go: one call reports a job and returns; drafting happens off to the side
+# ---------------------------------------------------------------------------
+
+def test_go_reports_the_job_and_returns(monkeypatch):
+    seen: dict = {}
+
+    def fake_spawn(root, *, stem, request, policy, verify, max_attempts):
+        seen.update(stem=stem, request=request, policy=policy)
+        return {"pid": 4242, "log": "job.log", "marker": "m", "request_file": "r"}
+
+    monkeypatch.setattr(executor, "spawn_planner", fake_spawn)
+    result = runner.invoke(app, ["workflow", "go", "audit every http route"])
+
+    assert result.exit_code == 0, result.output
+    assert "PLANNING audit-every-http" in result.output
+    assert seen["request"] == "audit every http route"
+
+
+def test_status_reports_a_failed_draft_that_no_run_covers(tmp_path):
+    executor.write_planning(
+        tmp_path, stem="audit", pid=1, request="audit",
+        state_name="failed", error="no_items: nothing to audit",
+    )
+
+    result = runner.invoke(app, ["workflow", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "planning audit" in result.output
+    assert "no_items: nothing to audit" in result.output

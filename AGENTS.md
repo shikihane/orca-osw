@@ -134,11 +134,20 @@ does not have to write it by hand: `osw workflow plan "<one sentence>"` has one
 ordinary agent draft that file, `defs.py` judges it, and `run --dry-run` shows
 the expansion before anything is dispatched. The schema stays closed either
 way, so a bad draft is refused by name, not half-run. `osw workflow go
-"<one sentence>"` is the one-shot entry an agent calls: draft, validate, create
-the run, start the scheduler as a detached process, print the run id and
-return — a run outlives the tool call that asked for it, and its output goes to
-`.orca/osw/runs/<run_id>/scheduler.log`. Progress is read from the archive
-(`workflow status <run> --json`), never from panes or that log.
+"<one sentence>"` is the one-shot entry an agent calls: it writes one job
+marker under `.orca/osw/planning/` and returns in about a second with
+`PLANNING <slug> pid <n>`; a detached worker then drafts, validates, creates
+the run and drives it — a run outlives the tool call that asked for it, and the
+scheduler's own output goes to `.orca/osw/runs/<run_id>/scheduler.log`.
+Progress is read from the archive (`workflow status --json`, which reports the
+newest run plus any job still drafting), never from panes or that log.
+
+- **Refuse where it happens.** A refusal is recorded, never routed around: a
+  drafting failure keeps its job marker with `<code>: <reason>`, and a run that
+  hits one writes it into its own `run.json` as `failed`. Nothing is retried
+  behind the scenes, and nothing edits `config.json` or `AGENTS.md` to make a
+  dispatch go through. A project that configured no provider dispatches with
+  `pi` and says so once on stderr.
 
 - **Shape.** `{name, max_agents?, approval?, phases[]}`; each phase is
   `{id, mode: single|for_each, from?, task, schema?}`. Phases run in declared

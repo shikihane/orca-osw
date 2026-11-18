@@ -349,13 +349,11 @@ def test_an_expansion_over_max_agents_is_refused(tmp_path):
     executor.tick(tmp_path, run["run_id"], dispatch=fake)
     finish(tmp_path, fake.agents[0], text=handoff_json(items=["/a", "/b", "/c"]))
 
-    with pytest.raises(defs.WorkflowError) as caught:
-        executor.tick(tmp_path, run["run_id"], dispatch=fake)
-
-    assert caught.value.code == "too_many_agents"
-    assert "audit" in caught.value.message
-    assert "3" in caught.value.message
-    assert board.read_run(tmp_path, run["run_id"])["state"] == "failed"
+    assert executor.tick(tmp_path, run["run_id"], dispatch=fake) == "failed"
+    saved = board.read_run(tmp_path, run["run_id"])
+    assert saved["error"].startswith("too_many_agents:")
+    assert "audit" in saved["error"]
+    assert "3" in saved["error"]
     assert len(fake.agents) == 1
 
 
@@ -367,12 +365,10 @@ def test_a_handoff_without_the_array_field_is_refused(tmp_path):
     executor.tick(tmp_path, run["run_id"], dispatch=fake)
     finish(tmp_path, fake.agents[0], text=handoff_json(items="not a list"))
 
-    with pytest.raises(defs.WorkflowError) as caught:
-        executor.tick(tmp_path, run["run_id"], dispatch=fake)
-
-    assert caught.value.code == "no_items"
-    assert "audit" in caught.value.message
-    assert "findings" in caught.value.message
+    assert executor.tick(tmp_path, run["run_id"], dispatch=fake) == "failed"
+    saved = board.read_run(tmp_path, run["run_id"])
+    assert saved["error"].startswith("no_items:")
+    assert "findings" in saved["error"]
     assert len(fake.agents) == 1
 
 
@@ -384,11 +380,10 @@ def test_a_handoff_without_a_json_block_is_refused(tmp_path):
     executor.tick(tmp_path, run["run_id"], dispatch=fake)
     finish(tmp_path, fake.agents[0], text="# plain markdown, no block\n")
 
-    with pytest.raises(defs.WorkflowError) as caught:
-        executor.tick(tmp_path, run["run_id"], dispatch=fake)
-
-    assert caught.value.code == "no_items"
-    assert "fenced" in caught.value.message
+    assert executor.tick(tmp_path, run["run_id"], dispatch=fake) == "failed"
+    saved = board.read_run(tmp_path, run["run_id"])
+    assert saved["error"].startswith("no_items:")
+    assert "fenced" in saved["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +469,7 @@ def test_stop_skips_unstarted_steps_and_ends_the_run(tmp_path):
 # The dispatch seam: argv the scheduler actually builds
 # ---------------------------------------------------------------------------
 
-def _record_argv(monkeypatch, tmp_path, definition, *, env):
+def _record_argv(monkeypatch, tmp_path, definition, *, env, provider="pi"):
     seen: list[list[str]] = []
 
     async def fake_run(argv, cwd, **kwargs):
@@ -483,7 +478,10 @@ def _record_argv(monkeypatch, tmp_path, definition, *, env):
             0, "Created code_001 on terminal term_001", "",
         )
 
-    monkeypatch.setenv("OSW_PROVIDER", "pi")
+    if provider:
+        monkeypatch.setenv("OSW_PROVIDER", provider)
+    else:
+        monkeypatch.delenv("OSW_PROVIDER", raising=False)
     if env:
         monkeypatch.setenv("ORCA_TERMINAL_HANDLE", env)
     else:
@@ -511,6 +509,15 @@ def test_a_dispatch_inside_a_pane_names_the_caller(tmp_path, monkeypatch):
     assert "--no-notify" not in argv
 
 
+def test_a_project_without_a_provider_still_dispatches(tmp_path, monkeypatch):
+    """An unconfigured project runs on the default provider instead of refusing."""
+    definition = install(tmp_path, [SCAN])
+
+    argv = _record_argv(monkeypatch, tmp_path, definition, env="", provider="")
+
+    assert "pi" in argv
+
+
 def test_a_producer_output_file_feeds_for_each(tmp_path):
     """The handoff is markdown; structured output goes to the file it names."""
     scan = {**SCAN, "task": "List the routes; write {\"items\": [...]} to {{output}}"}
@@ -533,7 +540,27 @@ def test_a_producer_output_file_feeds_for_each(tmp_path):
     assert "Audit /b" in fake.plans[2]["prompt"]
 
 
-def test_a_missing_output_file_names_the_path(tmp_path):
+def test_a_top_level_array_is_the_item_list(tmp_path):
+    """`["/a", "/b"]` answers "list these" directly; no wrapper object needed."""
+    scan = {**SCAN, "task": "List the routes and write them to {{output}}"}
+    definition = install(tmp_path, [scan, AUDIT])
+    run = start(tmp_path, definition)
+    fake = Fake(tmp_path)
+
+    executor.tick(tmp_path, run["run_id"], dispatch=fake)
+    output = Path(step_of(tmp_path, run["run_id"], "scan")["output"])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text('["/a", "/b"]', encoding="utf-8")
+    finish(tmp_path, fake.agents[0])
+
+    executor.tick(tmp_path, run["run_id"], dispatch=fake)
+
+    assert [plan["phase"] for plan in fake.plans] == ["scan", "audit", "audit"]
+    assert "Audit /b" in fake.plans[2]["prompt"]
+
+
+def test_a_refusal_fails_the_run_and_names_the_path(tmp_path):
+    """A missing producer file ends the run with the reason, not the scheduler."""
     scan = {**SCAN, "task": "List the routes; write them to {{output}}"}
     definition = install(tmp_path, [scan, AUDIT])
     run = start(tmp_path, definition)
@@ -542,12 +569,11 @@ def test_a_missing_output_file_names_the_path(tmp_path):
     executor.tick(tmp_path, run["run_id"], dispatch=fake)
     finish(tmp_path, fake.agents[0])
 
-    with pytest.raises(defs.WorkflowError) as caught:
-        executor.tick(tmp_path, run["run_id"], dispatch=fake)
-
-    assert caught.value.code == "no_items"
-    assert "outputs" in caught.value.message
-    assert "without writing it" in caught.value.message
+    assert executor.tick(tmp_path, run["run_id"], dispatch=fake) == "failed"
+    saved = board.read_run(tmp_path, run["run_id"])
+    assert saved["error"].startswith("no_items:")
+    assert "outputs" in saved["error"]
+    assert "without writing it" in saved["error"]
 
 
 def test_a_stop_request_stops_the_agents_it_dispatched(tmp_path):
@@ -628,9 +654,7 @@ def test_run_run_continues_the_run_it_is_given(tmp_path):
     assert [saved["run_id"] for saved in board.list_runs(tmp_path)] == [seeded["run_id"]]
 
 
-def test_spawn_scheduler_hands_the_run_id_to_the_child(tmp_path, monkeypatch):
-    definition = install(tmp_path, [SCAN])
-    run = executor.start_run(tmp_path, definition)
+def test_go_spawns_one_worker_that_owns_planning_and_scheduling(tmp_path, monkeypatch):
     captured: dict = {}
 
     class Child:
@@ -642,12 +666,31 @@ def test_spawn_scheduler_hands_the_run_id_to_the_child(tmp_path, monkeypatch):
         return Child()
 
     monkeypatch.setattr(executor.subprocess, "Popen", fake_popen)
-    spawned = executor.spawn_scheduler(tmp_path, run, definition, policy="partial")
+    spawned = executor.spawn_planner(
+        tmp_path, stem="audit-routes", request="audit every route", policy="partial",
+    )
 
     argv = captured["argv"]
     assert spawned["pid"] == 4242
-    assert argv[argv.index("--run") + 1] == run["run_id"]
+    assert "go-worker" in argv
+    assert argv[argv.index("--stem") + 1] == "audit-routes"
     assert argv[argv.index("--policy") + 1] == "partial"
-    assert "--json" in argv
-    assert Path(spawned["log"]).name == "scheduler.log"
-    assert Path(captured["log"]).name == "scheduler.log"
+    written = Path(argv[argv.index("--request-file") + 1]).read_text(encoding="utf-8")
+    assert written == "audit every route"
+    assert Path(spawned["log"]).parent.name == "planning"
+    # `status` has to see the job while it is still drafting.
+    assert executor.list_planning(tmp_path)[0]["stem"] == "audit-routes"
+
+
+def test_a_failed_draft_stays_visible_until_someone_reads_it(tmp_path):
+    """A drafting failure keeps its marker: it does not vanish like a success."""
+    executor.write_planning(
+        tmp_path, stem="audit", pid=1, request="audit",
+        state_name="failed", error="no_items: nothing found",
+    )
+
+    jobs = executor.list_planning(tmp_path)
+
+    assert [job["stem"] for job in jobs] == ["audit"]
+    assert jobs[0]["state"] == "failed"
+    assert jobs[0]["error"] == "no_items: nothing found"

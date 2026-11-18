@@ -45,7 +45,8 @@ recovery (`enroll`, `guard`, `revive`, `stop`), diagnosis, or cleanup, read
 Invocation shortcut: an invocation whose text starts with `workflow`
 (for example `/osw workflow "audit every HTTP route for missing auth"`) means
 run `workflow go` with that text as the request, then watch it to the end —
-planning, drafting, validation and start are all inside that one command. A
+planning, drafting, validation and start are all inside that one command, which
+returns at once with a `PLANNING` job instead of blocking for the draft. A
 plain request that names an `osw workflow` or a phased run, in any phrasing,
 means the same thing; the slash form is only the explicit spelling.
 

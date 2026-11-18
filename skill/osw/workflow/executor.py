@@ -100,6 +100,11 @@ VERDICTS = ("confirmed", "refuted", "unsure")
 
 JSON_FENCE_RE = re.compile(r"```json[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
+# A project that never configured a provider still has to be able to run: the
+# batch provider every other OSW path uses here is `pi`. The scheduler says so
+# in its log rather than refusing and leaving the caller to go find config.
+DEFAULT_PROVIDER = "pi"
+
 
 # ---------------------------------------------------------------------------
 # The dispatch seam
@@ -127,7 +132,11 @@ def default_dispatch(plan: Mapping[str, Any], definition: Definition, root: Path
     defaults = fanout.project_defaults(root)
     provider = str(defaults.get("provider") or "").strip()
     if not provider:
-        raise fanout.FanoutError("no provider: " + fanout.PROVIDER_HELP)
+        provider = DEFAULT_PROVIDER
+        print(
+            f"osw workflow: no provider configured; dispatching with {provider!r}",
+            file=sys.stderr, flush=True,
+        )
     prompt = str(plan.get("prompt") or "").strip()
     if not prompt:
         raise fanout.FanoutError("empty prompt; nothing to dispatch")
@@ -240,52 +249,147 @@ def start_run(
     return run
 
 
-def spawn_scheduler(
+def _spawn_detached(argv: list[str], root: Path, sink: Any) -> subprocess.Popen:
+    """Start a child that outlives this process, with no window of its own."""
+    if os.name == "nt":
+        flags = (
+            getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        )
+        return subprocess.Popen(
+            argv, cwd=str(root), stdin=subprocess.DEVNULL,
+            stdout=sink, stderr=subprocess.STDOUT, creationflags=flags,
+        )
+    return subprocess.Popen(
+        argv, cwd=str(root), stdin=subprocess.DEVNULL,
+        stdout=sink, stderr=subprocess.STDOUT, start_new_session=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Planning jobs
+# ---------------------------------------------------------------------------
+
+PLANNING_DIR = "planning"
+PLANNING_STALE_SECONDS = 1800.0
+
+
+def planning_dir(root: Path) -> Path:
+    """Where a drafting job announces itself, beside ``runs/``."""
+    return Path(root) / ".orca" / "osw" / PLANNING_DIR
+
+
+def planning_files(root: Path, stem: str) -> tuple[Path, Path]:
+    folder = planning_dir(root)
+    return folder / f"{stem}.json", folder / f"{stem}.log"
+
+
+def write_planning(
     root: Path,
-    run: Mapping[str, Any],
-    definition: Definition,
     *,
+    stem: str,
+    pid: int,
+    request: str,
+    run_id: str = "",
+    state_name: str = "planning",
+    error: str = "",
+) -> Path:
+    """One marker per drafting job: who is working, and where it landed.
+
+    A failure keeps its marker: the reason stays visible until someone reads it,
+    instead of the job disappearing as if it had never been asked.
+    """
+    marker, _ = planning_files(root, stem)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "stem": stem,
+        "pid": int(pid),
+        "state": state_name,
+        "run_id": run_id,
+        "request": request[:300],
+        "error": error,
+        "at": archive.now_iso(),
+    }
+    marker.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    return marker
+
+
+def clear_planning(root: Path, stem: str) -> None:
+    marker, _ = planning_files(root, stem)
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def list_planning(root: Path) -> list[dict]:
+    """Drafting jobs worth reporting, newest first.
+
+    A marker whose job stopped updating and never recorded a run is stale: it is
+    left off the report rather than shown as live work forever.
+    """
+    folder = planning_dir(root)
+    if not folder.is_dir():
+        return []
+    found: list[dict] = []
+    now = time.time()
+    for marker in folder.glob("*.json"):
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        age = now - marker.stat().st_mtime
+        if payload.get("state") == "planning" and age > PLANNING_STALE_SECONDS:
+            continue
+        payload["age_seconds"] = round(age)
+        found.append(payload)
+    found.sort(key=lambda item: str(item.get("at") or ""), reverse=True)
+    return found
+
+
+def spawn_planner(
+    root: Path,
+    *,
+    stem: str,
+    request: str,
     policy: str = "strict",
     verify: str = "suspect",
     max_attempts: int = 2,
 ) -> dict:
-    """Start this run's scheduler as its own process and return where it writes.
+    """Draft, create and schedule in one detached child, then return at once.
 
-    ``workflow go`` has to survive the shell that started it: the caller is a
-    short-lived tool call, while the run lasts minutes. The child gets the run
-    id explicitly, so it continues exactly that run and no other, and its
-    output goes to the run's own ``scheduler.log`` — the archive stays the only
-    thing anyone reads.
+    Drafting alone can take minutes, and a shell that blocks on it gets promoted
+    into a window of its own. The child owns the whole sequence, so ``go`` is a
+    short call that reports a job and exits; the run it creates is read from the
+    archive like any other.
     """
-    run_dir = archive.run_dir(Path(root), str(run["run_id"]))
-    run_dir.mkdir(parents=True, exist_ok=True)
-    log_path = run_dir / "scheduler.log"
+    root = Path(root)
+    marker, log_path = planning_files(root, stem)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    request_file = marker.with_suffix(".request.txt")
+    request_file.write_text(request, encoding="utf-8")
     argv = [
-        sys.executable, str(fanout.script_path()), "workflow", "run",
-        definition.name,
-        "--run", str(run["run_id"]),
-        "--policy", policy,
-        "--verify", verify,
+        sys.executable, str(fanout.script_path()), "workflow", "go-worker",
+        "--stem", stem, "--request-file", str(request_file),
+        "--policy", policy, "--verify", verify,
         "--max-attempts", str(max_attempts),
-        "--json",
     ]
     with open(log_path, "ab") as sink:
-        if os.name == "nt":
-            flags = (
-                getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-                | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            )
-            child = subprocess.Popen(
-                argv, cwd=str(root), stdin=subprocess.DEVNULL,
-                stdout=sink, stderr=subprocess.STDOUT, creationflags=flags,
-            )
-        else:
-            child = subprocess.Popen(
-                argv, cwd=str(root), stdin=subprocess.DEVNULL,
-                stdout=sink, stderr=subprocess.STDOUT, start_new_session=True,
-            )
-    return {"pid": child.pid, "log": str(log_path)}
+        child = _spawn_detached(argv, root, sink)
+    # The marker goes down immediately: drafting takes minutes and `status` has
+    # to say a job exists before it has a run to point at.
+    write_planning(
+        root, stem=stem, pid=child.pid, request=request, state_name="planning",
+    )
+    return {
+        "pid": child.pid,
+        "log": str(log_path),
+        "marker": str(marker),
+        "request_file": str(request_file),
+    }
 
 
 def _resume_target(root: Path, definition: Definition) -> dict | None:
@@ -346,13 +450,21 @@ def tick(
             archive.write_run(root, run)
         return str(run["state"])
 
-    definition = load_definition(root, run["definition"])
-    _join(root, run, definition, stamp)
-    _judge(root, run, definition, stamp)
-    if run.get("state") not in _RUN_TERMINAL:
-        _dispatch(root, run, definition, dispatch, stamp)
+    try:
+        definition = load_definition(root, run["definition"])
+        _join(root, run, definition, stamp)
         _judge(root, run, definition, stamp)
-    _settle(root, run, stamp)
+        if run.get("state") not in _RUN_TERMINAL:
+            _dispatch(root, run, definition, dispatch, stamp)
+            _judge(root, run, definition, stamp)
+        _settle(root, run, stamp)
+    except WorkflowError as exc:
+        # A refusal is the run's answer, not the scheduler's death: the archive
+        # says `failed` with the code and the message, so `status` shows why and
+        # nothing is retried or guessed behind the scenes.
+        _fail_run(run, stamp, f"{exc.code}: {exc.message}")
+    except Exception as exc:  # noqa: BLE001 - a crash must not leave `running`
+        _fail_run(run, stamp, f"{type(exc).__name__}: {exc}")
     archive.write_run(root, run)
     return str(run["state"])
 
@@ -1198,9 +1310,17 @@ def _items_from(
 def _array_value(
     payload: Any, path: Path, source: Phase, phase: Phase,
 ) -> list[Any]:
-    """Pick the array field the producer's schema names, refusing guesses."""
+    """Pick the array the producer wrote, refusing guesses.
+
+    A top-level array is the most direct answer to "list these", so it is taken
+    as the item list itself; an object still has to name its array field.
+    """
+    if isinstance(payload, list):
+        return list(payload)
     if not isinstance(payload, dict):
-        raise WorkflowError("no_items", f"{path}: expected a JSON object")
+        raise WorkflowError(
+            "no_items", f"{path}: expected a JSON object or an array",
+        )
     field = _array_field(source)
     if field is not None:
         value = payload.get(field)

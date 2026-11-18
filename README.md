@@ -477,13 +477,15 @@ python skill/osw.py workflow accept|reject|retry <run> <step> --reason "..."
 python skill/osw.py workflow stop <run>
 ```
 
-`go` is the one-shot entry an agent calls: it drafts the definition, validates
-it, creates the run and starts the scheduler as its own detached process, then
-prints `STARTED <run_id> ... pid <n>` and exits. A workflow outlives the tool
-call that asked for it, so progress is read from `workflow status <run_id>`
-(the archive) and the scheduler's own output lands in
-`.orca/osw/runs/<run_id>/scheduler.log`. `/osw workflow "<sentence>"` routes
-here.
+`go` is the one-shot entry an agent calls: it writes one job marker under
+`.orca/osw/planning/` and returns at once with `PLANNING <slug> pid <n>`. A
+detached worker then drafts the definition, validates it, creates the run and
+drives it, so a workflow outlives the tool call that asked for it. Progress is
+read from `workflow status` (the archive) — the newest run plus any job still
+drafting — and a drafting failure stays visible there as
+`planning <slug> ... <code>: <reason>`. A run that hits a refusal records it in
+its own `run.json` as `failed`; nothing is retried, no config is rewritten.
+`/osw workflow "<sentence>"` routes here.
 
 `plan` writes the definition for you: one ordinary agent drafts
 `.orca/osw/workflows/<name>.json` from the sentence, `defs.py` judges it, and

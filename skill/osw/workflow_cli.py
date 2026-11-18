@@ -15,6 +15,7 @@ means.
 from __future__ import annotations
 
 import json
+import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -61,15 +62,17 @@ def _echo_json(value: Any) -> None:
     typer.echo(json.dumps(value, ensure_ascii=False, indent=2, default=str))
 
 
-def _latest_or_exit(root: Path, run_id: str | None) -> dict:
-    """The named run, or the newest one when ``status`` was called bare."""
-    if run_id:
-        return board.read_run(root, run_id)
+def _newest(root: Path) -> dict | None:
+    """The newest run, or ``None`` when nothing has been scheduled yet."""
     runs = board.list_runs(root)
-    if not runs:
-        typer.echo("No runs.")
-        raise typer.Exit(1)
-    return runs[0]
+    return runs[0] if runs else None
+
+
+def _planning_line(job: dict) -> str:
+    """One line about a drafting job: what it is, and why it stopped."""
+    where = f"run {job['run_id']}" if job.get("run_id") else str(job.get("state") or "")
+    extra = f"  {job['error']}" if job.get("error") else ""
+    return f"planning {job.get('stem')}  pid {job.get('pid')}  {where}{extra}"
 
 
 # ---------------------------------------------------------------------------
@@ -158,29 +161,45 @@ def status(
     ),
     json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
 ) -> None:
-    """Per-phase progress of one run (default: the newest)."""
+    """Per-phase progress of one run (default: the newest), plus live drafts."""
     root = resolve_project_root()
+    from osw.workflow import executor
+
+    def render() -> None:
+        jobs = executor.list_planning(root)
+        with _errors():
+            run = board.read_run(root, run_id) if run_id else _newest(root)
+        if json_output:
+            if run is None:
+                _echo_json({"planning": jobs})
+                return
+            payload = board.render_status_json(run)
+            payload["planning"] = jobs
+            _echo_json(payload)
+            return
+        if run is None:
+            if not jobs:
+                typer.echo("No runs.")
+                raise typer.Exit(1)
+            for job in jobs:
+                typer.echo(_planning_line(job))
+            return
+        typer.echo(board.render_status(run))
+        for job in jobs:
+            typer.echo(_planning_line(job))
 
     if watch:
         # Deliberately simple: no screen clearing, no diffing. Ctrl-C is the
         # exit path and is a success, not a failure.
         try:
             while True:
-                with _errors():
-                    run = _latest_or_exit(root, run_id)
-                typer.echo(board.render_status(run))
+                render()
                 typer.echo("")
                 time.sleep(POLL_LOCAL_SECONDS)
         except KeyboardInterrupt:
             raise typer.Exit(0)
         return
-
-    with _errors():
-        run = _latest_or_exit(root, run_id)
-    if json_output:
-        _echo_json(board.render_status_json(run))
-        return
-    typer.echo(board.render_status(run))
+    render()
 
 
 @workflow_app.command("plan")
@@ -257,39 +276,93 @@ def go(
 ) -> None:
     """Plan and start a run from one sentence, then return.
 
-    One agent drafts the definition, the validator judges it, the run is
-    created, and its scheduler starts as its own process — a workflow outlives
-    the shell or tool call that asked for it, so this command returns the run id
-    instead of blocking. Progress comes from ``workflow status``; the scheduler
-    writes its own output to the run's ``scheduler.log``.
+    Drafting takes minutes, so ``go`` does not stay for it: one detached child
+    drafts the definition, validates it, creates the run and schedules it, while
+    this command reports the job and exits. A long foreground command would be
+    promoted into a window of its own, and the run has to outlive this call
+    anyway. Progress comes from ``workflow status``; a drafting failure keeps its
+    reason there instead of vanishing.
     """
     root = resolve_project_root()
     from osw.workflow import author, executor
 
     with _errors():
-        path, definition = author.author(root, request, name=name)
+        stem = author.stem_for(request, name)
+        spawned = executor.spawn_planner(
+            root, stem=stem, request=request,
+            policy=policy, verify=verify, max_attempts=max_attempts,
+        )
+    if json_output:
+        _echo_json({"job": stem, **spawned})
+        return
+    typer.echo(f"PLANNING {stem}  pid {spawned['pid']}")
+    typer.echo(f"LOG {spawned['log']}")
+    typer.echo("NEXT python osw.py workflow status")
+
+
+@workflow_app.command("go-worker", hidden=True)
+def go_worker(
+    stem: str = typer.Option(..., "--stem"),
+    request_file: str = typer.Option(..., "--request-file"),
+    policy: str = typer.Option(
+        "strict", "--policy",
+        click_type=click.Choice(POLICIES),
+    ),
+    verify: str = typer.Option(
+        "suspect", "--verify",
+        click_type=click.Choice(VERIFY_MODES),
+    ),
+    max_attempts: int = typer.Option(
+        2, "--max-attempts", min=1, help="Attempts per step before it fails",
+    ),
+) -> None:
+    """Draft, create and schedule one run: the body of a detached ``go``.
+
+    A refusal is recorded on the job marker and the process stops there. It does
+    not retry with another provider, another model, or a hand-written config:
+    failure stays where it happened, with the code that caused it.
+    """
+    root = resolve_project_root()
+    from osw.workflow import author, executor
+
+    request = Path(request_file).read_text(encoding="utf-8")
+    landed = ""
+    try:
+        path, definition = author.author(root, request, name=stem)
         _cap_guard(definition, expand(definition))
         run = executor.start_run(
             root, definition,
             policy=policy, verify=verify, max_attempts=max_attempts,
         )
-        spawned = executor.spawn_scheduler(
-            root, run, definition,
+        landed = str(run["run_id"])
+        executor.write_planning(
+            root, stem=stem, pid=os.getpid(), request=request, run_id=landed,
+        )
+        executor.run_run(
+            root, definition, run_id=landed,
             policy=policy, verify=verify, max_attempts=max_attempts,
         )
-    if json_output:
-        _echo_json({
-            "run_id": run["run_id"],
-            "definition": definition.name,
-            "path": str(path),
-            "pid": spawned["pid"],
-            "log": spawned["log"],
-        })
-        return
-    typer.echo(f"STARTED {run['run_id']}  def {definition.name}  pid {spawned['pid']}")
-    typer.echo(f"DEF {definition.name} {path}")
-    typer.echo(f"LOG {spawned['log']}")
-    typer.echo(f"NEXT python osw.py workflow status {run['run_id']}")
+    except (WorkflowError, MailboxError) as exc:
+        executor.write_planning(
+            root, stem=stem, pid=os.getpid(), request=request,
+            run_id=landed, state_name="failed",
+            error=f"{exc.code}: {exc.message}",
+        )
+        typer.echo(f"Error: {exc.code}: {exc.message}")
+        raise typer.Exit(1)
+    except Exception as exc:  # noqa: BLE001 - the marker must carry the reason
+        executor.write_planning(
+            root, stem=stem, pid=os.getpid(), request=request,
+            run_id=landed, state_name="failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    executor.clear_planning(root, stem)
+    try:
+        Path(request_file).unlink()
+    except OSError:
+        pass
+    typer.echo(f"DONE {stem} run {landed}")
 
 
 @workflow_app.command("run")

@@ -20,17 +20,20 @@ The request: **<the request>**
    Call that directory's `osw.py`.
 2. Start it:
    `python <dir>/osw.py workflow go "<the request>" --name <short-slug>`.
-   One ordinary agent drafts `.orca/osw/workflows/<slug>.json`, the validator
-   judges it, the run is archived and its scheduler starts as its own process.
-   The command prints `STARTED <run_id> ... pid <n>` and returns.
-   A refusal (bad schema, unknown placeholder, `too_many_agents`) means the
-   draft is wrong: read the code it names, fix the draft, run it again. Never
-   bypass the check.
+   This returns in about a second with `PLANNING <slug>  pid <n>`: a detached
+   worker drafts `.orca/osw/workflows/<slug>.json`, the validator judges it,
+   the run is archived, and the scheduler drives it — all after your command
+   exited. Never wait for it in the shell.
+   A refusal (bad schema, unknown placeholder, `too_many_agents`, no items)
+   leaves `planning <slug> ... <code>: <reason>` in `status` and stops there.
+   Read the code, fix the draft, run it again. Never bypass the check, never
+   edit `.orca/osw/config.json` or `AGENTS.md` to make a dispatch work, and
+   never re-run with a different provider or model on your own.
 3. Watch until it is terminal, then report:
    `python <dir>/osw.py workflow status <run_id> --json` (add `--watch` for the
-   live table). Never read panes or the scheduler log for progress; the archive
-   is the truth. Scheduler problems are in
-   `.orca/osw/runs/<run_id>/scheduler.log`.
+   live table; without a run id it reports the newest run plus any drafting
+   job). Never read panes or the scheduler log for progress; the archive is the
+   truth. Scheduler problems are in `.orca/osw/runs/<run_id>/scheduler.log`.
 4. It is terminal when the state is `done`, `failed`, `partial` or `stopped`.
    `failed` names the step and its error: `workflow retry <run> <step>
    --reason <why>` re-arms one step, `workflow accept ...` takes a step as it
@@ -50,10 +53,15 @@ python <dir>/osw.py workflow run <slug>                          # the command i
 python <dir>/osw.py sweep                                        # reclaim finished panes
 ```
 
-`go` creates the run, then starts the scheduler as its own process, so the run
-outlives the tool call that asked for it; its output goes to
-`.orca/osw/runs/<run_id>/scheduler.log`. A run started in a pane keeps the
-caller terminal; from a plain shell or CI it dispatches with `--no-notify`.
-`--resume` reuses finished steps by key, so an interrupted run continues where
-it stopped. `max_agents` refuses rather than truncates. Do not hand-write the
-definition to get past a validator refusal: fix the draft.
+`go` writes one job marker under `.orca/osw/planning/` and returns; a detached
+worker drafts, creates the run and schedules it, so the run outlives the tool
+call that asked for it and the run's scheduler output goes to
+`.orca/osw/runs/<run_id>/scheduler.log`. A job that fails keeps its marker with
+the code and the reason, and a run that hits a refusal records it in its own
+`run.json` as `failed` — it never dies silently and nothing is retried behind
+the scenes. A project that configured no provider dispatches with `pi` and says
+so once. A run started in a pane keeps the caller terminal; from a plain shell
+or CI it dispatches with `--no-notify`. `--resume` reuses finished steps by key,
+so an interrupted run continues where it stopped. `max_agents` refuses rather
+than truncates. Do not hand-write the definition to get past a validator
+refusal: fix the draft.
