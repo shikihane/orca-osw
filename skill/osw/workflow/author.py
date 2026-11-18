@@ -48,20 +48,40 @@ Schema, with no keys beyond these:
 
   {"name": "__NAME__",
    "max_agents": <integer, at most 64>,
+   "goal": "<one sentence: the end state the person asked for>",
+   "max_rounds": <integer 1..20, default 1>,
    "phases": [
      {"id": "<short slug>",
       "mode": "single" | "for_each",
       "from": ["<id of an earlier phase>"],   // only when this phase consumes that phase's output
-      "task": "<the complete instruction one agent receives>"}
+      "task": "<the complete instruction one agent receives>",
+      "criteria": "<how a blind judge decides this phase reached its goal>",
+      "evidence": ["<repo-relative path or glob of a file the judge reads>"],
+      "repeat": false}
    ]}
 
 Rules:
 - Use 2 to 6 phases. The first phase discovers the work; a later for_each phase
   does the bulk work; a final single phase summarises.
+- Write goal: one sentence naming the end state the person asked for. It is
+  run-level text and holds no placeholder of any kind: no {{output}}, no
+  {{item}}, no {{item.<field>}}.
+- Every phase whose product is a deliverable declares criteria (judgeable
+  offline from the files on disk, written before the work runs) and evidence
+  (the repo-relative file globs the judge reads). A for_each phase's criteria
+  may use {{item}} and {{item.<field>}}; a single phase's criteria may not.
+  criteria is never given {{output}}: the judge reads the step's outputs itself.
+- If the request is open-ended ("continue until X", "推进到完成"), the phase
+  that does the bulk work is "repeat": true and max_rounds is 3 unless the
+  request says otherwise. repeat belongs only to a for_each phase and needs
+  non-empty from, non-empty criteria and max_rounds greater than 1.
+- The final phase's criteria must restate the goal, not "a summary exists".
 - A phase whose results a later phase consumes must write a JSON array to the
   path __OUTPUT__. Its task must say to write exactly that file.
 - A for_each phase's task uses {{item}} (or {{item.<field>}} for an object
   field) and must not refer to the other items.
+- Every evidence entry is literal: a relative path or glob, with no
+  placeholder, no ".." and no drive letter.
 - These are the only placeholders that exist: {{output}}, {{item}},
   {{item.<field>}}. There is no {{project_root}}, {{repo}}, {{date}} or any
   other name — the agent already runs inside the repository, so it should

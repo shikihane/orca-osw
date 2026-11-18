@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from osw.log import get_logger
-from osw.state import state_dir, write_json_atomic
+from osw.state import pid_is_running, state_dir, write_json_atomic
 from osw.workflow.board import RUN_FILE
 from osw.workflow.defs import Definition, WorkflowError
 
@@ -40,6 +40,17 @@ STEPS_DIR = "steps"
 REQUESTS_DIR = "requests"
 OUTPUTS_DIR = "outputs"
 VERDICT_FILE = "verdicts.jsonl"
+
+# Gate steps live in the same phase as the work they judge; -1 keeps them out
+# of the item index space, so an item key never collides with a gate key.
+GATE_INDEX = -1
+# Bumped when the step-key material changes shape. A run records the version
+# it was created with so resume recomputes the keys it actually wrote.
+KEYS_VERSION = 2
+
+# A scheduler is alive when its pid runs and its last beat is this young. The
+# executor beats every poll, so three missed local ticks still read alive.
+SCHEDULER_STALE_SECONDS = 90.0
 
 POLICIES = ("strict", "partial")
 VERIFY_MODES = ("none", "suspect", "all")
@@ -69,9 +80,22 @@ def schema_token(schema: Any) -> str:
     return json.dumps(schema, sort_keys=True, separators=(",", ":"))
 
 
-def step_key(phase_id: str, index: int, prompt: str, schema_id: str) -> str:
-    """``sha256(phase_id \\0 index \\0 prompt \\0 schema_id)[:32]``."""
-    material = "\0".join((phase_id, str(int(index)), prompt, schema_id))
+def step_key(phase_id: str, index: int, prompt: str, schema_id: str,
+             *, round_no: int = 0, keys_version: int = KEYS_VERSION) -> str:
+    """The identity of one declared step, ``sha256(material)[:32]``.
+
+    Version 1 is the original material, kept byte-for-byte so every archive
+    written before rounds existed still recomputes the keys it holds. Version 2
+    adds the round, because a repeating phase is a new instance of the same
+    declaration: the same prompt in round 2 must not reuse round 1's record.
+    """
+    if int(keys_version) >= KEYS_VERSION:
+        material = "|".join((
+            str(KEYS_VERSION), str(int(round_no)), phase_id,
+            str(int(index)), prompt, schema_id,
+        ))
+    else:
+        material = "\0".join((phase_id, str(int(index)), prompt, schema_id))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
@@ -121,6 +145,12 @@ def output_path(root: Path, run_id: str, phase_id: str, index: int) -> Path:
     return run_dir(root, run_id) / OUTPUTS_DIR / name
 
 
+def gate_output_path(root: Path, run_id: str, phase_id: str, round_no: int) -> Path:
+    """The file a gate step writes its verdict to: one per phase and round."""
+    name = f"{_checked(str(phase_id), 'phase id')}-gate-r{int(round_no)}.json"
+    return run_dir(root, run_id) / OUTPUTS_DIR / name
+
+
 # ---------------------------------------------------------------------------
 # Run header
 # ---------------------------------------------------------------------------
@@ -161,6 +191,15 @@ def create_run(
         "verify": verify,
         "max_attempts": int(max_attempts),
         "max_agents": int(definition.max_agents),
+        # Which shape of step-key material this archive was written with.
+        "keys_version": KEYS_VERSION,
+        # The end state the run is trying to reach, and changes a gate or a
+        # person proposed. A proposal is recorded, never applied.
+        "goal": definition.goal,
+        "goal_proposals": [],
+        # Stamped by the scheduler on start and on every tick; read by
+        # `status` and `resume` to tell a live run from an abandoned one.
+        "scheduler": {"pid": 0, "host": "", "started_at": "", "beat_at": ""},
         # `started` is what the board renders; `started_at` is the archive's
         # own name for the same instant (the spec's run-header fields).
         "started": started,
@@ -168,7 +207,13 @@ def create_run(
         "finished": None,
         "finished_at": None,
         "phases": [
-            {"id": phase.id, "state": "pending", "steps": []}
+            {
+                "id": phase.id,
+                "state": "pending",
+                "steps": [],
+                "round": 1,
+                "gate": {"round": 0, "step": "", "pass": None, "reason": ""},
+            }
             for phase in definition.phases
         ],
         "steps": [],
@@ -180,6 +225,42 @@ def create_run(
 def write_run(root: Path, run: dict) -> None:
     """Atomically write ``run.json``. The scheduler is the only caller."""
     write_json_atomic(run_path(root, run["run_id"]), run)
+
+
+def _beat_age_seconds(stamp: Any, now: datetime) -> float | None:
+    if not isinstance(stamp, str) or not stamp.strip():
+        return None
+    text = stamp.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        beat = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if beat.tzinfo is None:
+        beat = beat.replace(tzinfo=timezone.utc)
+    return (now - beat).total_seconds()
+
+
+def scheduler_alive(root: Path, run: dict) -> bool:
+    """Whether the scheduler recorded in ``run`` is still driving it.
+
+    A pure read: the pid must be running *and* the last beat must be younger
+    than ``SCHEDULER_STALE_SECONDS``. A live pid with an old beat is a process
+    that stopped ticking (or a reused pid), and neither may block ``resume``.
+    """
+    del root  # part of the contract; liveness is a property of the record
+    block = run.get("scheduler")
+    if not isinstance(block, dict):
+        return False
+    try:
+        pid = int(block.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not pid_is_running(pid):
+        return False
+    age = _beat_age_seconds(block.get("beat_at"), datetime.now(timezone.utc))
+    return age is not None and age <= SCHEDULER_STALE_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +338,22 @@ def phase_steps(root: Path, run: dict, phase_id: str) -> list[dict]:
         record = read_step(root, run["run_id"], key)
         if record is not None:
             records.append(record)
+    return records
+
+
+def phase_round_steps(root: Path, run: dict, phase_id: str, round_no: int) -> list[dict]:
+    """The step records of one phase belonging to one round, in index order.
+
+    A record without a ``round`` came from before rounds existed (or from a
+    non-repeating phase), so it belongs to round 0 — the only round such a
+    phase ever has.
+    """
+    target = int(round_no)
+    records = [
+        record for record in phase_steps(root, run, phase_id)
+        if int(record.get("round") or 0) == target
+    ]
+    records.sort(key=lambda record: int(record.get("index") or 0))
     return records
 
 

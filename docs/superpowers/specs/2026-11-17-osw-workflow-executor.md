@@ -390,3 +390,12 @@ CLI tests use `CliRunner` and a temporary project root, matching
   host seam on every verification, or only when the verifier reports a change.
   The former costs one extra read per verified step; the latter trusts the
   verifier's own report and is therefore weaker.
+
+## Rounds and gates (2026-11-18)
+
+"No model is consulted about what runs next" is narrowed, not broken: a gate
+answers a criterion written into the definition before the run, and the
+policy — not the gate — maps that answer to the next step. A gate cannot add a
+phase, rewrite a criterion or change the goal; it may propose a goal change,
+which a person accepts with `workflow goal --set`. Rounds are new instances of
+a declared phase, keyed with their round number, so resume stays exact.

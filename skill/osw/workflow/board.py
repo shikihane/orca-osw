@@ -31,6 +31,9 @@ from osw.state import state_dir
 from osw.workflow.defs import WorkflowError
 
 RUN_FILE = "run.json"
+#: The supervisor's own record, beside the run it owns. The supervisor writes
+#: this one file and nothing else: ``run.json`` stays the scheduler's.
+SUPERVISOR_FILE = "supervisor.json"
 STEP_STATES = ("done", "running", "failed", "waiting")
 
 
@@ -61,6 +64,9 @@ def read_run(root: Path, run_id: str) -> dict:
     if not isinstance(payload, dict):
         raise WorkflowError("run_not_found", f"{path}: top level must be an object")
     payload.setdefault("run_id", run_id)
+    # Archives written before rounds carry no key version; their step keys are
+    # the original material, which is version 1.
+    payload.setdefault("keys_version", 1)
     return payload
 
 
@@ -175,8 +181,8 @@ LS_COLUMNS = ("RUN_ID", "DEFINITION", "STATE", "STARTED")
 LS_WIDTHS = (8, 12, 7)
 PHASE_COLUMNS = ("PHASE", "DONE/TOTAL", "RUNNING", "FAILED", "WAITING")
 PHASE_WIDTHS = (12, 12, 9, 8)
-DRY_COLUMNS = ("PHASE", "MODE", "FROM", "TASKS")
-DRY_WIDTHS = (8, 11, 9)
+DRY_COLUMNS = ("PHASE", "MODE", "FROM", "TASKS", "ROUNDS", "GATE")
+DRY_WIDTHS = (8, 11, 9, 6, 6)
 
 
 def _row(cells: tuple[str, ...], widths: tuple[int, ...]) -> str:
@@ -239,7 +245,15 @@ def render_phase_table(run: dict) -> str:
 
 def render_status(run: dict) -> str:
     """Identity, phase table, and steps only when something needs attention."""
-    lines = [run_header(run), render_phase_table(run)]
+    lines = [run_header(run)]
+    supervisor = supervisor_view(run)
+    if supervisor["restarts"]:
+        # A restarted scheduler is why a run took as long as it did; one that
+        # never restarted says nothing worth a line.
+        lines.append(
+            f"SUPERVISOR pid {supervisor['pid']} restarts {supervisor['restarts']}"
+        )
+    lines.append(render_phase_table(run))
     if has_active_steps(run):
         lines.append("STEPS")
         lines.extend(step_lines(run) or ["  none"])
@@ -259,14 +273,117 @@ def render_show(run: dict) -> str:
     return "\n".join(lines)
 
 
+def _phase_entry(run: dict, phase_id: str) -> dict:
+    """The archive's own record for one phase, or an empty one when absent."""
+    for entry in run.get("phases") or []:
+        if isinstance(entry, dict) and entry.get("id") == phase_id:
+            return entry
+    return {}
+
+
+def _phase_round(entry: dict) -> int:
+    """The round a phase is on. An archive from before rounds is on round 1."""
+    value = entry.get("round")
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+        return value
+    return 1
+
+
+def _gate_view(entry: dict) -> dict:
+    """A phase's last gate verdict, reduced to what ``status`` reports."""
+    gate = entry.get("gate")
+    if not isinstance(gate, dict):
+        gate = {}
+    round_no = gate.get("round")
+    passed = gate.get("pass")
+    return {
+        "round": round_no if isinstance(round_no, int) and not isinstance(round_no, bool) else 0,
+        "pass": passed if isinstance(passed, bool) else None,
+        "reason": str(gate.get("reason") or ""),
+    }
+
+
+def _scheduler_alive(run: dict) -> bool:
+    """Whether the scheduler that owns ``run`` is still beating.
+
+    The rule lives in the archive, which imports this module for ``RUN_FILE``,
+    so the import stays local. Nothing is rewritten: liveness is computed from
+    the heartbeat the scheduler stamps, never inferred back into the record.
+    """
+    from osw.workflow.archive import scheduler_alive
+
+    return scheduler_alive(Path("."), run)
+
+
+def supervisor_file(root: Path, run_id: str) -> Path:
+    """The supervisor's sidecar for one run."""
+    return runs_dir(root) / run_id / SUPERVISOR_FILE
+
+
+def read_supervisor(root: Path, run_id: str) -> dict:
+    """The supervisor's record for one run, as read: ``{}`` when it has none.
+
+    A sidecar that is missing, half-written or not an object is not an error:
+    the run simply has no supervisor, which is what ``status`` reports.
+    """
+    name = str(run_id or "")
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        return {}
+    try:
+        payload = json.loads(supervisor_file(root, name).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def supervisor_view(run: dict) -> dict:
+    """The sidecar reduced to what ``status`` reports: pid, alive, restarts.
+
+    ``alive`` is the supervisor's own pid, never the scheduler's: the two
+    answer different questions, and a live supervisor with a dead scheduler is
+    exactly the state a restart is about to fix.
+    """
+    from osw.state import pid_is_running
+
+    record = read_supervisor(Path("."), str(run.get("run_id") or ""))
+    pid = record.get("pid")
+    restarts = record.get("restarts")
+    pid = pid if isinstance(pid, int) and not isinstance(pid, bool) else 0
+    restarts = restarts if isinstance(restarts, int) and not isinstance(restarts, bool) else 0
+    return {
+        "pid": pid,
+        "alive": bool(pid) and pid_is_running(pid),
+        "restarts": max(0, restarts),
+    }
+
+
 def render_status_json(run: dict) -> dict:
-    """The same counts, machine-readable: phases plus the raw run identity."""
+    """The same counts, machine-readable: phases plus the raw run identity.
+
+    ``goal_proposals`` is a count because the list itself is what
+    ``workflow goal`` prints; a run from before rounds reports no goals and
+    every phase on round 1. ``supervisor`` is read from the sidecar the
+    supervisor writes, so a run nobody supervises reports a dead pid.
+    """
+    phases: list[dict] = []
+    for row in phase_rows(run):
+        entry = _phase_entry(run, row["id"])
+        phases.append({
+            **row,
+            "round": _phase_round(entry),
+            "gate": _gate_view(entry),
+        })
+    proposals = run.get("goal_proposals")
     return {
         "run_id": run.get("run_id"),
         "definition": run.get("definition"),
         "state": run.get("state"),
         "started": run.get("started"),
-        "phases": phase_rows(run),
+        "scheduler_alive": _scheduler_alive(run),
+        "supervisor": supervisor_view(run),
+        "goal": str(run.get("goal") or ""),
+        "goal_proposals": len(proposals) if isinstance(proposals, list) else 0,
+        "phases": phases,
     }
 
 
@@ -291,7 +408,14 @@ def render_dry_run(
             tasks_cell = "? (expanded at run time: one agent per item)"
         else:
             tasks_cell = str(phase.tasks)
-        lines.append(_row((phase.id, phase.mode, from_cell, tasks_cell), DRY_WIDTHS))
+        # `ROUNDS` is the worst case the definition asks for; `GATE` says the
+        # phase has to pass a written criterion before the run may call it done.
+        rounds_cell = str(phase.rounds)
+        gate_cell = "criteria" if phase.criteria else "-"
+        lines.append(_row(
+            (phase.id, phase.mode, from_cell, tasks_cell, rounds_cell, gate_cell),
+            DRY_WIDTHS,
+        ))
     if runtime_fanout:
         agents = f"{static_total} + N"
     else:

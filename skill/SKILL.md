@@ -47,7 +47,13 @@ words in any phrasing — means run `workflow go` with that text as the request,
 then watch it to the end. Planning, drafting, validation and start are all
 inside that one command, which returns at once with a `PLANNING` job instead of
 blocking for the draft. There is no other entry point and no command file to
-keep in sync.
+keep in sync. An open-ended request — "continue until X", "推进到完成" — needs
+a written goal and a repeat phase, so expect rounds rather than one pass.
+`workflow status --json` is the truth, not a watch job: `scheduler_alive`, and
+each phase's `round` and `gate`, say whether the batch is still moving.
+Waiting for the run, continuing past a batch and restarting a dead run are your
+own calls — `workflow wait`, `workflow next`, `workflow resume` — never
+instructions printed for the operator.
 
 For work that is many independent units plus a check and a summary — audit every
 route, port every handler, review every module — build a workflow instead of

@@ -113,3 +113,43 @@ def test_plan_names_the_file_from_the_request_when_no_name_is_given(tmp_path):
         wait=_done,
     )
     assert path.name == "audit-every-http.json"
+
+
+def test_plan_prompt_shows_the_goal_rounds_and_gate_keys(tmp_path):
+    prompt = author.prompt_for(tmp_path, "flow", "audit every route")
+
+    for key in ('"goal"', '"max_rounds"', '"criteria"', '"evidence"', '"repeat"'):
+        assert key in prompt, f"the planner must be shown {key}"
+
+
+def test_plan_prompt_states_the_goal_criteria_repeat_and_final_rules(tmp_path):
+    prompt = author.prompt_for(tmp_path, "flow", "audit every route")
+    flat = " ".join(prompt.split())
+
+    assert "Write goal: one sentence naming the end state the person asked for." in flat
+    assert "declares criteria" in flat and "evidence" in flat
+    assert 'the phase that does the bulk work is "repeat": true and max_rounds is 3' in flat
+    assert "The final phase's criteria must restate the goal" in flat
+    # The pre-existing rules survive the addition.
+    assert "Use 2 to 6 phases." in flat
+    assert "{{project_root}}" in flat and "{{now}}" in flat
+
+
+def test_plan_prompt_for_an_open_ended_request_names_repeat_and_max_rounds(tmp_path):
+    prompt = author.prompt_for(
+        tmp_path, "advance", "keep going until the bench cards are all executed",
+    )
+    flat = " ".join(prompt.split())
+
+    assert "keep going until the bench cards are all executed" in flat
+    assert "open-ended" in flat
+    assert '"repeat": true' in flat
+    assert "max_rounds is 3" in flat
+
+
+def test_plan_prompt_never_offers_a_placeholder_inside_goal(tmp_path):
+    prompt = author.prompt_for(tmp_path, "flow", "audit every route")
+
+    for line in prompt.splitlines():
+        if "goal" in line and "{{" in line:
+            assert "no {{" in line, f"goal placeholders are refused, not taught: {line!r}"

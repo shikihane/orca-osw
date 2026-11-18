@@ -127,7 +127,8 @@ line, at most 4 KiB, always carrying the decision id for audit.
 ## Workflow Runs
 
 `super` fans one task list out once; a workflow turns a phase plan into agents
-and keeps going across phases. The plan is a closed-schema JSON —
+and keeps going across the declared phases, and across rounds where a phase
+declares `repeat`. The plan is a closed-schema JSON —
 `.orca/osw/workflows/<name>.json` in the project (preferred) or the home
 directory — never a script an agent composes and executes at run time. A person
 does not have to write it by hand: `osw workflow plan "<one sentence>"` has one
@@ -149,15 +150,27 @@ newest run plus any job still drafting), never from panes or that log.
   dispatch go through. A project that configured no provider dispatches with
   `pi` and says so once on stderr.
 
-- **Shape.** `{name, max_agents?, approval?, phases[]}`; each phase is
-  `{id, mode: single|for_each, from?, task, schema?}`. Phases run in declared
-  order with a barrier: a phase starts only when every phase it names in
-  `from` is terminal. `for_each` expands one agent per item taken from the
-  array in the producer's output file — the path `{{output}}` names — or, for
-  a producer that predates it, the last fenced ```json block of its handoff. A
-  missing field or a missing file is refused (`no_items`) with the path named,
-  never guessed. The handoff stays the watcher's four-section markdown, so
-  machine-readable output has a channel of its own.
+- **Shape.** `{name, max_agents?, approval?, goal?, max_rounds?, phases[]}`;
+  each phase is `{id, mode: single|for_each, from?, task, schema?, criteria?,
+  evidence?, repeat?}`. Phases run in declared order with a barrier: a phase
+  starts only when every phase it names in `from` is terminal. `for_each`
+  expands one agent per item taken from the array in the producer's output
+  file — the path `{{output}}` names — or, for a producer that predates it,
+  the last fenced ```json block of its handoff. A missing field or a missing
+  file is refused (`no_items`) with the path named, never guessed. The handoff
+  stays the watcher's four-section markdown, so machine-readable output has a
+  channel of its own.
+- **Rounds and gates.** A phase that declares `criteria` is done only when a
+  blind gate agent answers them — it reads the run's `goal`, the criteria,
+  that round's `evidence` files and the round's outputs, never the workers'
+  prompts or verdicts — with one JSON object, and the scheduler, not the
+  gate, maps `pass`, the round number and `--policy` to the next step.
+  `pass: false` on a `repeat: true` phase starts round `n+1` from
+  `next_items` while `max_rounds` (default 1, cap 20) and the agent ceiling
+  allow it; otherwise `strict` fails the run at that phase and round, and
+  `partial` marks the phase partial. A gate can only propose:
+  `goal_proposals` are recorded and never applied; accepting one is the
+  person's `workflow goal <run> --set "<sentence>" --reason "<why>"`.
 - **Identity and resume.** `step_key = sha256(phase 0 index 0 prompt 0
   schema_id)`, so a prompt must be a pure function of the definition and the
   previous phase's structured output; `defs.py` rejects `{{now}}`, `{{uuid}}`,
@@ -170,6 +183,21 @@ newest run plus any job still drafting), never from panes or that log.
   `max_attempts` (default 2), then the step is `failed` and `--policy` decides:
   `strict` stops the run at that barrier, `partial` continues and marks the
   phase `partial` — a partial phase is never reported as success.
+- **Recovery.** A supervisor restarts a scheduler that died while the run is
+  still `running`, up to `OSW_WORKFLOW_RESTARTS` (default 3), and keeps its
+  own `supervisor.json` sidecar; `status --json` reports `scheduler_alive`
+  from the heartbeat and `supervisor: {pid, alive, restarts}` — the sidecar
+  is the supervisor's, `run.json` stays the scheduler's. `workflow resume
+  <run>` is the manual entry when no supervisor is alive (`workflow run
+  <slug> --resume --run <id>` in the foreground); either reuses every `done`
+  step by key, and a live scheduler refuses with `run_running`. `workflow
+  next <run>` turns a terminal-but-unmet run into the next batch: the goal,
+  the last gate reason and the proposals become a request, drafted and
+  started under an auto-incremented stem (`<name>-r2`, `-r3`, …); a run with
+  no goal is refused as `no_goal`. A dead planner is reported as `planning
+  <stem> ... plan_failed: planner_died` and nothing retries it. A step whose
+  attempt ends `lost` is revived in its own pane before a fresh agent is
+  spent; `--no-revive-lost` turns that revival off.
 - **Verification.** A verifier gets the artifact and the claim only (blind),
   appends one line to `verdicts.jsonl`, and never calls OSW itself; the
   artifact's sha256 is taken before and after, and a change discards the

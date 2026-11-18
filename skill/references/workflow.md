@@ -22,30 +22,46 @@ The request: **<the request>**
    This returns in about a second with `PLANNING <slug>  pid <n>`: a detached
    worker drafts `.orca/osw/workflows/<slug>.json`, the validator judges it,
    the run is archived, and the scheduler drives it — all after your command
-   exited. Never wait for it in the shell.
+   exited — `go` itself never blocks, and waiting is the next step.
    A refusal (bad schema, unknown placeholder, `too_many_agents`, no items)
    leaves `planning <slug> ... <code>: <reason>` in `status` and stops there.
    Read the code, fix the draft, run it again. Never bypass the check, never
    edit `.orca/osw/config.json` or `AGENTS.md` to make a dispatch work, and
    never re-run with a different provider or model on your own.
-3. Watch until it is terminal, then report:
-   `python <dir>/osw.py workflow status <run_id> --json` (add `--watch` for the
-   live table; without a run id it reports the newest run plus any drafting
-   job). Never read panes or the scheduler log for progress; the archive is the
-   truth. Scheduler problems are in `.orca/osw/runs/<run_id>/scheduler.log`.
+3. Wait until it is terminal, then report:
+   `python <dir>/osw.py workflow wait <run-or-stem> [--timeout SECONDS]` blocks
+   until the run is terminal (exit 0) or the timeout expires (exit 2), and
+   writes nothing — `go` prints a stem, so pass the stem and it resolves the
+   run id once the draft lands. Then read
+   `python <dir>/osw.py workflow status <run_id> --json` (without a run id it
+   reports the newest run plus any drafting job); `--watch` is a live table
+   for a person, not the agent's loop. Never read panes or the scheduler log
+   for progress; the archive is the truth, and its `scheduler_alive` says
+   whether anything is still driving the run. Scheduler problems are in
+   `.orca/osw/runs/<run_id>/scheduler.log`.
 4. It is terminal when the state is `done`, `failed`, `partial` or `stopped`.
-   `failed` names the step and its error: `workflow retry <run> <step>
-   --reason <why>` re-arms one step, `workflow accept ...` takes a step as it
-   is, `workflow reject ...` buries it; after a `stop`, `workflow run <slug>
-   --resume` reuses finished steps by key and runs only what is left.
+   `done` is the end of the declared phases, not the end of the project; the
+   rest of this page says how to read that. `failed` names the step and its
+   error: `workflow retry <run> <step> --reason <why>` re-arms one step,
+   `workflow accept ...` takes a step as it is, `workflow reject ...` buries
+   it; after a `stop`, or a run whose supervisor is gone, `workflow resume
+   <run>` restarts the scheduler and reuses finished steps by key, running
+   only what is left.
 5. Finish with `python <dir>/osw.py sweep` to reclaim panes that are still
    open (a `done` turn closes its own; `sweep` catches the rest), then
-   summarise per-step results and any verdicts in `verdicts.jsonl` — say
-   plainly which claims were confirmed, refuted or left unverifiable.
+   summarise per-step results and any verdicts in `verdicts.jsonl` — gate
+   verdicts are its `"kind": "gate"` lines — and say plainly which claims
+   were confirmed, refuted or left unverifiable.
 
 ```text
 python <dir>/osw.py workflow go "<one sentence>" --name <slug>   # plan + start, returns
 python <dir>/osw.py workflow status <run_id> --json              # the archive is the truth
+python <dir>/osw.py workflow wait <run-or-stem>                  # block until terminal (0) or timeout (2)
+python <dir>/osw.py workflow goal <run_id>                       # what the run is for
+python <dir>/osw.py workflow goal <run_id> --set "<sentence>" --reason "<why>"  # accept it
+python <dir>/osw.py workflow resume <run_id>                     # restart a dead scheduler
+python <dir>/osw.py workflow next <run_id>                       # continue towards the goal
+python <dir>/osw.py workflow run <slug> --resume --run <id>        # the same, foreground
 python <dir>/osw.py workflow plan "<one sentence>"               # draft only, no run
 python <dir>/osw.py workflow run <slug> --dry-run                # show the expansion
 python <dir>/osw.py workflow run <slug>                          # the command is the scheduler
@@ -64,3 +80,60 @@ or CI it dispatches with `--no-notify`. `--resume` reuses finished steps by key,
 so an interrupted run continues where it stopped. `max_agents` refuses rather
 than truncates. Do not hand-write the definition to get past a validator
 refusal: fix the draft.
+
+## Rounds, gates and recovery
+
+One `go` is one batch: the phases the definition declares, run once. `done`
+means those phases — and the rounds a repeat phase declared — finished, not
+that the request is finished; read the run's goal against the request before
+reporting the work complete.
+
+A phase that declares `criteria` is not finished when its work settles. A
+blind gate agent answers them — it reads the run's goal, the criteria, that
+round's `evidence` files and the round's outputs, and never the workers'
+prompts or verdicts — with one JSON object `{"pass", "reason", "next_items",
+"goal_proposals"}`. The scheduler, not the gate, maps that answer to the next
+step: `pass` true closes the phase; `pass` false on a phase with `repeat: true`
+and non-empty `next_items` starts round `n+1` from those items while
+`max_rounds` and the agent ceiling allow it (a ceiling that would be exceeded
+marks the phase `failed` with `too_many_agents`); otherwise `--policy`
+decides — `strict` fails the run at that phase and round, `partial` marks the
+phase partial. An answer that is missing, unparseable, not a boolean `pass`, or
+carrying a non-array `next_items` (`gate_invalid`) gets one retry and then
+holds the run as `unverifiable`. Gate proposals are recorded and notified,
+never applied.
+
+`status --json` is where all of that is read: `scheduler_alive`, the
+`supervisor` block (`{pid, alive, restarts}`), each phase's `round` and `gate`
+(`{round, pass, reason}`), and the run's `goal` and `goal_proposals` count. A
+supervisor owns the scheduler's lifetime: while the run is still `running` it
+restarts a scheduler that died, up to `OSW_WORKFLOW_RESTARTS` (default 3) with
+a 5 s backoff, logging to `supervisor.log` and keeping `supervisor.json`
+(`{pid, started_at, restarts, last_exit}`) beside the run — it never writes
+`run.json`. With no supervisor alive, `workflow resume <run>` is the manual
+entry: it starts a detached scheduler and `workflow run <slug> --resume --run
+<id>` is the same in the foreground; either reuses every finished step by key.
+A live scheduler refuses with `run_running`.
+
+`workflow goal <run>` prints the goal, its proposals and the round count;
+adding `--set "<sentence>" --reason "<why>"` records the acceptance and
+rewrites the goal every later gate reads. An unknown run (`run_not_found`) or
+a non-human identity is refused. A drafting job whose planner died is reported
+as `planning <stem> ... plan_failed: planner_died` — `status --json` carries
+the job's `alive` and `code` — and nothing retries it.
+
+A step whose attempt ends `lost` is revived in its own pane before a fresh
+agent is spent — the revival is the next attempt, and a failed revival falls
+back to a new agent. `revive_lost` defaults true; `--no-revive-lost` on
+`workflow run` sets it false for that run.
+
+The acting agent runs this loop; it never prints a command for a person to run.
+While the run is not terminal, wait with `workflow wait <run-or-stem>` — exit 0
+at a terminal run, 2 at the timeout, nothing written — then read `status
+--json`. When the state is `running` and neither the supervisor's `alive` nor
+`scheduler_alive` is true, call `workflow resume <run>` yourself. When the
+state is terminal and the last gate verdict's `reason` or the run's `goal` says
+the request is unmet, call `workflow next <run>`: it reads the goal, the gate
+reason and the proposals, assembles a request and starts it under a new stem
+(`<definition>-r2`, `-r3`, …), refusing `no_goal` when there is nothing to
+continue towards. Never report a batch as finished work while the goal is open.

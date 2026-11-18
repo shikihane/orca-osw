@@ -411,3 +411,308 @@ def test_help_lists_every_verb():
     assert result.exit_code == 0, result.output
     for verb in ("ls", "show", "status", "run"):
         assert verb in result.output
+
+
+# ---------------------------------------------------------------------------
+# Rounds, gates and recovery: the schema additions (plan §1)
+# ---------------------------------------------------------------------------
+
+def _phase_set(**top_level) -> dict:
+    """One ``single`` phase, plus whatever top-level keys a test adds."""
+    payload = {
+        "name": DEFINITION_NAME,
+        "phases": [{"id": "scan", "mode": "single", "task": "Scan the tree."}],
+    }
+    payload.update(top_level)
+    return payload
+
+
+@pytest.mark.parametrize(
+    "goal",
+    ["Ship {{output}}.", "Finish by {{now}}.", "Turn {{item}} green."],
+)
+def test_goal_refuses_every_placeholder(tmp_path, goal):
+    _install_definition(tmp_path, _phase_set(goal=goal))
+
+    with pytest.raises(workflow_pkg.WorkflowError) as caught:
+        defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert caught.value.code == "unknown_placeholder"
+    assert "goal" in caught.value.message
+
+
+@pytest.mark.parametrize("goal", ["", "   ", 5])
+def test_goal_must_be_a_non_empty_string(tmp_path, goal):
+    _install_definition(tmp_path, _phase_set(goal=goal))
+
+    with pytest.raises(workflow_pkg.WorkflowError) as caught:
+        defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert caught.value.code == "definition_invalid"
+    assert "goal" in caught.value.message
+
+
+@pytest.mark.parametrize("value", [0, -1, 21, True, "3", 2.5, None])
+def test_max_rounds_is_bounded_and_never_a_bool(tmp_path, value):
+    _install_definition(tmp_path, _phase_set(max_rounds=value))
+
+    with pytest.raises(workflow_pkg.WorkflowError) as caught:
+        defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert caught.value.code == "definition_invalid"
+    assert "max_rounds" in caught.value.message
+
+
+def test_max_rounds_defaults_to_one_and_accepts_the_cap(tmp_path):
+    _install_definition(tmp_path, _phase_set())
+    assert defs.load_definition(tmp_path, DEFINITION_NAME).max_rounds == 1
+
+    _install_definition(tmp_path, _phase_set(max_rounds=defs.MAX_ROUNDS_CAP))
+    assert defs.load_definition(tmp_path, DEFINITION_NAME).max_rounds == 20
+
+
+def test_repeat_phase_criteria_may_use_item_placeholders(tmp_path):
+    _install_definition(tmp_path, {
+        "name": DEFINITION_NAME,
+        "goal": "Every route has an auth check.",
+        "max_rounds": 2,
+        "phases": [
+            {"id": "scan", "mode": "single", "task": "List the routes."},
+            {
+                "id": "advance",
+                "mode": "for_each",
+                "from": "scan",
+                "task": "Fix {{item.path}}.",
+                "criteria": "Every {{item}} named route has an auth check.",
+                "repeat": True,
+            },
+        ],
+    })
+
+    definition = defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert definition.phases[1].criteria == "Every {{item}} named route has an auth check."
+
+
+def test_item_placeholder_in_criteria_is_refused_on_a_single_phase(tmp_path):
+    entry = {"id": "scan", "mode": "single", "task": "Scan.",
+             "criteria": "Every {{item}} is fixed."}
+    _install_definition(tmp_path, {"name": DEFINITION_NAME, "phases": [entry]})
+
+    with pytest.raises(workflow_pkg.WorkflowError) as caught:
+        defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert caught.value.code == "definition_invalid"
+    assert "criteria" in caught.value.message
+    assert "{{item}}" in caught.value.message
+
+
+@pytest.mark.parametrize("criteria", ["{{output}} is valid JSON.", "{{findings}} are fixed."])
+def test_criteria_accepts_no_other_placeholder(tmp_path, criteria):
+    entry = {"id": "scan", "mode": "single", "task": "Scan.", "criteria": criteria}
+    _install_definition(tmp_path, {"name": DEFINITION_NAME, "phases": [entry]})
+
+    with pytest.raises(workflow_pkg.WorkflowError) as caught:
+        defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert caught.value.code == "unknown_placeholder"
+
+
+def test_unstable_placeholder_in_criteria_is_refused(tmp_path):
+    entry = {"id": "scan", "mode": "single", "task": "Scan.",
+             "criteria": "The report is newer than {{today}}."}
+    _install_definition(tmp_path, {"name": DEFINITION_NAME, "phases": [entry]})
+
+    with pytest.raises(workflow_pkg.WorkflowError) as caught:
+        defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert caught.value.code == "unstable_placeholder"
+
+
+def test_empty_criteria_is_refused(tmp_path):
+    entry = {"id": "scan", "mode": "single", "task": "Scan.", "criteria": "  "}
+    _install_definition(tmp_path, {"name": DEFINITION_NAME, "phases": [entry]})
+
+    with pytest.raises(workflow_pkg.WorkflowError) as caught:
+        defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert caught.value.code == "definition_invalid"
+    assert "criteria" in caught.value.message
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "../secrets.md",
+        "docs/../../secrets.md",
+        "C:/secrets.md",
+        "C:\\secrets.md",
+        "/etc/passwd",
+        "docs/{{item}}.md",
+        "",
+        "docs/auth.md",
+    ],
+)
+def test_evidence_must_be_relative_literal_paths(tmp_path, evidence):
+    entry = {"id": "scan", "mode": "single", "task": "Scan.", "evidence": evidence}
+    _install_definition(tmp_path, {"name": DEFINITION_NAME, "phases": [entry]})
+
+    with pytest.raises(workflow_pkg.WorkflowError) as caught:
+        defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert caught.value.code == "definition_invalid"
+    assert "evidence" in caught.value.message
+
+
+def test_evidence_entries_round_trip(tmp_path):
+    entry = {"id": "scan", "mode": "single", "task": "Scan.",
+             "evidence": ["docs/auth.md", "src/routes/*.py"]}
+    _install_definition(tmp_path, {"name": DEFINITION_NAME, "phases": [entry]})
+
+    definition = defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert definition.phases[0].evidence == ("docs/auth.md", "src/routes/*.py")
+
+
+def test_absent_or_empty_evidence_means_no_evidence(tmp_path):
+    _install_definition(tmp_path, {
+        "name": DEFINITION_NAME,
+        "phases": [
+            {"id": "scan", "mode": "single", "task": "Scan."},
+            {"id": "audit", "mode": "single", "task": "Audit.", "evidence": []},
+        ],
+    })
+
+    definition = defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert definition.phases[0].evidence == ()
+    assert definition.phases[1].evidence == ()
+
+
+def test_repeat_must_be_a_boolean(tmp_path):
+    entry = {"id": "scan", "mode": "single", "task": "Scan.", "repeat": "yes"}
+    _install_definition(tmp_path, {"name": DEFINITION_NAME, "phases": [entry]})
+
+    with pytest.raises(workflow_pkg.WorkflowError) as caught:
+        defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert caught.value.code == "definition_invalid"
+    assert "repeat" in caught.value.message
+
+
+@pytest.mark.parametrize(
+    "top_level, phase, missing",
+    [
+        ({"max_rounds": 2},
+         {"id": "audit", "mode": "single", "task": "Audit.",
+          "criteria": "The tree is audited.", "repeat": True},
+         "'mode': 'for_each'"),
+        ({"max_rounds": 2},
+         {"id": "advance", "mode": "for_each", "from": "scan", "task": "Fix {{item}}.",
+          "repeat": True},
+         "'criteria'"),
+        ({"max_rounds": 1},
+         {"id": "advance", "mode": "for_each", "from": "scan", "task": "Fix {{item}}.",
+          "criteria": "Every {{item}} is fixed.", "repeat": True},
+         "'max_rounds'"),
+    ],
+)
+def test_repeat_preconditions_each_name_the_field(tmp_path, top_level, phase, missing):
+    _install_definition(tmp_path, {
+        "name": DEFINITION_NAME,
+        "phases": [{"id": "scan", "mode": "single", "task": "List the routes."}, phase],
+        **top_level,
+    })
+
+    with pytest.raises(workflow_pkg.WorkflowError) as caught:
+        defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert caught.value.code == "definition_invalid"
+    assert missing in caught.value.message
+
+
+def test_repeat_without_from_names_the_from_field(tmp_path):
+    _install_definition(tmp_path, {
+        "name": DEFINITION_NAME,
+        "max_rounds": 2,
+        "phases": [{
+            "id": "advance", "mode": "for_each", "task": "Fix {{item}}.",
+            "criteria": "Every {{item}} is fixed.", "repeat": True,
+        }],
+    })
+
+    with pytest.raises(workflow_pkg.WorkflowError) as caught:
+        defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert caught.value.code == "definition_invalid"
+    assert "'from'" in caught.value.message
+
+
+def test_repeat_false_with_max_rounds_above_one_is_allowed(tmp_path):
+    _install_definition(tmp_path, _phase_set(max_rounds=3))
+
+    definition = defs.load_definition(tmp_path, DEFINITION_NAME)
+
+    assert definition.max_rounds == 3
+    assert definition.phases[0].repeat is False
+
+
+def test_valid_repeat_definition_expands_rounds_and_multiplies_the_total(tmp_path):
+    _install_definition(tmp_path, {
+        "name": DEFINITION_NAME,
+        "goal": "Every route has an auth check.",
+        "max_rounds": 3,
+        "phases": [
+            {"id": "scan", "mode": "single", "task": "List the routes."},
+            {
+                "id": "advance",
+                "mode": "for_each",
+                "from": "scan",
+                "task": "Fix {{item.path}}.",
+                "criteria": "Every {{item}} named route has an auth check.",
+                "evidence": ["docs/auth.md"],
+                "repeat": True,
+            },
+            {"id": "report", "mode": "single", "from": "advance",
+             "task": "Write the report.", "criteria": "The report restates the goal."},
+        ],
+    })
+
+    definition = defs.load_definition(tmp_path, DEFINITION_NAME)
+    planned = defs.expand(definition)
+
+    assert definition.goal == "Every route has an auth check."
+    assert definition.phases[1].repeat is True
+    assert [phase.criteria for phase in definition.phases] == [
+        "", "Every {{item}} named route has an auth check.",
+        "The report restates the goal.",
+    ]
+    assert [phase.criteria for phase in planned] == [False, True, True]
+    assert [phase.rounds for phase in planned] == [1, 3, 1]
+    assert defs.static_agent_total(planned) == 2
+    counted = [defs.PlannedPhase(id="a", mode="for_each", from_ids=(), tasks=3,
+                                 criteria=True, rounds=3)]
+    assert defs.static_agent_total(counted) == 9
+
+
+def test_definition_without_the_new_keys_behaves_exactly_as_before(tmp_path):
+    _install_definition(tmp_path)
+
+    definition = defs.load_definition(tmp_path, DEFINITION_NAME)
+    planned = defs.expand(definition)
+
+    assert definition.goal == ""
+    assert definition.max_rounds == 1
+    assert [phase.criteria for phase in definition.phases] == [""] * 4
+    assert [phase.evidence for phase in definition.phases] == [()] * 4
+    assert [phase.repeat for phase in definition.phases] == [False] * 4
+    assert [phase.criteria for phase in planned] == [False] * 4
+    assert [phase.rounds for phase in planned] == [1] * 4
+    assert [phase.tasks for phase in planned] == [1, None, None, 1]
+    assert defs.static_agent_total(planned) == 2
+
+
+def test_new_error_codes_are_registered():
+    for code in ("run_running", "gate_invalid"):
+        assert code in defs.CODES
+        assert workflow_pkg.WorkflowError(code, "x").code == code
