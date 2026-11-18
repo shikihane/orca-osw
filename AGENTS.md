@@ -133,7 +133,12 @@ directory — never a script an agent composes and executes at run time. A perso
 does not have to write it by hand: `osw workflow plan "<one sentence>"` has one
 ordinary agent draft that file, `defs.py` judges it, and `run --dry-run` shows
 the expansion before anything is dispatched. The schema stays closed either
-way, so a bad draft is refused by name, not half-run.
+way, so a bad draft is refused by name, not half-run. `osw workflow go
+"<one sentence>"` is the one-shot entry an agent calls: draft, validate, create
+the run, start the scheduler as a detached process, print the run id and
+return — a run outlives the tool call that asked for it, and its output goes to
+`.orca/osw/runs/<run_id>/scheduler.log`. Progress is read from the archive
+(`workflow status <run> --json`), never from panes or that log.
 
 - **Shape.** `{name, max_agents?, approval?, phases[]}`; each phase is
   `{id, mode: single|for_each, from?, task, schema?}`. Phases run in declared
@@ -302,6 +307,11 @@ copied files.
 - Codex destination: `C:\Users\shiki\.codex\skills\osw\`
 - Agents destination: `C:\Users\shiki\.agents\skills\osw\`
 - Claude destination: `C:\Users\shiki\.claude\skills\osw\`
+- A skill directory cannot define a slash command, so `install.py` also drops
+  `skill/commands/workflow.md` into the folder each harness searches for one:
+  `~/.claude/commands/osw-workflow.md` and
+  `~/.codex/prompts/osw-workflow.md` (`/osw-workflow`). The agents (omp) skill
+  needs no command file: its skill itself is the entry point.
 - Never use junctions, symbolic links, hard links, directory links, reparse
   points, or any other link-like mechanism for either the directory or its
   files.

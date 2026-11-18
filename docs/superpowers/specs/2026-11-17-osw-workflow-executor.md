@@ -137,8 +137,8 @@ those events and nothing else.
 |---|---|
 | `workflow/defs.py` | Delivered. Closed-schema load, expansion, refusal codes. |
 | `workflow/board.py` | Delivered. Read-only rendering of runs. |
-| `workflow_cli.py` | Delivered for `ls`/`show`/`status`/`run --dry-run`; extended with `run`, `stop`, `accept`, `reject`, `retry`, `plan`. |
-| `workflow/author.py` | New. `plan`: one agent drafts a definition against the closed schema; `defs.py` judges the file, and nothing is dispatched. The schema stays closed — a draft is refused by name, never half-run. |
+| `workflow_cli.py` | Delivered for `ls`/`show`/`status`/`run --dry-run`; extended with `run`, `stop`, `accept`, `reject`, `retry`, `plan`, `go`, and `run --run <id>` (continue one named run). |
+| `workflow/author.py` | New. `plan`: one agent drafts a definition against the closed schema; `defs.py` judges the file, and nothing is dispatched. The schema stays closed — a draft is refused by name, never half-run. `go` composes it with `start_run` and `spawn_scheduler`, so one sentence becomes a run that outlives the tool call: the scheduler is its own detached process and writes `runs/<run_id>/scheduler.log`. |
 | `workflow/executor.py` | New. The scheduler: `join()`, `judge()`, `dispatch()`, one `tick()` per poll interval. |
 | `workflow/archive.py` | New. `run.json`, step records, verdict ledger, request side files. The only writer of run state. |
 | `watch`/watcher | One behaviour added (stall resend); no structural change. |

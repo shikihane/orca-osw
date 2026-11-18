@@ -36,6 +36,8 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -177,13 +179,17 @@ def run_run(
     dispatch: Dispatch = default_dispatch,
     approved: bool = False,
     interval: float | None = None,
+    run_id: str | None = None,
 ) -> dict:
     """Execute a definition until the run reaches a terminal state.
 
-    ``resume`` reopens the newest run of this definition that a dead scheduler
-    left ``running``; its finished steps are reused by key. The loop owns the
-    polling cadence (``interval``, default ``POLL_LOCAL_SECONDS``); ``tick``
-    does one pass and is what tests drive.
+    ``run_id`` continues one run whose header already exists — that is how a
+    detached scheduler picks up the run ``workflow go`` created before it was
+    spawned, without guessing which run was meant. ``resume`` reopens the newest
+    run of this definition that a dead scheduler left ``running``; its finished
+    steps are reused by key. The loop owns the polling cadence (``interval``,
+    default ``POLL_LOCAL_SECONDS``); ``tick`` does one pass and is what tests
+    drive.
     """
     if definition.approval == "human" and not approved:
         raise WorkflowError(
@@ -192,22 +198,94 @@ def run_run(
             "approve it, then run with --yes",
         )
     root = Path(root)
-    run = _resume_target(root, definition) if resume else None
-    if run is None:
-        run = archive.create_run(
-            root, definition,
-            policy=policy, verify=verify, max_attempts=max_attempts,
-        )
-        run["definition_sha"] = _definition_sha(definition)
-        archive.write_run(root, run)
-    else:
+    if run_id:
+        run = read_run(root, run_id)
         _reopen_stopped(root, run)
+    else:
+        run = _resume_target(root, definition) if resume else None
+        if run is None:
+            run = start_run(
+                root, definition,
+                policy=policy, verify=verify, max_attempts=max_attempts,
+            )
+        else:
+            _reopen_stopped(root, run)
     pause = POLL_LOCAL_SECONDS if interval is None else max(0.0, float(interval))
     while True:
         status = tick(root, run["run_id"], dispatch=dispatch)
         if status != RUNNING:
             return read_run(root, run["run_id"])
         time.sleep(pause)
+
+
+def start_run(
+    root: Path,
+    definition: Definition,
+    *,
+    policy: str = "strict",
+    verify: str = "suspect",
+    max_attempts: int = 2,
+) -> dict:
+    """Create the run header and return it, dispatching nothing.
+
+    A detached scheduler needs the run id before it exists as a process, so the
+    caller that spawns it creates the archive first and hands the id over.
+    """
+    run = archive.create_run(
+        root, definition,
+        policy=policy, verify=verify, max_attempts=max_attempts,
+    )
+    run["definition_sha"] = _definition_sha(definition)
+    archive.write_run(root, run)
+    return run
+
+
+def spawn_scheduler(
+    root: Path,
+    run: Mapping[str, Any],
+    definition: Definition,
+    *,
+    policy: str = "strict",
+    verify: str = "suspect",
+    max_attempts: int = 2,
+) -> dict:
+    """Start this run's scheduler as its own process and return where it writes.
+
+    ``workflow go`` has to survive the shell that started it: the caller is a
+    short-lived tool call, while the run lasts minutes. The child gets the run
+    id explicitly, so it continues exactly that run and no other, and its
+    output goes to the run's own ``scheduler.log`` — the archive stays the only
+    thing anyone reads.
+    """
+    run_dir = archive.run_dir(Path(root), str(run["run_id"]))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / "scheduler.log"
+    argv = [
+        sys.executable, str(fanout.script_path()), "workflow", "run",
+        definition.name,
+        "--run", str(run["run_id"]),
+        "--policy", policy,
+        "--verify", verify,
+        "--max-attempts", str(max_attempts),
+        "--json",
+    ]
+    with open(log_path, "ab") as sink:
+        if os.name == "nt":
+            flags = (
+                getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            )
+            child = subprocess.Popen(
+                argv, cwd=str(root), stdin=subprocess.DEVNULL,
+                stdout=sink, stderr=subprocess.STDOUT, creationflags=flags,
+            )
+        else:
+            child = subprocess.Popen(
+                argv, cwd=str(root), stdin=subprocess.DEVNULL,
+                stdout=sink, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+    return {"pid": child.pid, "log": str(log_path)}
 
 
 def _resume_target(root: Path, definition: Definition) -> dict | None:

@@ -700,6 +700,39 @@ class Watcher:
         self._turn_truncated_at = 0
         self._task_truncated_at = 0
 
+    async def _reclaim_pane(self, *, human_turn: bool) -> bool:
+        """Close this agent's pane now that a clean turn is over.
+
+        The record keeps the provider session id and the report and handoff
+        keep the evidence, so `revive` can reopen the session in a fresh pane;
+        leaving the pane behind is what piles terminals up on the desk. The
+        policy is `reclaim.decision`, the same one `osw sweep` applies, so an
+        adopted or supervised pane is never touched. True when a pane closed.
+        """
+        allowed = reclaim.decision(
+            {**self.agent, "state": "done"}, human_turn=human_turn,
+        )[0]
+        if not allowed:
+            return False
+        try:
+            closed = await reclaim.close_if_open(
+                self.root, self.agent, host=self.host,
+            )
+        except OrcaError as exc:
+            # Closing is housekeeping: a failure here must not turn a
+            # finished turn into an error.
+            self._event(
+                "pane_reclaim_failed",
+                level="WARNING",
+                message=one_line(str(exc), 200),
+            )
+            return False
+        if not closed:
+            return False
+        self._update(pane_reclaim="auto", pane_reclaimed_at=now_iso())
+        self._event("pane_reclaimed", data={"by": "auto"})
+        return True
+
     def _update(self, **fields) -> None:
         changed = False
         for key, value in fields.items():
@@ -3308,6 +3341,13 @@ class Watcher:
         except OSError:
             pass
 
+        # A clean turn keeps nothing in its pane, so the pane goes now
+        # rather than waiting for someone to run `osw sweep`. Failed
+        # turns keep theirs: that is where the failure is still visible.
+        closed = False
+        if final_state == "done" and not os.environ.get("OSW_KEEP_TERMINAL"):
+            closed = await self._reclaim_pane(human_turn=following or resuming)
+
         if final_state == "error":
             line = (
                 f"# [osw] task-error agent={self.agent_id}"
@@ -3325,7 +3365,7 @@ class Watcher:
                 summary=last_msg,
                 outcome=str(self.agent.get("orchestration_outcome") or ""),
                 warning=warning,
-                cleanup="sweep" if reclaimable else "",
+                cleanup="auto" if closed else ("sweep" if reclaimable else ""),
             )
         if self._mailbox_running():
             # §14: the spool report above is this turn's conclusion and the

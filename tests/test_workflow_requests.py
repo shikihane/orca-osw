@@ -275,7 +275,8 @@ def _fake_executor(monkeypatch, *, result: dict | None = None,
     """Replace the one dispatch seam: record the call, return a finished run."""
     calls: dict = {}
 
-    def run_run(root, definition, *, policy, verify, max_attempts, resume, approved):
+    def run_run(root, definition, *, policy, verify, max_attempts, resume, approved,
+                run_id=None):
         calls.update({
             "root": root,
             "definition": definition,

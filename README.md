@@ -95,7 +95,7 @@ python skill/osw.py status
 - OSW adds the provider's non-blocking autonomy flag by default: `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`, `pi --approve`, `omp --auto-approve`, `kimi --yolo`, or `grok --always-approve --trust`.
 - `new` and `use` accept `--caller-terminal <handle>` to receive completion reports on a parent terminal. Run from an Orca chat (a structured agent session, which has no terminal handle), the caller is the injected `ORCA_AGENT_SESSION_ID`, recorded as `caller_session: orca_session_id:<id>`; the watcher delivers through `orca orchestration send`, which Orca injects into that chat as a user turn.
 - `del --close` also asks Orca to close the terminal.
-- **Closing finished terminals is the supervisor's duty, and it is mandatory.** OSW never closes a pane by itself: a completed turn's notification ends with `cleanup=sweep`, and you close it with `osw sweep` before reporting the task done. Records and `session_id` stay, so `revive <agent_id>` resumes the session in a fresh terminal. Panes kept on purpose: adopted ones (`use`/`enroll`), supervised dispatch terminals (Orca owns them; `del <id> --close` releases them), failed turns (`error`/`lost`, until `sweep --force`), human-reopened turns (`guard`/`revive`), and records whose watcher is still alive.
+- **A `done` turn closes its own terminal.** When a turn settles `done` the watcher applies the reclamation policy and closes the pane it was given: the completion line then carries `cleanup=auto` and the record gains `pane_reclaim: "auto"`. Records and `session_id` stay, so `revive <agent_id>` resumes the session in a fresh terminal. `osw sweep` is still the backstop (and the only way to close a failed one, with `--force`); it prints what it kept and why. Panes never closed automatically: adopted ones (`use`/`enroll`), supervised dispatch terminals (Orca owns them; `del <id> --close` releases them), failed turns (`error`/`lost`), human-reopened turns (`guard`/`revive`), and a `done` turn with `OSW_KEEP_TERMINAL=1` in its environment.
 - `list --json` outputs raw JSON.
 
 ## Orca Compatibility
@@ -466,6 +466,7 @@ from what the last one produced — so a run that dies halfway can be finished
 instead of restarted.
 
 ```bash
+python skill/osw.py workflow go "audit every HTTP route for missing auth"  # plan + start, then return
 python skill/osw.py workflow plan "audit every HTTP route for missing auth"   # one agent drafts the plan
 python skill/osw.py workflow run audit-routes --dry-run   # phases and agent count, nothing created
 python skill/osw.py workflow run audit-routes             # execute
@@ -475,6 +476,14 @@ python skill/osw.py workflow ls ; workflow show <run>
 python skill/osw.py workflow accept|reject|retry <run> <step> --reason "..."
 python skill/osw.py workflow stop <run>
 ```
+
+`go` is the one-shot entry an agent calls: it drafts the definition, validates
+it, creates the run and starts the scheduler as its own detached process, then
+prints `STARTED <run_id> ... pid <n>` and exits. A workflow outlives the tool
+call that asked for it, so progress is read from `workflow status <run_id>`
+(the archive) and the scheduler's own output lands in
+`.orca/osw/runs/<run_id>/scheduler.log`. `/osw workflow "<sentence>"` routes
+here.
 
 `plan` writes the definition for you: one ordinary agent drafts
 `.orca/osw/workflows/<name>.json` from the sentence, `defs.py` judges it, and

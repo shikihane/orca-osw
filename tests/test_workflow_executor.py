@@ -596,3 +596,58 @@ def test_resume_continues_a_stopped_run(tmp_path):
     assert resumed["state"] == "done"
     phases = [plan["phase"] for plan in fake.plans]
     assert phases == ["scan", "scan", "report"], phases
+
+
+# ---------------------------------------------------------------------------
+# One-shot start: go creates the run, the child scheduler continues it
+# ---------------------------------------------------------------------------
+
+def test_start_run_creates_a_running_header(tmp_path):
+    definition = install(tmp_path, [SCAN])
+
+    run = executor.start_run(tmp_path, definition, policy="partial", verify="none")
+
+    saved = board.read_run(tmp_path, run["run_id"])
+    assert saved["state"] == "running"
+    assert saved["policy"] == "partial"
+    assert saved["verify"] == "none"
+    assert saved["definition_sha"]
+
+
+def test_run_run_continues_the_run_it_is_given(tmp_path):
+    definition = install(tmp_path, [SCAN])
+    seeded = executor.start_run(tmp_path, definition)
+    fake = Fake(tmp_path, auto_finish=True)
+
+    final = executor.run_run(
+        tmp_path, definition, run_id=seeded["run_id"], interval=0.0, dispatch=fake,
+    )
+
+    assert final["run_id"] == seeded["run_id"]
+    assert final["state"] == "done"
+    assert [saved["run_id"] for saved in board.list_runs(tmp_path)] == [seeded["run_id"]]
+
+
+def test_spawn_scheduler_hands_the_run_id_to_the_child(tmp_path, monkeypatch):
+    definition = install(tmp_path, [SCAN])
+    run = executor.start_run(tmp_path, definition)
+    captured: dict = {}
+
+    class Child:
+        pid = 4242
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured["log"] = kwargs["stdout"].name
+        return Child()
+
+    monkeypatch.setattr(executor.subprocess, "Popen", fake_popen)
+    spawned = executor.spawn_scheduler(tmp_path, run, definition, policy="partial")
+
+    argv = captured["argv"]
+    assert spawned["pid"] == 4242
+    assert argv[argv.index("--run") + 1] == run["run_id"]
+    assert argv[argv.index("--policy") + 1] == "partial"
+    assert "--json" in argv
+    assert Path(spawned["log"]).name == "scheduler.log"
+    assert Path(captured["log"]).name == "scheduler.log"

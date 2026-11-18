@@ -6412,23 +6412,79 @@ async def test_live_mailbox_lock_keeps_blocked_notice(tmp_path, spool_writes):
 # --- panes are never closed behind a running watcher ---------------------
 
 @pytest.mark.anyio
-async def test_finalize_never_closes_the_pane_itself(tmp_path, spool_writes):
-    """Cleanup is the supervisor's (`osw sweep`), not the watcher's: a
-    finished turn leaves its pane exactly as it is."""
+async def test_finalize_closes_the_pane_of_a_clean_turn(tmp_path, spool_writes):
+    """A finished turn keeps nothing in its pane, so the watcher closes it
+    itself: leaving that to a human is what piles terminals up."""
     _spool_agent(tmp_path, origin="new", pane_key="tab-a:leaf-b")
     watcher = Watcher(tmp_path, "agent_001")
     close = AsyncMock(return_value={})
 
-    with patch("osw.reclaim.terminal_list",
+    with patch.object(Watcher, "_notify", AsyncMock(return_value=None)), \
+         patch("osw.reclaim.terminal_list",
+               AsyncMock(return_value=[
+                   {"handle": "term-a", "tabId": "tab-a", "leafId": "leaf-b"}])), \
+         patch("osw.reclaim.terminal_close", close):
+        await watcher._finalize("done", "ps_done")
+
+    close.assert_awaited_once()
+    assert close.await_args.args == ("term-a",)
+    record = state.read_agent(tmp_path, "agent_001")
+    assert record["pane_reclaim"] == "auto"
+    assert record["pane_reclaimed_at"]
+
+
+@pytest.mark.anyio
+async def test_finalize_keeps_the_pane_of_a_failed_turn(tmp_path, spool_writes):
+    """A failed turn's pane is where the failure is still readable."""
+    _spool_agent(tmp_path, origin="new", pane_key="tab-a:leaf-b")
+    watcher = Watcher(tmp_path, "agent_001")
+    close = AsyncMock(return_value={})
+
+    with patch.object(Watcher, "_notify", AsyncMock(return_value=None)), \
+         patch("osw.reclaim.terminal_list",
+               AsyncMock(return_value=[
+                   {"handle": "term-a", "tabId": "tab-a", "leafId": "leaf-b"}])), \
+         patch("osw.reclaim.terminal_close", close):
+        await watcher._finalize("error", "timeout")
+
+    close.assert_not_awaited()
+    assert "pane_reclaim" not in state.read_agent(tmp_path, "agent_001")
+
+
+@pytest.mark.anyio
+async def test_finalize_honours_the_keep_terminal_switch(
+    tmp_path, spool_writes, monkeypatch,
+):
+    monkeypatch.setenv("OSW_KEEP_TERMINAL", "1")
+    _spool_agent(tmp_path, origin="new", pane_key="tab-a:leaf-b")
+    watcher = Watcher(tmp_path, "agent_001")
+    close = AsyncMock(return_value={})
+
+    with patch.object(Watcher, "_notify", AsyncMock(return_value=None)), \
+         patch("osw.reclaim.terminal_list",
                AsyncMock(return_value=[
                    {"handle": "term-a", "tabId": "tab-a", "leafId": "leaf-b"}])), \
          patch("osw.reclaim.terminal_close", close):
         await watcher._finalize("done", "ps_done")
 
     close.assert_not_awaited()
-    record = state.read_agent(tmp_path, "agent_001")
-    assert "pane_reclaim" not in record
-    assert "pane_reclaimed_at" not in record
+
+
+@pytest.mark.anyio
+async def test_a_failed_close_still_lands_the_turn(tmp_path, spool_writes):
+    """Housekeeping never decides the turn: a refused close is one warning."""
+    _spool_agent(tmp_path, origin="new", pane_key="tab-a:leaf-b")
+    watcher = Watcher(tmp_path, "agent_001")
+
+    with patch.object(Watcher, "_notify", AsyncMock(return_value=None)), \
+         patch("osw.reclaim.terminal_list",
+               AsyncMock(return_value=[
+                   {"handle": "term-a", "tabId": "tab-a", "leafId": "leaf-b"}])), \
+         patch("osw.reclaim.terminal_close",
+               AsyncMock(side_effect=OrcaError("runtime down", 1))):
+        await watcher._finalize("done", "ps_done")
+
+    assert state.read_agent(tmp_path, "agent_001")["state"] == "done"
 
 
 def test_completion_report_flags_a_reclaimable_pane():
@@ -6440,9 +6496,9 @@ def test_completion_report_flags_a_reclaimable_pane():
 
 
 @pytest.mark.anyio
-async def test_finalize_flags_the_pane_for_the_supervisor(tmp_path, spool_writes):
-    """The watcher never closes a pane; it tells the supervisor that this
-    one is reclaimable, and the skill makes sweeping it mandatory."""
+async def test_finalize_reports_the_cleanup_it_did(tmp_path, spool_writes):
+    """The completion line says what happened to the pane: `auto` when the
+    watcher closed it, `sweep` when it is gone already."""
     _spool_agent(tmp_path, origin="new", pane_key="tab-a:leaf-b")
     watcher = Watcher(tmp_path, "agent_001")
     sent: list[str] = []
@@ -6450,10 +6506,30 @@ async def test_finalize_flags_the_pane_for_the_supervisor(tmp_path, spool_writes
     async def fake_notify(self, message):
         sent.append(message)
 
-    with patch.object(Watcher, "_notify", fake_notify):
+    with patch.object(Watcher, "_notify", fake_notify), \
+         patch("osw.reclaim.terminal_list", AsyncMock(return_value=[])):
         await watcher._finalize("done", "ps_done")
 
     assert sent and "cleanup=sweep" in sent[0]
+
+
+@pytest.mark.anyio
+async def test_finalize_says_auto_when_it_closed_the_pane(tmp_path, spool_writes):
+    _spool_agent(tmp_path, origin="new", pane_key="tab-a:leaf-b")
+    watcher = Watcher(tmp_path, "agent_001")
+    sent: list[str] = []
+
+    async def fake_notify(self, message):
+        sent.append(message)
+
+    with patch.object(Watcher, "_notify", fake_notify), \
+         patch("osw.reclaim.terminal_list",
+               AsyncMock(return_value=[
+                   {"handle": "term-a", "tabId": "tab-a", "leafId": "leaf-b"}])), \
+         patch("osw.reclaim.terminal_close", AsyncMock(return_value={})):
+        await watcher._finalize("done", "ps_done")
+
+    assert sent and "cleanup=auto" in sent[0]
 
 
 @pytest.mark.anyio

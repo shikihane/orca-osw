@@ -43,3 +43,21 @@ def test_install_replaces_existing_directory(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert not (stale / "leftover.txt").exists()
     assert (stale / "SKILL.md").is_file()
+
+
+def test_install_writes_the_slash_command_where_each_harness_reads_it(tmp_path):
+    for harness, folder in ((".claude", "commands"), (".codex", "prompts")):
+        root = tmp_path / harness / "skills"
+
+        result = subprocess.run(
+            [sys.executable, str(REPO / "install.py"), str(root)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        command = tmp_path / harness / folder / "osw-workflow.md"
+        assert command.is_file()
+        assert "workflow go" in command.read_text(encoding="utf-8")
+        assert "workflow status" in command.read_text(encoding="utf-8")

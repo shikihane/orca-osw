@@ -235,6 +235,63 @@ def plan(
     ))
 
 
+@workflow_app.command("go")
+def go(
+    request: str = typer.Argument(..., metavar="TEXT"),
+    name: str = typer.Option(
+        "", "--name", help="Definition file stem (default: taken from the request)",
+    ),
+    policy: str = typer.Option(
+        "strict", "--policy", help="A failed step stops the phase (strict) or "
+        "leaves a recorded gap (partial)",
+        click_type=click.Choice(POLICIES),
+    ),
+    verify: str = typer.Option(
+        "suspect", "--verify", help="Verify nothing, only suspect steps, or all",
+        click_type=click.Choice(VERIFY_MODES),
+    ),
+    max_attempts: int = typer.Option(
+        2, "--max-attempts", min=1, help="Attempts per step before it fails",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
+) -> None:
+    """Plan and start a run from one sentence, then return.
+
+    One agent drafts the definition, the validator judges it, the run is
+    created, and its scheduler starts as its own process — a workflow outlives
+    the shell or tool call that asked for it, so this command returns the run id
+    instead of blocking. Progress comes from ``workflow status``; the scheduler
+    writes its own output to the run's ``scheduler.log``.
+    """
+    root = resolve_project_root()
+    from osw.workflow import author, executor
+
+    with _errors():
+        path, definition = author.author(root, request, name=name)
+        _cap_guard(definition, expand(definition))
+        run = executor.start_run(
+            root, definition,
+            policy=policy, verify=verify, max_attempts=max_attempts,
+        )
+        spawned = executor.spawn_scheduler(
+            root, run, definition,
+            policy=policy, verify=verify, max_attempts=max_attempts,
+        )
+    if json_output:
+        _echo_json({
+            "run_id": run["run_id"],
+            "definition": definition.name,
+            "path": str(path),
+            "pid": spawned["pid"],
+            "log": spawned["log"],
+        })
+        return
+    typer.echo(f"STARTED {run['run_id']}  def {definition.name}  pid {spawned['pid']}")
+    typer.echo(f"DEF {definition.name} {path}")
+    typer.echo(f"LOG {spawned['log']}")
+    typer.echo(f"NEXT python osw.py workflow status {run['run_id']}")
+
+
 @workflow_app.command("run")
 def run(
     name: str = typer.Argument(..., metavar="NAME"),
@@ -258,6 +315,10 @@ def run(
     ),
     yes: bool = typer.Option(
         False, "--yes", help="Approve a run whose definition asks for human approval",
+    ),
+    attach: str = typer.Option(
+        "", "--run", metavar="RUN_ID",
+        help="Continue this existing run instead of creating one (used by `go`)",
     ),
     json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
 ) -> None:
@@ -284,6 +345,7 @@ def run(
                 max_attempts=max_attempts,
                 resume=resume,
                 approved=bool(yes),
+                run_id=attach.strip() or None,
             )
         if json_output:
             _echo_json(final)
