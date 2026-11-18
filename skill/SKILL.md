@@ -1,6 +1,6 @@
 ---
 name: osw
-description: Use when delegating, coordinating, resuming, monitoring, or recovering Orca-backed Claude, Codex, Pi, OMP, or Kimi sessions in the current worktree
+description: Use when delegating, coordinating, resuming, monitoring, or recovering Orca-backed Claude, Codex, Pi, OMP, or Kimi sessions in the current worktree; also when the request names an osw workflow, a phased run, or one audit/port/review fanned out across many independent units
 ---
 
 # OSW Agent Supervisor
@@ -42,32 +42,22 @@ recovery (`enroll`, `guard`, `revive`, `stop`), diagnosis, or cleanup, read
 
 ## Phased Runs
 
-Invocation shortcut: a skill invocation whose text starts with `workflow`
+Invocation shortcut: an invocation whose text starts with `workflow`
 (for example `/osw workflow "audit every HTTP route for missing auth"`) means
 run `workflow go` with that text as the request, then watch it to the end —
-planning, drafting, validation and start are all inside that one command.
+planning, drafting, validation and start are all inside that one command. A
+plain request that names an `osw workflow` or a phased run, in any phrasing,
+means the same thing; the slash form is only the explicit spelling.
 
 For work that is many independent units plus a check and a summary — audit every
 route, port every handler, review every module — build a workflow instead of
 hand-rolling a fan-out. `.orca/osw/workflows/<name>.json` holds phases; the
 `scheduler` expands them and is the only writer of `.orca/osw/runs/<run_id>/`.
 
-```text
-python <skill-dir>/osw.py workflow go "<one sentence>" --name <slug>   # plan + start, returns
-python <skill-dir>/osw.py workflow status <run_id> --json              # the archive is the truth
-python <skill-dir>/osw.py workflow plan "<one sentence>"               # draft only, no run
-python <skill-dir>/osw.py workflow run <slug> --dry-run                # show the expansion
-python <skill-dir>/osw.py workflow run <slug>                          # the command is the scheduler
-python <skill-dir>/osw.py sweep                                        # reclaim finished panes
-```
-
-`go` creates the run, then starts the scheduler as its own process, so the run
-outlives the tool call that asked for it; its output goes to
-`.orca/osw/runs/<run_id>/scheduler.log`. A run started in a pane keeps the
-caller terminal; from a plain shell or CI it dispatches with `--no-notify`.
-`--resume` reuses finished steps by key, so an interrupted run continues where
-it stopped. Do not hand-write the definition to get past a validator refusal:
-fix the draft.
+The recipe lives in one place: read
+[references/workflow.md](references/workflow.md) and follow it with the request
+as the task. The `/osw-workflow` command follows the same page, so the two entry
+points cannot drift apart.
 
 ## Quick Start
 

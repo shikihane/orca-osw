@@ -59,5 +59,12 @@ def test_install_writes_the_slash_command_where_each_harness_reads_it(tmp_path):
         assert result.returncode == 0, result.stdout + result.stderr
         command = tmp_path / harness / folder / "osw-workflow.md"
         assert command.is_file()
-        assert "workflow go" in command.read_text(encoding="utf-8")
-        assert "workflow status" in command.read_text(encoding="utf-8")
+        text = command.read_text(encoding="utf-8")
+        assert "references/workflow.md" in text
+        # The recipe itself ships beside the skill, so both entry points
+        # read the same page instead of two copies that drift.
+        recipe = root / "osw" / "references" / "workflow.md"
+        assert recipe.is_file()
+        recipe_text = recipe.read_text(encoding="utf-8")
+        assert "workflow go" in recipe_text
+        assert "workflow status" in recipe_text

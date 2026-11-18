@@ -1,4 +1,4 @@
 interface:
   display_name: "OSW Agent Supervisor"
-  short_description: "Coordinate Orca-backed coding agent sessions"
+  short_description: "Coordinate Orca-backed coding agents; run phased workflows"
   default_prompt: "Use $osw to delegate and coordinate this task in the current worktree."
