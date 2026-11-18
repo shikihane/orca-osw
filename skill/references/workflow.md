@@ -9,9 +9,8 @@ agent drafts it against the closed schema, `defs.py` judges the file, and
 `run --dry-run` shows the expansion first, so a bad draft is refused by name
 rather than half-run.
 
-Both entry points — a skill invocation that names an `osw workflow`, and the
-`/osw-workflow` command — follow this page. There is one recipe on purpose:
-two copies drift apart.
+This page is the only recipe: the skill is the entry, and nothing else mirrors
+it.
 
 The request: **<the request>**
 

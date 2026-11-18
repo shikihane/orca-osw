@@ -42,13 +42,12 @@ recovery (`enroll`, `guard`, `revive`, `stop`), diagnosis, or cleanup, read
 
 ## Phased Runs
 
-Invocation shortcut: an invocation whose text starts with `workflow`
-(for example `/osw workflow "audit every HTTP route for missing auth"`) means
-run `workflow go` with that text as the request, then watch it to the end —
-planning, drafting, validation and start are all inside that one command, which
-returns at once with a `PLANNING` job instead of blocking for the draft. A
-plain request that names an `osw workflow` or a phased run, in any phrasing,
-means the same thing; the slash form is only the explicit spelling.
+Invocation shortcut: an invocation whose text starts with `workflow` — the same
+words in any phrasing — means run `workflow go` with that text as the request,
+then watch it to the end. Planning, drafting, validation and start are all
+inside that one command, which returns at once with a `PLANNING` job instead of
+blocking for the draft. There is no other entry point and no command file to
+keep in sync.
 
 For work that is many independent units plus a check and a summary — audit every
 route, port every handler, review every module — build a workflow instead of
@@ -57,8 +56,7 @@ hand-rolling a fan-out. `.orca/osw/workflows/<name>.json` holds phases; the
 
 The recipe lives in one place: read
 [references/workflow.md](references/workflow.md) and follow it with the request
-as the task. The `/osw-workflow` command follows the same page, so the two entry
-points cannot drift apart.
+as the task. The skill is the only entry; nothing else mirrors this page.
 
 ## Quick Start
 

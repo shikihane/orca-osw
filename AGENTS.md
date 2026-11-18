@@ -320,11 +320,9 @@ copied files.
 - Codex destination: `C:\Users\shiki\.codex\skills\osw\`
 - Agents destination: `C:\Users\shiki\.agents\skills\osw\`
 - Claude destination: `C:\Users\shiki\.claude\skills\osw\`
-- A skill directory cannot define a slash command, so `install.py` also drops
-  `skill/commands/workflow.md` into the folder each harness searches for one:
-  `~/.claude/commands/osw-workflow.md` and
-  `~/.codex/prompts/osw-workflow.md` (`/osw-workflow`). The agents (omp) skill
-  needs no command file: its skill itself is the entry point.
+- One entry, no side copies: the skill directory itself. `/osw …` in Claude
+  Code, `/skill:osw` in omp, the `osw` skill in Codex. There is no separate
+  command file, prompt file, or extra copy anywhere else.
 - Never use junctions, symbolic links, hard links, directory links, reparse
   points, or any other link-like mechanism for either the directory or its
   files.
