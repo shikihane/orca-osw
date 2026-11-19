@@ -78,6 +78,11 @@ Rules:
   that does the bulk work is "repeat": true and max_rounds is 3 unless the
   request says otherwise. repeat belongs only to a for_each phase and needs
   non-empty from, non-empty criteria and max_rounds greater than 1.
+- Size max_agents for the whole run, not for one phase: every for_each unit,
+  one gate agent per phase that declares criteria, and every round a repeat
+  phase may take all draw on the same ceiling. A ceiling below that is refused
+  with too_many_agents only after the earlier phases have already been paid for,
+  so count them before choosing the number.
 - The final phase's criteria must restate the goal, not "a summary exists".
 - A phase whose results a later phase consumes must write a JSON array to the
   path __OUTPUT__. Its task must say to write exactly that file.

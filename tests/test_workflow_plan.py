@@ -130,6 +130,8 @@ def test_plan_prompt_states_the_goal_criteria_repeat_and_final_rules(tmp_path):
     assert "declares criteria" in flat and "evidence" in flat
     assert "Phrase criteria as what one command proves" in flat
     assert 'the phase that does the bulk work is "repeat": true and max_rounds is 3' in flat
+    assert "Size max_agents for the whole run" in flat
+    assert "one gate agent per phase that declares criteria" in flat
     assert "The final phase's criteria must restate the goal" in flat
     # The pre-existing rules survive the addition.
     assert "Use 2 to 6 phases." in flat
