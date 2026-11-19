@@ -116,7 +116,9 @@ REVIVE_TIMEOUT_SECONDS = 120.0
 #: one agent reading files a person named, so the ceiling belongs to the prompt.
 GATE_MAX_FILES = 20
 GATE_MAX_FILE_BYTES = 8 * 1024
-GATE_MAX_TOTAL_BYTES = 200 * 1024
+#: How much of an evidence file the brief quotes. The gate reads the rest
+#: itself; whole-file inlining only inflated the brief.
+GATE_HEAD_LINES = 20
 #: Windows refuses a command line over ~32 KiB (WinError 206). The dispatch
 #: seam passes a prompt as one argv token, so a prompt above this is refused
 #: here, with a reason, instead of surfacing as an OS error from `new`.
@@ -1495,25 +1497,24 @@ def _evidence_files(root: Path, phase: Phase) -> list[Path]:
 
 
 def _evidence_block(root: Path, phase: Phase) -> str:
-    """The evidence a gate may read, bounded so no file floods the prompt."""
+    """The evidence a gate may read: each file's path, plus its opening lines.
+
+    The gate has read tools, so inlining whole files bought nothing and cost
+    tokens — a measured brief came to 18 KiB of evidence for one phase. Paths
+    plus enough context to tell one file from another is what the brief needs;
+    the gate opens whatever it must judge.
+    """
     paths = _evidence_files(root, phase)
     if not paths:
         return "(no file matched the declared evidence globs)"
-    parts: list[str] = []
-    total = 0
+    parts = [f"{len(paths)} file(s) — read the ones you need yourself."]
     for path in paths:
         text = _read_capped(path, GATE_MAX_FILE_BYTES)
-        size = len(text.encode("utf-8"))
-        if total + size > GATE_MAX_TOTAL_BYTES:
-            # The per-file and file-count caps already bound this; the total is
-            # the promise, so it is enforced here too rather than assumed.
-            parts.append(
-                f"(evidence truncated: the round names {len(paths)} files and "
-                f"they exceed {GATE_MAX_TOTAL_BYTES} bytes)"
-            )
-            break
-        total += size
-        parts.append(f"--- {_relative_to(root, path)} ---\n{text}")
+        lines = text.splitlines()
+        head = "\n".join(lines[:GATE_HEAD_LINES])
+        if len(lines) > GATE_HEAD_LINES:
+            head += "\n(... read the file for the rest)"
+        parts.append(f"--- {_relative_to(root, path)} ---\n{head}")
     return "\n\n".join(parts)
 
 

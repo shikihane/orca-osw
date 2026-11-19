@@ -335,6 +335,37 @@ def test_a_valid_second_answer_still_starts_the_round(tmp_path):
     assert len(steps_of(tmp_path, run["run_id"], "advance", 2)) == 1
 
 
+def test_the_brief_quotes_only_the_head_of_an_evidence_file(tmp_path):
+    """Paths plus a head: the gate reads the file itself for the rest.
+
+    Inlining whole evidence files made one measured brief 18 KiB, which is
+    tokens for text the gate never needed to be handed.
+    """
+    deep = tmp_path / "notes.md"
+    deep.write_text(
+        "\n".join([f"head-token-{line}" for line in range(20)]
+                  + ["late-token-70"]),
+        encoding="utf-8",
+    )
+    definition = install(
+        tmp_path,
+        [{"id": "scan", "mode": "single", "task": "scan the notes",
+          "criteria": "the scan is complete", "evidence": ["notes.md"]}],
+        goal="scan everything",
+    )
+    run = start(tmp_path, definition)
+    fake = Fake(tmp_path, run["run_id"])
+
+    assert run_to_terminal(tmp_path, run["run_id"], fake) == "done"
+
+    brief = archive.gate_brief_path(
+        tmp_path, run["run_id"], "scan", 1).read_text(encoding="utf-8")
+    assert "notes.md" in brief
+    assert "head-token-19" in brief
+    assert "late-token-70" not in brief
+    assert "read the file for the rest" in brief
+
+
 # ---------------------------------------------------------------------------
 # Rounds: a failing gate on a repeat phase is a new round
 # ---------------------------------------------------------------------------
