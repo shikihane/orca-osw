@@ -60,6 +60,7 @@ python <dir>/osw.py workflow wait <run-or-stem>                  # block until t
 python <dir>/osw.py workflow goal <run_id>                       # what the run is for
 python <dir>/osw.py workflow goal <run_id> --set "<sentence>" --reason "<why>"  # accept it
 python <dir>/osw.py workflow resume <run_id>                     # restart a dead scheduler
+python <dir>/osw.py workflow reload <run_id>                     # rebuild a wrong definition
 python <dir>/osw.py workflow next <run_id>                       # continue towards the goal
 python <dir>/osw.py workflow run <slug> --resume --run <id>        # the same, foreground
 python <dir>/osw.py workflow plan "<one sentence>"               # draft only, no run
@@ -120,6 +121,15 @@ a 5 s backoff, logging to `supervisor.log` and keeping `supervisor.json`
 entry: it starts a detached scheduler and `workflow run <slug> --resume --run
 <id>` is the same in the foreground; either reuses every finished step by key.
 A live scheduler refuses with `run_running`.
+
+A run that ended because the definition itself was wrong is rebuilt in place:
+fix the definition, then `workflow reload <run>`. Every `done` step is kept,
+every step that had not finished is dropped so it is re-rendered from the
+definition as it now reads (a changed prompt is a new step key, which is the
+contract), the ceiling becomes the definition's when it is higher — never below
+what the run already spent — and the run goes back to `running` for `resume`.
+It refuses `run_running` while a scheduler is alive, because run state has one
+writer at a time.
 
 `workflow goal <run>` prints the goal, its proposals and the round count;
 adding `--set "<sentence>" --reason "<why>"` records the acceptance and

@@ -638,6 +638,81 @@ def _reopen_stopped(root: Path, run: dict) -> None:
     archive.write_run(root, run)
 
 
+def reload_run(root: Path, run_id: str) -> dict:
+    """Re-read a terminal run's definition and rebuild what has not run yet.
+
+    A run whose definition was wrong stops exactly where the wrong criterion or
+    a too-small ceiling bites. Everything already `done` is kept; every step
+    still pending, failed or skipped is dropped so it can be re-rendered from
+    the definition as it now reads (a new prompt means a new step key, which is
+    the contract). The ceiling is raised to the definition's, never lowered
+    below what the run already spent, and the run goes back to `running` so
+    ``workflow resume`` can drive it.
+
+    Refused while a scheduler is alive: this writes run state, and run state has
+    one writer at a time.
+    """
+    root = Path(root)
+    run = read_run(root, run_id)
+    if archive.scheduler_alive(root, run):
+        raise WorkflowError(
+            "run_running",
+            f"run {run_id!r} still has a live scheduler; stop it or wait",
+        )
+    definition = load_definition(root, str(run.get("definition") or ""))
+    used = _used_agents(root, run)
+    ceiling = max(int(run.get("max_agents") or 0), used, definition.max_agents)
+    dropped = 0
+    known = {phase.id for phase in definition.phases}
+    for entry in run.get("phases") or []:
+        if entry["id"] not in known:
+            raise WorkflowError(
+                "definition_invalid",
+                f"run {run_id!r} has phase {entry['id']!r}, which the "
+                f"definition no longer declares",
+            )
+        if entry.get("state") == PHASE_DONE:
+            continue
+        kept: list[str] = []
+        for key in entry.get("steps") or []:
+            record = archive.read_step(root, run_id, key)
+            # A finished work step is kept; a gate is not, even when its verdict
+            # was written — that verdict is exactly the judgment being replaced.
+            if (record is not None and record.get("state") == STEP_DONE
+                    and record.get("kind") != "gate"):
+                kept.append(key)
+                continue
+            dropped += 1
+            if record is not None and record.get("kind") == "gate":
+                output = str(record.get("output") or "")
+                if output:
+                    try:
+                        Path(output).unlink()
+                    except OSError:
+                        pass
+            try:
+                archive.step_path(root, run_id, key).unlink()
+            except OSError:
+                pass
+        entry["steps"] = kept
+        entry["state"] = PHASE_PENDING
+        entry["expanded"] = 0
+        entry["gate"] = {"round": 0, "step": "", "pass": None, "reason": ""}
+        entry["error"] = ""
+    run["max_agents"] = ceiling
+    run["definition_sha"] = _definition_sha(definition)
+    run["state"] = RUNNING
+    run["error"] = ""
+    run["finished"] = ""
+    run["finished_at"] = ""
+    archive.write_run(root, run)
+    log.info(
+        "run %s reloaded from %s: %d step(s) dropped, ceiling %s",
+        run_id, definition.path, dropped, ceiling,
+    )
+    return run
+
+
 def _stamp_scheduler(run: dict, stamp: str) -> None:
     """Say which process is driving this run, and that it is still ticking.
 

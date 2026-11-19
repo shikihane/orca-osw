@@ -784,6 +784,40 @@ def resume(
     typer.echo(f"LOG {log_path}")
 
 
+@workflow_app.command("reload")
+def reload_(
+    run_id: str = typer.Argument(..., metavar="RUN"),
+    json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
+) -> None:
+    """Rebuild a terminal run from its definition as it reads now.
+
+    A wrong criterion or a ceiling that bit stops a run where it stands; the
+    work already done is not wrong. This keeps every `done` step, drops the
+    rest so they are re-rendered (a changed prompt is a new step key), takes the
+    definition's ceiling when it is higher, and puts the run back in flight for
+    `workflow resume`. Refused `run_running` while a scheduler is alive.
+    """
+    root = resolve_project_root()
+    from osw.workflow import executor
+
+    with _errors():
+        _require_human(root, "reload")
+        run = executor.reload_run(root, run_id)
+    if json_output:
+        _echo_json({
+            "reloaded": True,
+            "run": run_id,
+            "max_agents": run.get("max_agents"),
+            "state": run.get("state"),
+        })
+        return
+    typer.echo(
+        f"RELOADED {run_id}  max_agents {run.get('max_agents')}  "
+        f"state {run.get('state')}"
+    )
+    typer.echo(f"NEXT python osw.py workflow resume {run_id}")
+
+
 # ---------------------------------------------------------------------------
 # Next and wait: the acting agent continues the work, no person in between
 #
