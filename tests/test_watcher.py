@@ -4877,6 +4877,46 @@ async def test_stop_waits_while_pane_keeps_producing_output(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_stop_sends_one_interrupt_and_never_repeats_it(tmp_path):
+    """The sidecar is an ask nobody in the pane hears: send the real Esc once.
+
+    A worker parked inside one long tool call never returns on its own, so
+    waiting for a natural settle is how a stop request used to cost eleven
+    minutes (2026-11-19). The watcher must interrupt, once, and not spam the
+    key on every poll afterwards.
+    """
+    watcher = _turn_agent(tmp_path)
+    watcher.deadline = time.monotonic() + 1
+    state.write_stop_request(tmp_path, "agent_001")
+    now_ms = int(time.time() * 1000)
+    interrupt = AsyncMock(return_value={})
+
+    with patch("osw.watcher.terminal_interrupt", interrupt), \
+         patch("osw.watcher.worktree_ps", AsyncMock(return_value=_ps_with(
+             "working", now_ms, interrupted=True))), \
+         patch("osw.watcher.terminal_show", _quiet_show(now_ms)), \
+         patch("osw.watcher.POLL_SECS", 0):
+        result = await watcher._wait_turn_done(
+            time.time() * 1000, sent_text="do the task")
+        assert await watcher._stop_requested_now() is True
+
+    assert result == "interrupted"
+    interrupt.assert_awaited_once()
+    assert interrupt.await_args.args[0] == watcher.handle
+
+
+@pytest.mark.anyio
+async def test_no_interrupt_without_a_stop_request(tmp_path):
+    watcher = _turn_agent(tmp_path)
+    interrupt = AsyncMock(return_value={})
+
+    with patch("osw.watcher.terminal_interrupt", interrupt):
+        assert await watcher._stop_requested_now() is False
+
+    interrupt.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_stop_turns_a_natural_done_into_interrupted(tmp_path):
     """pi ignores the interrupt and finishes normally: still a stopped turn."""
     watcher = _turn_agent(tmp_path)

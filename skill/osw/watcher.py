@@ -689,6 +689,7 @@ class Watcher:
         self._notified_classes: set[str] = set()
         self._task_group = None
         self._stop_at = ""  # stop request time, once observed
+        self._interrupt_sent = False  # one Esc per stop request, never repeated
         # Blocking-screen handling (plan §2.2), per watcher run:
         self._blockers_acted: set[str] = set()     # kinds keys went out for
         self._blockers_stopped: set[str] = set()   # kinds no longer automated
@@ -932,6 +933,36 @@ class Watcher:
         self._update(stop_requested_at=requested)
         self._event("stop_request_observed", data={"requested_at": requested})
         log.info("watcher(%s): stop requested at %s", self.agent_id, requested)
+        return True
+
+    async def _interrupt_once(self) -> None:
+        """Send the provider's interrupt key once per stop request.
+
+        The ``.stop`` sidecar is only an ask — nothing inside the pane hears
+        it. A provider parked inside one long tool call never returns on its
+        own, so the watcher would wait for a turn that cannot end (observed:
+        11 minutes on 2026-11-19). One Esc is the same interrupt
+        ``osw stop <agent>`` sends; it ends the current turn without killing
+        the session, so the existing settle path still writes the record and
+        the report.
+        """
+        if self._interrupt_sent:
+            return
+        self._interrupt_sent = True
+        try:
+            await terminal_interrupt(self.handle, host=self.host)
+        except OrcaError as exc:
+            self._event(
+                "stop_interrupt_failed", level="WARNING", message=exc.message,
+            )
+            return
+        self._event("stop_interrupt_sent", data={"at": self._stop_at})
+
+    async def _stop_requested_now(self) -> bool:
+        """``_stop_requested``, plus the interrupt the first time it is seen."""
+        if not self._stop_requested():
+            return False
+        await self._interrupt_once()
         return True
 
     async def _stop_settled(self) -> str:
@@ -1793,7 +1824,7 @@ class Watcher:
                 break
             blocked_sends += 1
             await anyio.sleep(BLOCKED_RETRY_SECS)
-        if source == "interrupted" or self._stop_requested():
+        if source == "interrupted" or await self._stop_requested_now():
             # A stopped task gets no handoff turn.
             await self._finalize("error", "interrupted")
             return
@@ -1838,7 +1869,7 @@ class Watcher:
                 # so a done in this turn still carries the task text.
                 also_ours=one_line(self.agent.get("prompt") or ""),
             )
-            if handoff_source == "interrupted" or self._stop_requested():
+            if handoff_source == "interrupted" or await self._stop_requested_now():
                 if not _handoff_ok(handoff):
                     self._update(handoff_path="")
                 await self._finalize("error", "interrupted")
@@ -1908,7 +1939,7 @@ class Watcher:
         self._event("follow_started", data={"ps_state": ps_state or "untracked"})
         if ps_state == "done":
             await self._record_session()
-            if self._stop_requested():
+            if await self._stop_requested_now():
                 await self._finalize("error", "interrupted")
                 return
             await self._finalize("done", "already_done")
@@ -1925,7 +1956,7 @@ class Watcher:
         tools = self._note_turn_tools("task")
         self._event("turn_finished", data={
             "phase": "task", "source": source, "tools_observed": tools})
-        if source == "interrupted" or self._stop_requested():
+        if source == "interrupted" or await self._stop_requested_now():
             await self._finalize("error", "interrupted")
             return
         if source in ("timeout", "terminal_lost"):
@@ -2004,7 +2035,7 @@ class Watcher:
             await anyio.sleep(SUPERVISED_POLL_SECS)
             # Record a stop as soon as it lands; the Dispatch settling
             # is still what ends the turn.
-            self._stop_requested()
+            await self._stop_requested_now()
             try:
                 data = await orchestration_worker_show(
                     dispatch_id, host=self.host)
@@ -2089,7 +2120,7 @@ class Watcher:
                 message=exc.message,
             )
 
-        if self._stop_requested():
+        if await self._stop_requested_now():
             # A stopped worker gets no wrap-up turn either.
             await self._finalize("error", "interrupted")
             return
@@ -2601,7 +2632,7 @@ class Watcher:
         idle_ignored = False
         busy_notified = False
         while time.monotonic() < self._ready_deadline:
-            if self._stop_requested():
+            if await self._stop_requested_now():
                 return "stop_requested"
             if self.pane is None:
                 self.pane = await _pane_key(self.handle, self.host)
@@ -3011,7 +3042,7 @@ class Watcher:
 
             # A stopped turn ends on the first sign the agent is no
             # longer working; normal completion evidence is moot then.
-            if self._stop_requested():
+            if await self._stop_requested_now():
                 reason = await self._stop_settled()
                 if reason:
                     self._event("stop_settled", data={"reason": reason})
