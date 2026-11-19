@@ -235,13 +235,44 @@ def test_the_gate_prompt_is_blind_and_names_the_reply_file(tmp_path):
     assert prompts, "no gate was dispatched"
     reply_file = archive.gate_output_path(tmp_path, run["run_id"], "advance", 1)
     for prompt in prompts:
-        assert "every item is reported" in prompt          # the run's goal
-        assert "- a is reported" in prompt                 # the criterion, per item
+        # The prompt stays small: goal, criterion and evidence live in the
+        # brief on disk, because Windows caps a command line near 32 KiB.
+        assert len(prompt) < 2000
         assert "write the result to" not in prompt         # never the worker prompt
         assert '"pass"' in prompt and '"next_items"' in prompt
     assert str(reply_file) in prompts[0]
     assert "-gate-r1.json" in prompts[0]
+    assert "-gate-r1.md" in prompts[0]
     assert all("-gate-r" not in prompt for prompt in fake.prompts("step"))
+
+    brief = archive.gate_brief_path(tmp_path, run["run_id"], "advance", 1)
+    text = brief.read_text(encoding="utf-8")
+    assert "every item is reported" in text                # the run's goal
+    assert "- a is reported" in text                       # the criterion, per item
+    assert "write the result to" not in text               # never the worker prompt
+
+
+def test_an_over_long_prompt_is_refused_before_dispatch(tmp_path):
+    """One argv token: a 40 KB prompt must fail here, not inside `new`.
+
+    Windows caps a command line near 32 KiB, so dispatching anyway surfaces a
+    WinError 206 that costs an attempt and names nothing useful. The step must
+    carry the reason instead, and no agent may be created.
+    """
+    definition = install(
+        tmp_path, [{"id": "scan", "mode": "single", "task": "x" * 40_000}],
+        goal="scan everything",
+    )
+    run = start(tmp_path, definition)
+    fake = Fake(tmp_path, run["run_id"])
+
+    assert run_to_terminal(tmp_path, run["run_id"], fake) == "failed"
+
+    step = steps_of(tmp_path, run["run_id"], "scan", 1)[0]
+    assert step["state"] == "failed"
+    assert "prompt_too_long" in step["error"]
+    assert str(executor.MAX_PROMPT_CHARS) in step["error"]
+    assert fake.plans == [], "an unusable prompt must not reach the dispatch seam"
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +306,9 @@ def test_a_failing_gate_starts_the_next_round(tmp_path):
 
     gates = [plan for plan in fake.plans if plan.get("kind") == "gate"]
     assert len(gates) == 2
-    assert gates[1]["prompt"].count("- c is reported") == 1
+    second_brief = archive.gate_brief_path(
+        tmp_path, run["run_id"], "advance", 2).read_text(encoding="utf-8")
+    assert second_brief.count("- c is reported") == 1
 
 
 def test_the_round_count_stops_at_max_rounds(tmp_path):

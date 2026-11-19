@@ -39,6 +39,7 @@ log = get_logger("workflow.archive")
 STEPS_DIR = "steps"
 REQUESTS_DIR = "requests"
 OUTPUTS_DIR = "outputs"
+GATES_DIR = "gates"
 VERDICT_FILE = "verdicts.jsonl"
 
 # Gate steps live in the same phase as the work they judge; -1 keeps them out
@@ -149,6 +150,18 @@ def gate_output_path(root: Path, run_id: str, phase_id: str, round_no: int) -> P
     """The file a gate step writes its verdict to: one per phase and round."""
     name = f"{_checked(str(phase_id), 'phase id')}-gate-r{int(round_no)}.json"
     return run_dir(root, run_id) / OUTPUTS_DIR / name
+
+
+def gate_brief_path(root: Path, run_id: str, phase_id: str, round_no: int) -> Path:
+    """The file the gate is told to read: goal, criterion, evidence, outputs.
+
+    The brief lives on disk instead of inside the prompt because the dispatch
+    seam passes a prompt as one command-line argument, and Windows refuses a
+    command line over ~32 KiB (WinError 206). A blind gate reads the same
+    content either way; a file has no length ceiling.
+    """
+    name = f"{_checked(str(phase_id), 'phase id')}-gate-r{int(round_no)}.md"
+    return run_dir(root, run_id) / GATES_DIR / name
 
 
 # ---------------------------------------------------------------------------

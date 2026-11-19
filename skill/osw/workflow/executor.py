@@ -117,6 +117,10 @@ REVIVE_TIMEOUT_SECONDS = 120.0
 GATE_MAX_FILES = 20
 GATE_MAX_FILE_BYTES = 8 * 1024
 GATE_MAX_TOTAL_BYTES = 200 * 1024
+#: Windows refuses a command line over ~32 KiB (WinError 206). The dispatch
+#: seam passes a prompt as one argv token, so a prompt above this is refused
+#: here, with a reason, instead of surfacing as an OS error from `new`.
+MAX_PROMPT_CHARS = 30_000
 
 
 # ---------------------------------------------------------------------------
@@ -1406,16 +1410,28 @@ def _gate_prompt(
     items = _round_items(root, dict(run), definition, entry, phase, int(round_no))
     goal = str(run.get("goal") or "").strip() or "(no goal recorded)"
     output = archive.gate_output_path(root, run["run_id"], phase.id, round_no)
-    return (
-        f"Gate task: answer one written criterion for phase {phase.id!r}, "
-        f"round {int(round_no)}.\n\n"
+    brief = archive.gate_brief_path(root, run["run_id"], phase.id, round_no)
+    brief.parent.mkdir(parents=True, exist_ok=True)
+    brief.write_text(
+        f"# Gate brief: phase {phase.id!r}, round {int(round_no)}\n\n"
         f"GOAL: {goal}\n\n"
         f"CRITERIA (all must hold):\n{_criteria_block(phase, items)}\n\n"
         f"EVIDENCE FILES:\n{_evidence_block(root, phase)}\n\n"
         f"ROUND OUTPUTS:\n{_round_outputs(root, run, phase)}\n\n"
         "Judge only against the criteria above. You are not shown the workers' "
         "prompts, their handoffs or an earlier verdict, and you cannot add a "
-        "phase, rewrite a criterion or change the goal.\n"
+        "phase, rewrite a criterion or change the goal.\n",
+        encoding="utf-8",
+    )
+    # Windows refuses a command line over ~32 KiB (WinError 206), and a gate
+    # that inlines evidence blows past it. The content is the same; only the
+    # place it lives changed, so the prompt stays a fixed few hundred bytes.
+    return (
+        f"Gate task: answer one written criterion for phase {phase.id!r}, "
+        f"round {int(round_no)}.\n\n"
+        f"READ THE BRIEF: {brief}\n"
+        "It holds the goal, the criterion, the evidence files and this round's "
+        "outputs. Read it before judging.\n\n"
         f"Write exactly one JSON object to {output} and nothing else:\n"
         '{"pass": true, "reason": "<one line>", "next_items": [], '
         '"goal_proposals": []}\n'
@@ -1705,6 +1721,25 @@ def _start_attempt(
     retry_reason = ""
     if not verify:
         retry_reason = str(step.pop("retry_reason", "") or "")
+    prompt = str(plan.get("prompt") or "")
+    if len(prompt) > MAX_PROMPT_CHARS:
+        # One argv token: Windows caps the whole command line near 32 KiB and
+        # `new` would fail with WinError 206 after spending nothing. Refuse
+        # with a readable reason; a retry would send the same bytes again.
+        reason = (
+            f"prompt_too_long: {len(prompt)} chars, cap {MAX_PROMPT_CHARS}; "
+            "the dispatch seam passes the prompt in argv"
+        )
+        log.error("step %s: %s", step.get("step_key"), reason)
+        if verify:
+            _note_verification(step, "", stamp, "error", reason)
+            _verifier_failed(root, run, step, stamp, reason)
+        else:
+            step["state"] = STEP_FAILED
+            step["error"] = reason
+            step["finished_at"] = stamp
+            archive.write_step(root, run, step)
+        return
     try:
         outcome = dispatch(plan, definition, root)
     except (fanout.FanoutError, WorkflowError, OSError) as exc:

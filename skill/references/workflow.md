@@ -92,8 +92,11 @@ A phase that declares `criteria` is not finished when its work settles. A
 blind gate agent answers them — it reads the run's goal, the criteria, that
 round's `evidence` files and the round's outputs, and never the workers'
 prompts or verdicts — with one JSON object `{"pass", "reason", "next_items",
-"goal_proposals"}`. The scheduler, not the gate, maps that answer to the next
-step: `pass` true closes the phase; `pass` false on a phase with `repeat: true`
+"goal_proposals"}`. Those inputs live in a brief on disk,
+`runs/<run>/gates/<phase>-gate-r<n>.md`; the dispatched prompt only names it,
+because a prompt travels as one command-line argument and Windows refuses a
+command line over ~32 KiB. The scheduler, not the gate, maps that answer to
+the next step: `pass` true closes the phase; `pass` false on a phase with `repeat: true`
 and non-empty `next_items` starts round `n+1` from those items while
 `max_rounds` and the agent ceiling allow it (a ceiling that would be exceeded
 marks the phase `failed` with `too_many_agents`); otherwise `--policy`
