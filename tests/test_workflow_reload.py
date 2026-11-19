@@ -133,14 +133,17 @@ def test_reload_rejudges_a_phase_whose_gate_was_the_failure(tmp_path):
     fake = No(tmp_path, run["run_id"])
     assert run_to_terminal(tmp_path, run["run_id"], fake) == "failed"
 
+    old_gate = [step for step in archive.phase_steps(
+        tmp_path, board.read_run(tmp_path, run["run_id"]), "work")
+        if step["kind"] == "gate"][0]["step_key"]
+
     dead_scheduler(tmp_path, board.read_run(tmp_path, run["run_id"]))
     reloaded = executor.reload_run(tmp_path, run["run_id"])
 
     phases = {entry["id"]: entry for entry in reloaded["phases"]}
-    assert all(
-        (archive.read_step(tmp_path, run["run_id"], key) or {}).get("kind") != "gate"
-        for key in phases["work"]["steps"]
-    ), "the old gate verdict must not survive a reload"
+    assert old_gate not in phases["work"]["steps"]
+    assert old_gate not in {item["step_id"] for item in reloaded["steps"]}
+    assert archive.read_step(tmp_path, run["run_id"], old_gate) is None
     assert run_to_terminal(tmp_path, run["run_id"], Fake(tmp_path, run["run_id"])) == "done"
 
 

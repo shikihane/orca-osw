@@ -112,7 +112,11 @@ never applied.
 
 `status --json` is where all of that is read: `scheduler_alive`, the
 `supervisor` block (`{pid, alive, restarts}`), each phase's `round` and `gate`
-(`{round, pass, reason}`), and the run's `goal` and `goal_proposals` count. A
+(`{round, pass, reason}`), and the run's `goal` and `goal_proposals` count.
+`verdicts.jsonl` is append-only: one line per gate answer ever given, so a
+phase that was re-judged (after `reload` or a second round) has several lines
+for the same phase and round — read the last one for the current answer, keep
+the rest as the audit trail. A
 supervisor owns the scheduler's lifetime: while the run is still `running` it
 restarts a scheduler that died, up to `OSW_WORKFLOW_RESTARTS` (default 3) with
 a 5 s backoff, logging to `supervisor.log` and keeping `supervisor.json`

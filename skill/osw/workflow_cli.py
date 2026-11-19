@@ -223,9 +223,13 @@ def _cap_guard(definition: Definition, planned: list[PlannedPhase]) -> None:
 
     Only ``single`` phases have a count before the run starts; a ``for_each``
     width is the run's to discover, and the executor refuses that one at
-    dispatch time with the same code.
+    dispatch time with the same code. A phase that declares ``criteria`` also
+    spends one gate agent per round, and those draw on the same ceiling — the
+    measured failure was a definition sized for its workers alone, refused only
+    after the earlier phases had already been paid for.
     """
-    total = 0
+    gates = sum(1 for phase in definition.phases if phase.criteria)
+    total = gates
     for phase in planned:
         if phase.tasks is None:
             continue
@@ -233,9 +237,16 @@ def _cap_guard(definition: Definition, planned: list[PlannedPhase]) -> None:
         if total > definition.max_agents:
             raise WorkflowError(
                 "too_many_agents",
-                f"phase {phase.id!r} brings the run to {total} agents, above "
-                f"max_agents {definition.max_agents}; nothing was dispatched",
+                f"phase {phase.id!r} brings the run to {total} agents "
+                f"({gates} of them gates), above max_agents "
+                f"{definition.max_agents}; nothing was dispatched",
             )
+    if total > definition.max_agents:
+        raise WorkflowError(
+            "too_many_agents",
+            f"the declared phases need {total} agents ({gates} of them gates), "
+            f"above max_agents {definition.max_agents}; nothing was dispatched",
+        )
 
 
 def _require_human(root: Path, verb: str) -> None:

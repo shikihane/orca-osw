@@ -705,6 +705,14 @@ def reload_run(root: Path, run_id: str) -> dict:
     run["error"] = ""
     run["finished"] = ""
     run["finished_at"] = ""
+    # The index keeps a summary per step ever written; a dropped record must
+    # leave the index too, or `status` reports work that no longer exists.
+    live = {key for entry in run.get("phases") or []
+            for key in entry.get("steps") or []}
+    run["steps"] = [
+        item for item in run.get("steps") or []
+        if str(item.get("step_id") or "") in live
+    ]
     archive.write_run(root, run)
     log.info(
         "run %s reloaded from %s: %d step(s) dropped, ceiling %s",

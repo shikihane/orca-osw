@@ -466,3 +466,44 @@ def test_status_reports_a_dead_planner(_isolated_home):
     text = runner.invoke(app, ["workflow", "status"])
     assert text.exit_code == 0, text.output
     assert "plan_failed: planner_died" in text.output
+
+
+# ---------------------------------------------------------------------------
+# The pre-flight ceiling counts the gate agents too
+# ---------------------------------------------------------------------------
+
+def _gated_definition(max_agents: int):
+    from pathlib import Path as _Path
+    from osw.workflow.defs import expand, parse_definition
+
+    raw = {
+        "name": "gated",
+        "max_agents": max_agents,
+        "phases": [
+            {"id": "a", "mode": "single", "task": "do a", "criteria": "a is done"},
+            {"id": "b", "mode": "single", "task": "do b", "criteria": "b is done"},
+            {"id": "c", "mode": "single", "task": "do c", "criteria": "c is done"},
+        ],
+    }
+    definition = parse_definition(raw, _Path("gated.json"))
+    return definition, expand(definition)
+
+
+def test_cap_guard_counts_one_gate_per_gated_phase():
+    from osw.workflow_cli import _cap_guard
+
+    definition, planned = _gated_definition(max_agents=5)
+
+    with pytest.raises(defs.WorkflowError) as caught:
+        _cap_guard(definition, planned)
+
+    assert caught.value.code == "too_many_agents"
+    assert "gates" in caught.value.message
+
+
+def test_cap_guard_accepts_a_ceiling_that_covers_the_gates():
+    from osw.workflow_cli import _cap_guard
+
+    definition, planned = _gated_definition(max_agents=6)
+
+    _cap_guard(definition, planned)  # three work agents and three gates
