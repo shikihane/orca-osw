@@ -1247,6 +1247,17 @@ def _settle_gate(
         )
         return
     block = entry.get("gate") or {}
+    if not verdict["pass"] and phase.repeat:
+        items = list(verdict.get("next_items") or [])
+        if items and round_no < int(max_rounds):
+            shape = _items_shape_error(phase, items)
+            if shape:
+                # The gate answered, but its list cannot start a round. Treat it
+                # like an unreadable verdict: one retry, then hold the run for a
+                # person. Failing the run here would throw away a round whose
+                # work already finished.
+                _gate_unverifiable(root, run, gate, stamp, shape)
+                return
     first = not (
         str(block.get("step") or "") == gate["step_key"]
         and int(block.get("round") or 0) == round_no
@@ -1426,12 +1437,28 @@ def _gate_prompt(
     # Windows refuses a command line over ~32 KiB (WinError 206), and a gate
     # that inlines evidence blows past it. The content is the same; only the
     # place it lives changed, so the prompt stays a fixed few hundred bytes.
+    # A gate's next_items start the next round, so their shape must match the
+    # items this phase was designed around. One real example is cheaper than a
+    # schema sentence, and the scheduler refuses a mismatched list.
+    shape = ""
+    if phase.repeat and items:
+        sample = json.dumps(items[0], ensure_ascii=False)
+        if len(sample) > 240:
+            sample = sample[:240] + "..."
+        shape = (
+            "NEXT ITEMS: when `pass` is false, every element of `next_items` "
+            "must have the shape of the items this round was given — one "
+            f"example from this round: {sample}\n"
+            "A list that cannot fill this phase's task is refused and the round "
+            "cannot start.\n\n"
+        )
     return (
         f"Gate task: answer one written criterion for phase {phase.id!r}, "
         f"round {int(round_no)}.\n\n"
         f"READ THE BRIEF: {brief}\n"
         "It holds the goal, the criterion, the evidence files and this round's "
         "outputs. Read it before judging.\n\n"
+        f"{shape}"
         f"Write exactly one JSON object to {output} and nothing else:\n"
         '{"pass": true, "reason": "<one line>", "next_items": [], '
         '"goal_proposals": []}\n'
@@ -2166,6 +2193,27 @@ def _array_field(phase: Phase) -> str | None:
     """The single array field this phase's schema declares, if it declares one."""
     fields = _declared_array_fields(phase)
     return fields[0] if fields else None
+
+
+def _items_shape_error(phase: Phase, items: list[Any]) -> str:
+    """Why these items cannot start a round, or "" when they can.
+
+    A gate writes ``next_items`` in its own words, while the phase's task and
+    criterion were written around the shape its producer emits. Rendering both
+    once here turns a mismatch into an answer the scheduler can refuse — one
+    retry, then a hold — instead of a ``WorkflowError`` raised three ticks
+    later that fails the whole run.
+    """
+    probe = Path("output.json")
+    for index, item in enumerate(items):
+        checks = ((phase.task, probe), (phase.criteria or "", None))
+        for text, output in checks:
+            try:
+                _render(phase, item, output, text=text)
+            except WorkflowError as exc:
+                what = "task" if output is not None else "criterion"
+                return f"next_items[{index}] does not fit the {what}: {exc.message}"
+    return ""
 
 
 def _render(

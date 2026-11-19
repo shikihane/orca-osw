@@ -103,7 +103,10 @@ marks the phase `failed` with `too_many_agents`); otherwise `--policy`
 decides — `strict` fails the run at that phase and round, `partial` marks the
 phase partial. An answer that is missing, unparseable, not a boolean `pass`, or
 carrying a non-array `next_items` (`gate_invalid`) gets one retry and then
-holds the run as `unverifiable`. Gate proposals are recorded and notified,
+holds the run as `unverifiable`. The same holds for a `next_items` list whose
+elements cannot fill the phase's task — the gate is told the shape of the items
+it was given, and a list that does not fit is refused rather than starting a
+round that cannot expand. Gate proposals are recorded and notified,
 never applied.
 
 `status --json` is where all of that is read: `scheduler_alive`, the

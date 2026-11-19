@@ -71,6 +71,9 @@ Rules:
   (the repo-relative file globs the judge reads). A for_each phase's criteria
   may use {{item}} and {{item.<field>}}; a single phase's criteria may not.
   criteria is never given {{output}}: the judge reads the step's outputs itself.
+  Phrase criteria as what one command proves — name the command and the output
+  it must show — not as a count of source lines or a wording check that a
+  reformat can break without changing behaviour.
 - If the request is open-ended ("continue until X", "推进到完成"), the phase
   that does the bulk work is "repeat": true and max_rounds is 3 unless the
   request says otherwise. repeat belongs only to a for_each phase and needs

@@ -243,6 +243,7 @@ def test_the_gate_prompt_is_blind_and_names_the_reply_file(tmp_path):
     assert str(reply_file) in prompts[0]
     assert "-gate-r1.json" in prompts[0]
     assert "-gate-r1.md" in prompts[0]
+    assert "NEXT ITEMS" in prompts[0] and '"a"' in prompts[0]
     assert all("-gate-r" not in prompt for prompt in fake.prompts("step"))
 
     brief = archive.gate_brief_path(tmp_path, run["run_id"], "advance", 1)
@@ -273,6 +274,65 @@ def test_an_over_long_prompt_is_refused_before_dispatch(tmp_path):
     assert "prompt_too_long" in step["error"]
     assert str(executor.MAX_PROMPT_CHARS) in step["error"]
     assert fake.plans == [], "an unusable prompt must not reach the dispatch seam"
+
+
+ID_SURVEY = {"id": "survey", "mode": "single",
+             "task": "list the work items\nwrite them to {{output}}"}
+ID_ADVANCE = {"id": "advance", "mode": "for_each", "from": ["survey"],
+              "task": "work {{item.id}}\nwrite the result to {{output}}",
+              "criteria": "{{item.id}} is reported", "repeat": True}
+
+
+class IdFake(Fake):
+    """Items are objects: the phase names a field, so shape matters."""
+
+    def _produce(self, root: Path, plan: dict) -> None:
+        phase = str(plan.get("phase") or "")
+        if phase not in ("survey", "advance"):
+            return
+        index = int(plan.get("index") or 0)
+        path = archive.output_path(root, self.run_id, phase, index)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = ([{"id": "a"}, {"id": "b"}] if phase == "survey"
+                   else [{"id": f"done{index}"}])
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_a_misshapen_next_items_list_holds_the_run_instead_of_failing_it(tmp_path):
+    """The gate's list starts the next round, so it must fit the phase's task.
+
+    A list that cannot fill `{{item.id}}` used to raise inside the next round's
+    expansion, which failed the whole run three ticks later — after a round of
+    real work had already finished. One retry, then a hold, is the honest end.
+    """
+    definition = install(tmp_path, [ID_SURVEY, ID_ADVANCE],
+                         goal="every item is reported", max_rounds=2)
+    run = start(tmp_path, definition)
+    bad = {"pass": False, "reason": "c missing", "next_items": ["c"]}
+    fake = IdFake(tmp_path, run["run_id"], replies=[dict(bad), dict(bad)])
+
+    status = run_to_terminal(tmp_path, run["run_id"], fake)
+
+    assert status == "blocked"
+    gate = gate_of(tmp_path, run["run_id"], "advance", 1)
+    assert gate is not None and gate["state"] == "unverifiable"
+    assert "gate_invalid" in gate["error"]
+    assert "no field 'id'" in gate["error"]
+    assert steps_of(tmp_path, run["run_id"], "advance", 2) == []
+
+
+def test_a_valid_second_answer_still_starts_the_round(tmp_path):
+    definition = install(tmp_path, [ID_SURVEY, ID_ADVANCE],
+                         goal="every item is reported", max_rounds=2)
+    run = start(tmp_path, definition)
+    fake = IdFake(tmp_path, run["run_id"], replies=[
+        {"pass": False, "reason": "c missing", "next_items": ["c"]},
+        {"pass": False, "reason": "c missing", "next_items": [{"id": "c"}]},
+        {"pass": True, "reason": "met"},
+    ])
+
+    assert run_to_terminal(tmp_path, run["run_id"], fake) == "done"
+    assert len(steps_of(tmp_path, run["run_id"], "advance", 2)) == 1
 
 
 # ---------------------------------------------------------------------------
