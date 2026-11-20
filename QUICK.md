@@ -85,8 +85,24 @@ When Orca reports the agent's turn as done (`worktree ps`; untracked CLIs fall b
 4. The caller (a terminal auto-detected from a TTY or `ORCA_TERMINAL_HANDLE`, a chat session from `ORCA_AGENT_SESSION_ID`, or an explicit `--caller-terminal` address) receives a single-line report:
 
 ```
-# [osw] task-finished agent=code_001 terminal=term_xxx report=... handoff=... summary=...
+# [osw] task-finished agent=code_001 terminal=term_xxx report=... handoff=... summary=... cleanup=manual close=osw del code_001 --close
 ```
+
+5. The finished pane stays open on purpose, so the result stays on screen. Close it yourself once you have read it: `osw del code_001 --close` for one agent, `osw sweep` for the finished ones in bulk. Records and `session_id` stay, so `revive` still works afterwards.
+
+Delivery is durable: the watcher appends a `notify_delivered` event after a
+successful send, and a notice that reached no caller stays pending instead of
+vanishing. `osw inbox` lists what is waiting; `new`, `use` and `status` leave pending
+notices alone, so a caller waiting on one agent keeps its own timeline.
+`status` prints `Unread completions: N (osw inbox)`.
+
+```bash
+python /path/to/orca-osw/skill/osw.py inbox
+python /path/to/orca-osw/skill/osw.py inbox --ack --limit 5
+```
+
+`--ack` records the listed notices as read in `.orca/osw/notify/acked.json`;
+`--json` prints `{count, pending}` for scripts.
 
 ## 8. Broadcast to all agents
 
@@ -110,10 +126,12 @@ python /path/to/orca-osw/skill/osw.py del agent_001          # remove from manag
 python /path/to/orca-osw/skill/osw.py del agent_001 --close  # also close the terminal
 ```
 
-Closing a finished worker's terminal is not optional. OSW never closes a pane
-by itself: a completed turn's notification ends with `cleanup=sweep`, and you
-run `sweep` before reporting the task done. Records stay, so `revive agent_001`
-brings the session back in a fresh terminal.
+Closing a finished worker's terminal is your step, and it waits for you. OSW
+leaves the pane on screen on purpose, so the result stays readable: a completed
+turn's notification ends with
+`cleanup=manual close=osw del <agent_id> --close`. Records stay, so
+`revive agent_001` brings the session back in a fresh terminal once the pane is
+gone.
 
 ```bash
 python /path/to/orca-osw/skill/osw.py sweep           # finished agents only

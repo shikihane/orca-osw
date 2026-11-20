@@ -2,16 +2,30 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 
-from osw import hosts
+from osw import hookcache, hosts
 
 
-# Orca's hook server persists the last status each agent reported, keyed
-# by paneKey: `{version, entries: {<paneKey>: {providerSession: {id,
-# transcriptPath?}, payload, receivedAt, ...}}}`. This is not a public
-# Orca interface, so any other version reads as "no session".
-LAST_STATUS_VERSION = 2
+# Orca's hook server persists the last status each agent reported. Older
+# releases wrote one JSON document (`{version, entries: {<paneKey>:
+# {providerSession: {id, transcriptPath?}, payload, receivedAt, ...}}}`);
+# Orca 1.4.265 replaced it with the SQLite cache `hookcache` reads. Neither
+# is a public Orca interface, so any version OSW does not understand reads
+# as "no session".
+LAST_STATUS_VERSION = hookcache.LEGACY_JSON_VERSION
+
+# `meta.schema_version` of the SQLite cache; anything at or above it is
+# read, anything below it falls back to the JSON document above.
+HOOK_CACHE_SCHEMA_VERSION = hookcache.SQLITE_SCHEMA_VERSION
+
+# Orca's launch-time identity database, beside the status cache: one row
+# per agent launch linking the Orca session id to the provider's own.
+IDENTITIES_FILENAME = "agent-identities.db"
+
+# path -> ((mtime_ns, size), {orca_session_id: provider_session_id}).
+_LINKED_CACHE: dict[str, tuple[tuple[int, int], dict[str, str]]] = {}
 
 # Where a POSIX remote keeps the same cache, relative to the host home.
 # Orca's own directory casing moved between releases (and its XDG data
@@ -64,17 +78,80 @@ def parse_last_status(text: str, pane_key: str) -> str:
     return session_id if isinstance(session_id, str) else ""
 
 
-def session_for_pane(pane_key: str, path: Path | None = None) -> str:
+def session_for_pane(
+    pane_key: str, path: Path | None = None, orca_session_id: str = "",
+) -> str:
     """Return the provider session id Orca recorded for a pane, or "".
 
-    Empty when the file is missing or unreadable, its version is not the
-    one OSW understands, or the pane has no entry.
+    Three sources, in the order Orca itself layers them. The per-pane
+    status cache (SQLite, then the legacy JSON) answers for the agents
+    that report status there — omp does, pi and claude do not. For those
+    the identity link is the only record: `agent-identities.db` maps the
+    pane's `orcaSessionId` to its provider session id, and the caller
+    passes that id in from `worktree ps`. Empty when no source answers.
     """
+    session = hookcache.session_id(pane_key, path)
+    if session:
+        return session
+    if orca_session_id:
+        linked = linked_session(orca_session_id, path)
+        if linked:
+            return linked
     try:
-        text = (path or last_status_path()).read_text(encoding="utf-8")
+        text = hookcache.legacy_path(path).read_text(encoding="utf-8")
     except (OSError, ValueError):
         return ""
     return parse_last_status(text, pane_key)
+
+
+def identities_path(path: Path | None = None) -> Path:
+    """Orca's identity database, beside the status cache."""
+    anchor = path or hookcache.default_path()
+    return anchor.with_name(IDENTITIES_FILENAME)
+
+
+def linked_session(orca_session_id: str, path: Path | None = None) -> str:
+    """The provider session id linked to an Orca session id, or "".
+
+    `agent-identities.db` is a plain SQLite file with one row per agent
+    launch (`provider_links`: execution_host, wsl_distro, agent,
+    provider_session_id, locator, orca_session_id). Like the status
+    cache it is not a public interface, so a missing, unreadable or
+    unexpected database reads as "no link". One read per file change is
+    cached for the whole process.
+    """
+    if not orca_session_id:
+        return ""
+    target = identities_path(path)
+    try:
+        info = target.stat()
+    except OSError:
+        return ""
+    signature = (info.st_mtime_ns, info.st_size)
+    key = str(target)
+    cached = _LINKED_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1].get(orca_session_id, "")
+    links: dict[str, str] = {}
+    try:
+        connection = sqlite3.connect(
+            target.resolve().as_uri() + "?mode=ro", uri=True
+        )
+    except (sqlite3.Error, ValueError):
+        return ""
+    try:
+        for orca_id, provider_id in connection.execute(
+            "SELECT orca_session_id, provider_session_id FROM provider_links"
+        ):
+            if isinstance(orca_id, str) and isinstance(provider_id, str):
+                links[orca_id] = provider_id
+    except sqlite3.Error:
+        return ""
+    finally:
+        connection.close()
+    _LINKED_CACHE[key] = (signature, links)
+    return links.get(orca_session_id, "")
+
 
 
 async def session_for_agent(
@@ -105,7 +182,10 @@ async def session_cache_path(host: hosts.Host, root: Path | None = None) -> str:
     if host.session_cache:
         return host.session_cache
     if host.is_local:
-        return str(last_status_path())
+        # Both caches live side by side locally; the SQLite one is the
+        # current shape, so it wins when it exists.
+        database = hookcache.default_path()
+        return str(database if database.exists() else last_status_path())
     tried = [
         host.join(host.home, rel) for rel in session_cache_candidates(host)
     ]

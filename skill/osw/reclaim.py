@@ -5,11 +5,11 @@ agent's pane holds nothing its record does not: the record keeps the
 provider session id, so `revive` resumes that session in a fresh pane, and
 the report and handoff files keep the turn's evidence.
 
-The watcher applies this policy itself when a turn finishes `done`, so a
-clean turn never leaves a pane behind; a failed turn keeps its pane, which
-is where the failure is still readable. `osw sweep` applies the same policy
-to whatever is already open (`--force` widens it to failed turns). The
-policy is:
+The watcher never closes a pane: a finished turn keeps its terminal until a
+human or the caller runs `osw del <agent> --close` (the completion line
+carries that command) or `osw sweep`, which applies this policy to whatever
+is already open (`--force` widens it to failed turns). Closing a pane means
+closing it explicitly, and the policy is:
 
 * only a pane OSW created (`origin == "new"`) is reclaimable,
 * only a settled record qualifies (`done`; `--force` adds `error`/`lost`),
@@ -17,9 +17,8 @@ policy is:
 * a supervised record's terminal belongs to Orca's dispatch plane,
 * a `guard`/`revive` turn is a pane a human just reopened.
 
-One policy (`decision`) and one closer (`close_if_open`) are shared by the
-watcher, `osw sweep` and `del --close`, so records stay the only thing
-deleted.
+One policy (`decision`) and one closer (`close_if_open`) are shared by
+`osw sweep` and `del --close`, so records stay the only thing deleted.
 """
 
 from __future__ import annotations

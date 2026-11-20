@@ -29,6 +29,8 @@ from osw.log import (
 )
 from osw import hosts as host_seam
 from osw import fanout as fanout_mod
+from osw.caller import infer_caller_pane
+from osw import notify
 from osw import reclaim
 from osw.hosts import Host, HostError
 from osw.orca_cli import (
@@ -568,14 +570,18 @@ def _executor_identity(caller_terminal: str | None) -> tuple[str | None, str]:
     return _terminal_handle(data, fallback=handle), pane_key
 
 
-def _maybe_detect_caller(caller_terminal: str | None) -> str | None:
+def _maybe_detect_caller(
+    caller_terminal: str | None, root: Path | None = None,
+) -> str | None:
     """The notification address of this command's caller, or None.
 
     A terminal handle when one is known; otherwise the injected
     structured-session address, which Orca delivers mail into as a user
     turn. A structured chat (OMP launched as an Orca chat) has neither
     a terminal handle nor a TTY, so without that fallback the caller of
-    every chat-dispatched agent would be unknown.
+    every chat-dispatched agent would be unknown. When both fail, the
+    worktree itself is asked: exactly one agent pane that no OSW record
+    owns is the dispatcher, and its handle is the answer.
     """
     if caller_terminal:
         return caller_terminal
@@ -590,19 +596,73 @@ def _maybe_detect_caller(caller_terminal: str | None) -> str | None:
     if session:
         log.info("caller from ORCA_AGENT_SESSION_ID  address=%s", session)
         return session
+    if root is not None:
+        inferred = _infer_caller(root)
+        if inferred:
+            return inferred
     if sys.stdin.isatty() and sys.stdout.isatty():
         return _detect_caller_terminal()
     log.warning("caller detect skipped: stdin/stdout are not TTYs")
     return None
 
 
-def _resolve_caller(caller_terminal: str | None, no_notify: bool) -> str | None:
+def _infer_caller(root: Path) -> str | None:
+    """Handle of the worktree's one non-OSW agent pane, or None.
+
+    A dispatch launched by an agent's own tool pipeline carries no
+    caller identity in its environment; the pane that ran it is still
+    the only agent pane in the worktree that no OSW record owns. More
+    than one such pane is ambiguous, and a guess would deliver every
+    completion notice to the wrong agent, so only a single candidate
+    answers.
+    """
+    try:
+        inferred = anyio.run(infer_caller_pane, root, None)
+    except Exception as exc:  # inference is best-effort, never fatal
+        log.warning("caller inference failed: %s", exc)
+        return None
+    pane_key = str((inferred or {}).get("pane_key") or "")
+    handle = str((inferred or {}).get("handle") or "")
+    if not handle and pane_key:
+        # The hook cache names the pane; the runtime handle is only in
+        # Orca's terminal list, so one lookup at dispatch time.
+        try:
+            for terminal in anyio.run(reclaim.list_open, root):
+                key = f"{terminal.get('tabId')}:{terminal.get('leafId')}"
+                if key == pane_key:
+                    handle = str(terminal.get("handle") or "")
+                    break
+        except Exception as exc:  # best-effort, never fatal
+            log.warning("caller handle lookup failed: %s", exc)
+    if not handle:
+        return None
+    log.info("caller from inferred agent pane  terminal=%s", handle)
+    emit_event(
+        logs_dir(root),
+        component="cli",
+        event="caller_inferred",
+        terminal=handle,
+        message="caller inferred from the worktree's only agent pane",
+        data={
+            "handle": handle,
+            "pane_key": str((inferred or {}).get("pane_key") or ""),
+            "title": str((inferred or {}).get("title") or ""),
+        },
+    )
+    return handle
+
+
+def _resolve_caller(
+    caller_terminal: str | None,
+    no_notify: bool,
+    root: Path | None = None,
+) -> str | None:
     """Resolve the notification target or fail loudly.
 
     A dispatch without a caller terminal can never report completion, so
     it is rejected unless the user explicitly opts out via --no-notify.
     """
-    caller = _maybe_detect_caller(caller_terminal)
+    caller = _maybe_detect_caller(caller_terminal, root)
     if caller:
         return caller
     if no_notify:
@@ -1011,7 +1071,10 @@ def _carry_reused_fields(agent: dict, existing: dict | None) -> None:
 
 
 def _use_notify_target(
-    existing: dict | None, caller_terminal: str | None, no_notify: bool
+    existing: dict | None,
+    caller_terminal: str | None,
+    no_notify: bool,
+    root: Path | None = None,
 ) -> tuple[str | None, dict | None]:
     """(caller terminal, guardian to keep) for a `use` dispatch.
 
@@ -1021,8 +1084,8 @@ def _use_notify_target(
     """
     guardian = (existing or {}).get("guardian")
     if guardian and not caller_terminal:
-        return _maybe_detect_caller(None), guardian
-    return _resolve_caller(caller_terminal, no_notify), None
+        return _maybe_detect_caller(None, root), guardian
+    return _resolve_caller(caller_terminal, no_notify, root), None
 
 
 def _start_watcher(root: Path, agent: dict) -> None:
@@ -1401,7 +1464,7 @@ def new(
     # Resolve the caller before creating anything: a dispatch without a
     # notification target is rejected, and must not leave an orphan
     # terminal behind.
-    caller = _resolve_caller(caller_terminal, no_notify)
+    caller = _resolve_caller(caller_terminal, no_notify, root)
 
     remote_root = ""
     if remote:
@@ -1733,7 +1796,7 @@ def use(
         # including one written by an older supervised dispatch — is
         # followed by the classic watcher, which sends the prompt.
         caller, guardian = _use_notify_target(
-            existing_agent, caller_terminal, no_notify,
+            existing_agent, caller_terminal, no_notify, root,
         )
         try:
             receipt = anyio.run(
@@ -1802,7 +1865,7 @@ def use(
         return
 
     caller, guardian = _use_notify_target(
-        existing_agent, caller_terminal, no_notify,
+        existing_agent, caller_terminal, no_notify, root,
     )
     agent = _base_agent(
         root,
@@ -3140,6 +3203,41 @@ def logs(
 
 
 @app.command()
+def inbox(
+    json_output: bool = typer.Option(False, "--json", help="Print raw JSON"),
+    ack: bool = typer.Option(
+        False, "--ack", help="Mark the printed notices acknowledged",
+    ),
+    limit: int = typer.Option(20, "--limit", help="Maximum notices to print"),
+) -> None:
+    """List completion notices no caller has been told about yet."""
+    root = resolve_project_root()
+    enable_file_logging(logs_dir(root))
+    try:
+        notify.reconcile_legacy(root)
+    except (OSError, ValueError) as exc:  # reconciling never blocks the list
+        log.warning("notify legacy reconcile failed: %s", exc)
+    notices = notify.pending(root)[: max(limit, 0)]
+    if json_output:
+        typer.echo(json.dumps(
+            {"version": 1, "count": len(notices), "pending": notices},
+            indent=2, ensure_ascii=False,
+        ))
+    elif notices:
+        for notice in notices:
+            typer.echo(notice["line"])
+    else:
+        typer.echo("No unread completions.")
+    if ack and notices:
+        acked = notify.ack(root, [notice["key"] for notice in notices])
+        typer.echo(
+            f"Acknowledged {acked} completion notice(s).",
+            err=json_output,
+        )
+    raise typer.Exit(0)
+
+
+@app.command()
 def status(
     all_hosts: bool = typer.Option(
         False, "--all", help="Summarise agents and watchers per host",
@@ -3176,6 +3274,17 @@ def status(
     for agent_state, count in sorted(counts.items()):
         typer.echo(f"  {agent_state}: {count}")
     typer.echo(f"Watchers running: {running_watchers}")
+    try:
+        notify.reconcile_legacy(root)
+    except (OSError, ValueError) as exc:  # reconciling never blocks status
+        log.warning("notify legacy reconcile failed: %s", exc)
+    try:
+        unread = notify.pending_count(root)
+    except Exception as exc:  # status must still report state
+        log.warning("notify pending count failed: %s", exc)
+        unread = 0
+    if unread:
+        typer.echo(f"Unread completions: {unread} (osw inbox)")
 
 
 def _status_by_host(agents: dict[str, dict]) -> None:

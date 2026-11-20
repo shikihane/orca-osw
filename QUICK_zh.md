@@ -85,8 +85,23 @@ Watchers running: 1
 4. 调用方（TTY 下自动检测、`ORCA_TERMINAL_HANDLE`、对话会话的 `ORCA_AGENT_SESSION_ID`，或通过 `--caller-terminal` 显式指定的地址）收到单行完成报告：
 
 ```
-# [osw] task-finished agent=code_001 terminal=term_xxx report=... handoff=... summary=...
+# [osw] task-finished agent=code_001 terminal=term_xxx report=... handoff=... summary=... cleanup=manual close=osw del code_001 --close
 ```
+
+5. 已完成的 pane 故意留在屏幕上，结果就停在你能读到的地方。读完再由你关闭：单个 agent 用 `osw del code_001 --close`，已完成的批量用 `osw sweep`。记录和 `session_id` 保留，之后 `revive` 仍可恢复会话。
+
+投递是可追溯的：发送成功后 watcher 追加一条 `notify_delivered` 事件，没找到
+调用方的通知留在待投递列表里，不会消失。`osw inbox` 列出等待中的通知；
+`new`、`use`、`status` 都不碰待投递通知，只在等一个 agent 的调用方因此按自己
+的节奏收结果。有通知待投递时，`status` 打印 `Unread completions: N (osw inbox)`。
+
+```bash
+python /path/to/orca-osw/skill/osw.py inbox
+python /path/to/orca-osw/skill/osw.py inbox --ack --limit 5
+```
+
+`--ack` 把列出的通知在 `.orca/osw/notify/acked.json` 中标记为已读；
+`--json` 输出 `{count, pending}`，供脚本使用。
 
 ## 8. 广播消息
 
@@ -110,9 +125,10 @@ python /path/to/orca-osw/skill/osw.py del agent_001          # 仅从管理中�
 python /path/to/orca-osw/skill/osw.py del agent_001 --close  # 同时关闭终端
 ```
 
-关掉已完成 worker 的终端不是可选项。OSW 自己从不关 pane：一轮完成的通知行末尾
-带 `cleanup=sweep`，你在报告任务完成之前跑 `sweep`。记录保留，所以
-`revive agent_001` 随时能在新终端里恢复会话。
+关掉已完成 worker 的终端是你的显式一步，它等你来做。OSW 故意把 pane 留在屏幕上，
+结果就一直可读：一轮完成的通知行末尾带
+`cleanup=manual close=osw del <agent_id> --close`。记录保留，所以 pane 关掉之后
+`revive agent_001` 能在新终端里恢复会话。
 
 ```bash
 python /path/to/orca-osw/skill/osw.py sweep           # 只处理已完成的 agent

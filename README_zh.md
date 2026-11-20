@@ -9,6 +9,7 @@
 - **目录隔离** — 每个工作目录是独立的管理范围，即使跨 git worktree 也互不影响
 - **Detached watcher** — 每个受管 agent 都有独立 watcher 进程，监控完成状态且不阻塞 CLI
 - **自动交接** — 检测任务完成后发送固定的收尾指令（含预分配的交接文件路径），校验交接 markdown 已写入，通知调用方终端
+- **完成通知可追溯** — 投递成功的通知记录为 `notify_delivered` 事件，没找到调用方的通知留在 `osw inbox` 里等待，不再只存在于日志中
 - **omp 标题态就绪与完成** — omp 从不进入输出空闲，Orca 也不为它发 `tui-idle`，因此 OSW 读取终端标题（前面有旋转符表示本轮正在运行）作为就绪判据与本轮完成判据
 - **接管与恢复** — `enroll` 登记不是 OSW 启动的 agent 终端，`guard` 让你成为它们的通知对象并跟踪进行中的一轮，`revive` 在 Orca 或 PC 重启后重新拉起 provider 会话，`stop` 中断当前一轮
 - **跨主机监管** — 机器登记一次，用 `--on <host>` 派单，交接文件落到本地：Orca 配对是派单面，SSH 是数据面，远端不需要安装 OSW
@@ -64,7 +65,8 @@ python skill/osw.py status
 | `sweep [--force] [--json]` | 关闭已完成 agent 的终端；记录与会话保留 |
 | `list [--all] [--json]` | 列出受管 agent |
 | `logs [--agent <agent_id>] [--tail N]` | 查看 OSW 日志和事件 |
-| `status [--all]` | 显示 OSW 状态和 agent 统计 |
+| `status [--all]` | 显示 OSW 状态、agent 统计与未读完成通知 |
+| `inbox [--json] [--ack] [--limit N]` | 列出待投递的完成通知（最新在前）；`--ack` 把列出的通知标记为已读 |
 | `mailbox start [--json]` | 启动本地邮箱守护进程（仅控制平面）；重复 `start` 视为成功 |
 | `mailbox stop [--json]` | 停止守护进程并等待退出 |
 | `mailbox status [--json]` | 各队列积压、最旧消息年龄、spool 滞后、门铃状态与死信 |
@@ -92,8 +94,36 @@ python skill/osw.py status
 - OSW 默认添加 provider 的非阻塞/批准类启动参数：`claude --dangerously-skip-permissions`、`codex --dangerously-bypass-approvals-and-sandbox`、`pi --approve`、`omp --auto-approve`、`kimi --yolo`、`grok --always-approve --trust`。
 - `new` 和 `use` 支持 `--caller-terminal <句柄>`，指定接收完成报告的父终端。在 Orca 对话（结构化 agent 会话，没有终端句柄）里运行时，调用方取自注入的 `ORCA_AGENT_SESSION_ID`，记为 `caller_session: orca_session_id:<id>`；watcher 通过 `orca orchestration send` 投递，Orca 会把它作为用户轮注入该对话。
 - `del --close` 同时让 Orca 关闭终端。
-- **关闭已完成的终端是 supervisor 的强制职责。** OSW 不自己关 pane：一轮完成的通知行末尾带 `cleanup=sweep`，你在报告任务完成之前用 `osw sweep` 把它关掉。记录和 `session_id` 保留，之后 `revive <agent_id>` 可在新终端恢复该会话。刻意保留的 pane：接管的（`use`/`enroll`）、supervised 派发终端（归 Orca 管，用 `del <id> --close` 释放）、失败的一轮（`error`/`lost`，直到 `sweep --force`）、人工重开的一轮（`guard`/`revive`），以及 watcher 仍在运行的记录。
+- **已完成的一轮会保留自己的终端。** pane 故意留在屏幕上，结果就停在调用方能读到的地方：完成通知行末尾带 `cleanup=manual close=osw del <agent_id> --close`，关掉它是调用方的显式一步。记录和 `session_id` 保留，pane 关掉之后 `revive <agent_id>` 可在新终端恢复该会话。单个 agent 用 `osw del <agent_id> --close` 关闭；已完成的面板批量关闭用 `osw sweep`（失败的一轮 `error`/`lost` 只在加 `--force` 时关闭——那个 pane 正是还能读到失败原因的地方），它会打印保留了哪些、为什么。`del <agent_id> --close` 是单个 agent 的显式关闭，不论它来自哪里；`sweep` 走的是共享策略，只关 OSW 自己创建的面板，接管的（`use`/`enroll`）、supervised 派发终端（归 Orca 管）、人工重开的一轮（`guard`/`revive`）都会被保留，需要时用 `del --close` 手动关。
 - `list --json` 输出原始 JSON。
+
+## 完成通知
+
+完成通知是可追溯的。投递成功后 watcher 追加一条 `notify_delivered` 事件，
+携带实际发出的 `line` 与 `channel`（`terminal` 或 `session`）；某个 agent
+只要存在一条该类事件，或一条来自 Mailbox 渠道的
+`completion_notify_suppressed` 事件，且时间戳不早于其 `finished_at`，就算作
+已投递。没找到调用方的通知留在待投递列表里，而不是只躺在事件日志中。
+
+```bash
+python skill/osw.py inbox                # 待投递通知，最新在前
+python skill/osw.py inbox --limit 20     # 限制条数
+python skill/osw.py inbox --json         # 输出 {count, pending}，供脚本使用
+python skill/osw.py inbox --ack          # 把列出的通知标记为已读
+```
+
+有通知待投递时，`osw status` 报告 `Unread completions: N (osw inbox)`。
+投递不借助其他命令重试：`new`、`use`、`status` 都不碰待投递通知，因此只在
+等某一个 agent 的调用方会一直等到它自己的结果。`osw inbox` 就是不打乱这个
+调用方的查看方式。
+
+通知文本优先采用投递被跳过或失败时记录的历史 `line`——那条记录下来的完成
+行以 `cleanup=manual close=osw del <agent_id> --close` 结尾；没有历史文本时，
+按 `format_completion_report` 的形状，从 agent 记录和最新报告生成。已读状态
+保存在 `.orca/osw/notify/acked.json`，键为 `<agent_id>@<finished_at>`；
+该文件只由 ack 与 reconcile 路径写入，agent 记录仍只有 watcher 一个写入者。
+该功能上线前已完成的记录会一次性归入 `notify/legacy_reconciled.json`，
+因此待投递列表只列出真正的缺口。
 
 ## Orca 兼容性
 

@@ -115,7 +115,12 @@ OSW resolves the notification target in this order: `--caller-terminal`,
 then the inherited `ORCA_TERMINAL_HANDLE` (validated first; a stale handle
 is dropped with a warning instead of aborting the dispatch), then the
 injected `ORCA_AGENT_SESSION_ID` of an Orca chat, then marker-based
-auto-detection in an interactive Orca terminal. A chat (a structured agent
+auto-detection in an interactive Orca terminal. When all of those yield
+nothing, OSW inspects the worktree: exactly one open terminal there that is an
+agent pane no OSW record owns is the dispatcher, so its handle is recorded as
+`caller_terminal`, the `caller_inferred` event names the pane, and the notice
+is delivered to it. Two or more such panes are ambiguous and nothing is
+guessed — pass `--caller-terminal <handle>`. A chat (a structured agent
 session) has no terminal handle, so OSW records `caller_session:
 orca_session_id:<id>` and the watcher delivers through `orca
 orchestration send`, which Orca injects into that chat as a user turn. If no
@@ -379,13 +384,15 @@ python <skill-dir>/osw.py del <agent-id> [--close]
 Use `stop` to interrupt a worker's current turn (see Takeover and Recovery).
 `del` removes the management record; `--close` also closes the Orca terminal.
 
-**`sweep` is mandatory, not optional.** OSW never closes a pane by itself: the
+**Closing the pane is mandatory, not optional.** OSW never closes a pane by itself: the
 watcher finishes a turn, writes the report and notifies, and leaves the
-terminal exactly where Orca put it. A completion line for a `done` turn OSW
-launched ends with `cleanup=sweep` — that is the flag that this pane is
-reclaimable. Close it before reporting the task or batch complete:
+terminal exactly where Orca put it. A completion line for a `done` turn ends
+with `cleanup=manual close=osw del <agent-id> --close` — that is the
+instruction to close that pane yourself. Close it before reporting the task or
+batch complete:
 
 ```text
+python <skill-dir>/osw.py del <agent-id> --close   # one agent
 python <skill-dir>/osw.py sweep           # every pane of a done agent
 python <skill-dir>/osw.py sweep --force   # also error/lost turns
 ```

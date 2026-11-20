@@ -81,7 +81,8 @@ from pathlib import Path
 
 import anyio
 
-from osw import hosts
+from osw import hookcache, hosts
+from osw.caller import infer_caller_pane
 from osw.log import emit_event, enable_file_logging, get_logger, setup_logging
 from osw.orca_cli import (
     OrcaError,
@@ -109,7 +110,7 @@ from osw.ready_gate import (
     normalized_hash,
     sanitize_frame,
 )
-from osw import blockers, reclaim
+from osw import blockers
 from osw.jev import (
     HOLD_BUDGET_MS,
     HOLD_FALSE_HOLD_CAP_MS,
@@ -122,7 +123,7 @@ from osw.jev import (
     resolve_mode,
     startup_should_hold,
 )
-from osw.sessions import session_for_pane
+from osw.sessions import linked_session, session_for_pane
 from osw.state import (
     StateWriteError,
     clear_stop_request,
@@ -149,7 +150,8 @@ BOOT_STARTING_WAIT_MS = 120_000
 FALLBACK_IDLE_STABLE_MS = 60_000   # untracked CLI: silent this long = turn over
 HARD_TIMEOUT_SECS = 3600           # give up on the whole task after this
 STUCK_NOTIFY_SECS = 300            # tracked agent frozen this long -> tell caller
-# A tracked pane that still reports "working" with no fresh activity has
+# `terminal send` writes into the pane's PTY. A tracked pane that still
+# reports "working" with no fresh activity has
 # usually had its submit eaten by a repaint; the same prompt written to
 # the same pane is the cheapest repair, and it costs the agent nothing
 # it has not already been asked for. One resend per turn is the whole
@@ -604,13 +606,17 @@ def _write_spool_envelope(root: Path, envelope: dict) -> str:
 def format_completion_report(
     agent_id: str, terminal: str, report_file: str,
     handoff_file: str = "", summary: str = "", outcome: str = "",
-    warning: str = "", cleanup: str = "",
+    warning: str = "", cleanup: str = "", close_command: str = "",
 ) -> str:
     """Single-line completion notification sent to the caller terminal.
 
     Single-line because newlines get mangled through orca.CMD --text on
     Windows; the leading '#' keeps it inert in a shell. Full data lives
     in the JSON report and the handoff markdown.
+
+    `cleanup` names who owns the pane now (`manual`: the caller or a
+    human closes it), and `close_command` is the exact command that does
+    it, so the reader needs no lookup.
     """
     message = f"# [osw] task-finished agent={agent_id} terminal={terminal}"
     if outcome:
@@ -624,9 +630,11 @@ def format_completion_report(
     if summary:
         message += f" summary={one_line(summary, 160)}"
     if cleanup:
-        # Not an action: `sweep` is the supervisor's, and this turn's pane
-        # is reclaimable. `skill/SKILL.md` makes it a required step.
+        # Ownership of the pane, not an action: `manual` means the caller
+        # or a human closes it, and the `close=` field is that command.
         message += f" cleanup={cleanup}"
+    if close_command:
+        message += f" close={one_line(close_command, 120)}"
     return message
 
 
@@ -647,13 +655,93 @@ async def _pane_key(handle: str, host: hosts.Host) -> str | None:
     return None
 
 
-async def _ps_entry(pane_key: str, host: hosts.Host) -> dict | None:
-    """Find the Orca agent-state entry for a pane, if Orca tracks it."""
+# A full ps row is the expensive half of observation: one Orca CLI spawn
+# (300-900 ms measured on this machine) for fields the hook cache does not
+# carry (toolName, the reported prompt, lastAssistantMessage, interrupted,
+# updatedAt). Those fields move on a seconds scale at best, so a poll loop
+# asking for them every POLL_SECS buys nothing but spawns: per pane, per
+# process, a full read inside this window serves the previous snapshot.
+_PS_FULL_MIN_INTERVAL_SECS = 15.0
+
+# pane_key -> (monotonic read time, snapshot) of the last full ps read.
+_PS_FULL_SNAPSHOTS: dict[str, tuple[float, dict | None]] = {}
+
+
+def reset_ps_snapshots() -> None:
+    """Drop the per-pane full-read floor.
+
+    The floor is a staleness budget for one long-lived watcher, so it has
+    to be cleared whenever the same process starts observing a pane
+    afresh: a test that patches `worktree_ps`, or a watcher that took
+    over a record, must never read a snapshot from an earlier life.
+    """
+    _PS_FULL_SNAPSHOTS.clear()
+
+
+async def _ps_state(pane_key: str, host: hosts.Host) -> dict | None:
+    """The pane's cached state, when Orca's hook cache can answer.
+
+    First rung of the observation ladder. On the local host the hook
+    cache already carries what the state-only poll sites ask for — the
+    pane's state, when that state started, and its agent type — and
+    reading it is one SQLite read instead of a CLI spawn, so a cache
+    hit never calls Orca at all. A hit comes back in ps's shape (with
+    `cached` set) so callers keep one code path; an absent entry, a
+    remote host (the cache is a local file), or any cache failure
+    returns None and the caller falls back to Orca.
+    """
+    if not host.is_local:
+        return None
+    try:
+        entry = hookcache.entries().get(pane_key)
+    except Exception:
+        return None
+    if not entry:
+        return None
+    payload = entry.get("payload") or {}
+    return {
+        "paneKey": pane_key,
+        "state": payload.get("state") or "",
+        "stateStartedAt": entry.get("stateStartedAt") or 0,
+        "agentType": payload.get("agentType") or "",
+        "cached": True,
+    }
+
+
+async def _ps_entry(
+    pane_key: str, host: hosts.Host, *, full: bool = False,
+) -> dict | None:
+    """Find the Orca agent-state entry for a pane, if Orca tracks it.
+
+    The observation ladder is cheap rung first: the hook cache answers
+    a state-only question with no Orca call (see `_ps_state`); a
+    `full=True` caller reads a field the cache does not carry, so it
+    skips straight to `worktree ps`; a cache miss costs nothing and
+    takes the same `worktree ps` path as always. Between those two
+    rungs sits the snapshot floor: a pane's full read is reused for
+    `_PS_FULL_MIN_INTERVAL_SECS`, so a two-second poll asking for full
+    rows spawns Orca once per window instead of once per poll — the
+    price is a snapshot that may lag that long, which is why only the
+    fields that need it pay and state-only sites stay on the cache.
+    """
+    if not full:
+        state = await _ps_state(pane_key, host)
+        if state is not None:
+            return state
+    now = time.monotonic()
+    previous = _PS_FULL_SNAPSHOTS.get(pane_key)
+    if previous is not None and now - previous[0] < _PS_FULL_MIN_INTERVAL_SECS:
+        return previous[1]
+    found = None
     for wt in await worktree_ps(host=host):
         for entry in wt.get("agents") or []:
             if entry.get("paneKey") == pane_key:
-                return entry
-    return None
+                found = entry
+                break
+        if found is not None:
+            break
+    _PS_FULL_SNAPSHOTS[pane_key] = (now, found)
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -707,39 +795,6 @@ class Watcher:
         # turn and for the task turn's report (0 = not truncated).
         self._turn_truncated_at = 0
         self._task_truncated_at = 0
-
-    async def _reclaim_pane(self, *, human_turn: bool) -> bool:
-        """Close this agent's pane now that a clean turn is over.
-
-        The record keeps the provider session id and the report and handoff
-        keep the evidence, so `revive` can reopen the session in a fresh pane;
-        leaving the pane behind is what piles terminals up on the desk. The
-        policy is `reclaim.decision`, the same one `osw sweep` applies, so an
-        adopted or supervised pane is never touched. True when a pane closed.
-        """
-        allowed = reclaim.decision(
-            {**self.agent, "state": "done"}, human_turn=human_turn,
-        )[0]
-        if not allowed:
-            return False
-        try:
-            closed = await reclaim.close_if_open(
-                self.root, self.agent, host=self.host,
-            )
-        except OrcaError as exc:
-            # Closing is housekeeping: a failure here must not turn a
-            # finished turn into an error.
-            self._event(
-                "pane_reclaim_failed",
-                level="WARNING",
-                message=one_line(str(exc), 200),
-            )
-            return False
-        if not closed:
-            return False
-        self._update(pane_reclaim="auto", pane_reclaimed_at=now_iso())
-        self._event("pane_reclaimed", data={"by": "auto"})
-        return True
 
     def _update(self, **fields) -> None:
         changed = False
@@ -970,7 +1025,9 @@ class Watcher:
         entry = None
         if self.pane is not None:
             try:
-                entry = await _ps_entry(self.pane, self.host)
+                # full: the stop verdict reads `interrupted`, which the
+                # hook cache does not carry.
+                entry = await _ps_entry(self.pane, self.host, full=True)
             except OrcaError:
                 entry = None
         if entry is not None:
@@ -1243,13 +1300,15 @@ class Watcher:
             self._task_tools_observed = tools
         return tools
 
-    async def _record_session(self) -> None:
-        """Record the pane's provider session id after a turn settles.
+    async def _record_session(self, entry: dict | None = None) -> None:
+        """Record the pane's provider session id from an observation.
 
-        Best effort: Orca's hook cache is not a public interface, so an
-        empty answer or any failure leaves the record (and the turn)
-        exactly as it was. A remote cache that cannot be read is named —
-        a missing id there is a transport fact, not "no session yet".
+        `entry` is the `worktree ps` row the caller already read for this
+        pane, so the identity fallback costs no extra Orca call. Best
+        effort: no observation, an empty answer, or any failure leaves
+        the record (and the turn) exactly as it was. A remote cache that
+        cannot be read is named — a missing id there is a transport
+        fact, not "no session yet".
         """
         if not self.pane:
             return
@@ -1280,6 +1339,24 @@ class Watcher:
                 data={"pane_key": self.pane},
             )
             return
+        if not session_id:
+            # pi and claude report no status to Orca's per-pane cache, so
+            # their pane has no status row at all. Their launch link
+            # does: ps names the pane's orcaSessionId (in the row the
+            # caller already read) and the identity database maps it to
+            # the provider's own session. No extra Orca call.
+            orca_session = str((entry or {}).get("orcaSessionId") or "")
+            if orca_session:
+                try:
+                    session_id = linked_session(orca_session)
+                except Exception as exc:
+                    self._event(
+                        "session_lookup_failed",
+                        level="WARNING",
+                        message=str(exc),
+                        data={"orca_session_id": orca_session},
+                    )
+                    return
         if session_id:
             self._update(session_id=session_id)
 
@@ -1342,8 +1419,51 @@ class Watcher:
                 return str(handle)
         return ""
 
+    async def _infer_caller(self) -> bool:
+        """Record this worktree's only non-OSW agent pane as the caller.
+
+        A dispatch launched through an agent's own tool pipeline carries
+        no caller identity in its environment (`caller_terminal` is null
+        in the record), yet the pane that ran it is still the only agent
+        pane no OSW record owns. Exactly one such pane is the
+        dispatcher; several candidates are ambiguous, and a guess would
+        deliver the notice to the wrong agent, so the caller stays
+        unresolved instead.
+        """
+        try:
+            inferred = await infer_caller_pane(self.root, self.host)
+        except Exception as exc:  # inference is best-effort, never fatal
+            log.warning(
+                "watcher(%s): caller inference failed: %s",
+                self.agent_id, exc,
+            )
+            return False
+        pane_key = str((inferred or {}).get("pane_key") or "")
+        handle = str((inferred or {}).get("handle") or "")
+        if not handle and pane_key:
+            # The hook cache names the pane, not the runtime handle: the
+            # handle is per-runtime and only `terminal list` knows it.
+            handle = await self._rebind_notify_target(pane_key)
+        if not handle:
+            return False
+        self._update(caller_terminal=handle)
+        self._event(
+            "caller_inferred",
+            message="caller inferred from the worktree's only agent pane",
+            data={
+                "handle": handle,
+                "pane_key": str((inferred or {}).get("pane_key") or ""),
+                "title": str((inferred or {}).get("title") or ""),
+            },
+        )
+        return True
+
     async def _notify(self, line: str) -> None:
         kind, target, pane_key = self._notify_target()
+        if not target and await self._infer_caller():
+            # The recorded caller_terminal is the target now; resolving
+            # again also picks up a guardian this record may carry.
+            kind, target, pane_key = self._notify_target()
         if not target:
             # Never drop a completion notification silently: record an
             # ERROR event so the gap is visible in `osw logs`.
@@ -1362,8 +1482,13 @@ class Watcher:
         if kind == "session":
             await self._notify_session(target, line)
             return
+        pane_key = pane_key or await _pane_key(target, self.host)
         try:
             await terminal_send(target, line)
+            self._event(
+                "notify_delivered",
+                data={"line": line, "channel": "terminal"},
+            )
             return
         except OrcaError as exc:
             failure = exc
@@ -1384,6 +1509,10 @@ class Watcher:
                 target = rebound
                 try:
                     await terminal_send(target, line)
+                    self._event(
+                        "notify_delivered",
+                        data={"line": line, "channel": "terminal"},
+                    )
                     return
                 except OrcaError as exc:
                     failure = exc
@@ -1408,6 +1537,10 @@ class Watcher:
         subject = text[:120] or "osw"
         try:
             await orchestration_send(address, subject, line)
+            self._event(
+                "notify_delivered",
+                data={"line": line, "channel": "session"},
+            )
             return
         except OrcaError as exc:
             log.warning("notify failed (session=%s): %s", address, exc)
@@ -1932,13 +2065,15 @@ class Watcher:
         entry = None
         if self.pane:
             try:
-                entry = await _ps_entry(self.pane, self.host)
+                # full: the takeover adopts ps's `prompt` as the sent
+                # text for completion attribution; the cache has none.
+                entry = await _ps_entry(self.pane, self.host, full=True)
             except OrcaError:
                 entry = None
         ps_state = str((entry or {}).get("state") or "")
         self._event("follow_started", data={"ps_state": ps_state or "untracked"})
         if ps_state == "done":
-            await self._record_session()
+            await self._record_session(entry)
             if await self._stop_requested_now():
                 await self._finalize("error", "interrupted")
                 return
@@ -2639,20 +2774,19 @@ class Watcher:
                 if self.pane:
                     self._update(pane_key=self.pane)
                     self._event("pane_detected", data={"pane_key": self.pane})
-            if self.pane and not self.agent.get("session_id"):
-                # Capture the provider session while the pane is still
-                # idle and the hook lane owns Orca's status record. dsh
-                # loses its id to the title lane on the first turn (the
-                # two lanes name different agents, so the hook lane's
-                # later events are dropped), and a turn-end read then
-                # finds nothing.
-                await self._record_session()
             entry = None
             if self.pane:
                 try:
+                    # state only: the hook cache answers this.
                     entry = await _ps_entry(self.pane, self.host)
                 except OrcaError:
                     entry = None
+            if self.pane and not self.agent.get("session_id"):
+                # Capture the provider session while the pane is still
+                # idle and the hook lane owns Orca's status record, from
+                # the row just read: pi/claude answer only through the
+                # identity link that row carries.
+                await self._record_session(entry)
             if entry is not None:
                 # Tracked pane: "done" means ready; anything else (a
                 # turn still running on an adopted pane) means wait.
@@ -2758,6 +2892,7 @@ class Watcher:
         or stuck startup when the ready wait times out."""
         if self.pane is not None:
             try:
+                # state only.
                 entry = await _ps_entry(self.pane, self.host)
             except OrcaError:
                 entry = None
@@ -2791,6 +2926,7 @@ class Watcher:
         if self.pane is None:
             return 0
         try:
+            # state + stateStartedAt only: both come from the cache.
             entry = await _ps_entry(self.pane, self.host)
         except OrcaError:
             return 0
@@ -3091,7 +3227,11 @@ class Watcher:
             entry = None
             if self.pane is not None:
                 try:
-                    entry = await _ps_entry(self.pane, self.host)
+                    # full: this loop reads the ps prompt (receipt,
+                    # truncation, foreign done), `toolName` (tool
+                    # activity, AskUserQuestion) and `updatedAt`
+                    # (stall), none of which the cache carries.
+                    entry = await _ps_entry(self.pane, self.host, full=True)
                 except OrcaError:
                     continue
 
@@ -3278,13 +3418,20 @@ class Watcher:
         self._release_update_lock("finalize")
 
         last_msg = ""
+        entry = None
         if self.pane:
             try:
-                entry = await _ps_entry(self.pane, self.host)
+                # full: the report carries `lastAssistantMessage`.
+                entry = await _ps_entry(self.pane, self.host, full=True)
                 if entry:
                     last_msg = entry.get("lastAssistantMessage") or ""
             except OrcaError:
-                pass
+                entry = None
+        if self.pane and not self.agent.get("session_id"):
+            # The pane's launch link lands after the ready gate has
+            # already looked, so a pi/claude session is recorded here,
+            # from the row just read, while the record is still open.
+            await self._record_session(entry)
 
         report_payload = {
             "version": 3,
@@ -3384,13 +3531,6 @@ class Watcher:
         except OSError:
             pass
 
-        # A clean turn keeps nothing in its pane, so the pane goes now
-        # rather than waiting for someone to run `osw sweep`. Failed
-        # turns keep theirs: that is where the failure is still visible.
-        closed = False
-        if final_state == "done" and not os.environ.get("OSW_KEEP_TERMINAL"):
-            closed = await self._reclaim_pane(human_turn=following or resuming)
-
         if final_state == "error":
             line = (
                 f"# [osw] task-error agent={self.agent_id}"
@@ -3398,17 +3538,16 @@ class Watcher:
                 f" report={report_path}"
             )
         else:
-            reclaimable = reclaim.decision(
-                {**self.agent, "state": final_state},
-                human_turn=following or resuming,
-            )[0]
+            # The pane stays open: a finished turn's terminal is the
+            # caller's to close, and the line carries the exact command.
             line = format_completion_report(
                 self.agent_id, self.handle, str(report_path),
                 handoff_file=self.agent.get("handoff_path") or "",
                 summary=last_msg,
                 outcome=str(self.agent.get("orchestration_outcome") or ""),
                 warning=warning,
-                cleanup="auto" if closed else ("sweep" if reclaimable else ""),
+                cleanup="manual",
+                close_command=f"osw del {self.agent_id} --close",
             )
         if self._mailbox_running():
             # §14: the spool report above is this turn's conclusion and the

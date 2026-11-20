@@ -36,6 +36,12 @@ HEAD), `dispatcher.py` (the only applier of Decisions, through the existing
 `new`/`use`/`stop`/`orchestration reply` paths) and `mailbox_cli.py` (the
 `mailbox` verbs). Producers append envelopes to the spool under
 `.orca/osw/mailbox/spool/`; the daemon is the only writer of the store.
+`skill/osw/notify.py` owns durable completion notices: delivery truth is the
+`notify_delivered` event, or `completion_notify_suppressed` when the Mailbox
+owns delivery; an undelivered notice stays pending for `osw inbox`; the ack
+store `.orca/osw/notify/acked.json` is CLI-owned and `reconcile_legacy` marks
+pre-feature records read exactly once; the watcher remains the only writer of
+agent records.
 The Codex skill guide is `skill/SKILL.md`. Tests live in `tests/`, with
 `conftest.py` adding the local package path. User-facing docs are in
 `README.md`, `README_zh.md`, `QUICK.md`, and `QUICK_zh.md`. Runtime state such
@@ -87,8 +93,12 @@ small functions with clear names. Keep CLI behavior in `skill/osw/cli.py`,
 provider command construction in `skill/osw/providers.py`, persistent state
 helpers in `skill/osw/state.py`, and watcher logic in `skill/osw/watcher.py`.
 Agent ids use `<prefix>_NNN`, for example `agent_001`, `research_001`, or
-`debug_001`. While a watcher runs it is the only writer of its agent
-record; the CLI signals it through side files such as the stop request
+`debug_001`. A finished turn keeps its terminal: the watcher never closes a
+pane, and the completion line carries `cleanup=manual` plus the exact
+`close=osw del <id> --close` command, so the caller or a human closes it
+(`osw sweep` is the bulk closer). While a watcher runs it is the only
+writer of its agent record; the CLI signals it through side files such as
+the stop request
 `.orca/osw/agents/<id>.stop`. OSW itself may inject only
 `watcher.HANDOFF_TEMPLATE`, `watcher.RESUME_TEMPLATE`, the keys of
 `blockers.WHITELIST` entries, the resume command `revive` types into a

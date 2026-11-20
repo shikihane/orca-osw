@@ -9,10 +9,11 @@ import pytest
 from typer.testing import CliRunner
 
 from osw import hosts as host_mod
+from osw import notify as notify_mod
 from osw import state as state_mod
 from osw.cli import app, _spawn_watcher
 from osw.hosts import local_host
-from osw.log import read_events
+from osw.log import emit_event, read_events
 from osw.orca_cli import OrcaError
 
 runner = CliRunner()
@@ -843,6 +844,77 @@ def test_new_detects_caller_from_agent_session_env(tmp_path, monkeypatch):
     agent = state_mod.read_agent(tmp_path, "agent_001")
     assert agent["caller_session"] == "orca_session_id:omp_abc"
     assert agent["caller_terminal"] is None
+
+
+def test_new_infers_caller_from_the_only_agent_pane(tmp_path, monkeypatch):
+    """Agent tool-pipeline dispatch: no ORCA_TERMINAL_HANDLE, no injected
+    session, stdin/stdout are pipes — but the worktree holds exactly one
+    non-OSW agent pane, so that pane is the dispatcher and the record
+    names it instead of demanding --no-notify."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    monkeypatch.delenv("ORCA_AGENT_SESSION_ID", raising=False)
+
+    create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
+    infer = AsyncMock(return_value={
+        "handle": "term-dispatch",
+        "pane_key": "tab-d:leaf-d",
+        "title": "omp - dispatch",
+    })
+    with patch("osw.cli.terminal_create", create), \
+         patch("osw.cli.infer_caller_pane", infer), \
+         patch("osw.cli._spawn_watcher", Mock(return_value=4567)):
+        result = runner.invoke(app, ["new", "claude", "do the task"])
+
+    assert result.exit_code == 0, result.output
+    agent = state_mod.read_agent(tmp_path, "agent_001")
+    assert agent["caller_terminal"] == "term-dispatch"
+    infer.assert_awaited_once()
+    event = next(
+        e for e in read_events(state_mod.logs_dir(tmp_path))
+        if e["event"] == "caller_inferred"
+    )
+    assert event["component"] == "cli"
+    assert event["data"] == {
+        "handle": "term-dispatch",
+        "pane_key": "tab-d:leaf-d",
+        "title": "omp - dispatch",
+    }
+
+
+def test_new_refuses_when_caller_inference_is_ambiguous(tmp_path, monkeypatch):
+    """Two agent panes that no OSW record owns: inference declines to
+    guess, so a piped dispatch still refuses without --no-notify."""
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    monkeypatch.delenv("ORCA_AGENT_SESSION_ID", raising=False)
+
+    create = AsyncMock(return_value={"result": {"terminal": {"handle": "term-new"}}})
+    terminals = [
+        {
+            "handle": "term-a",
+            "tabId": "tab-a",
+            "leafId": "leaf-a",
+            "agentIdentity": "omp",
+        },
+        {
+            "handle": "term-b",
+            "tabId": "tab-b",
+            "leafId": "leaf-b",
+            "agentIdentity": "claude",
+        },
+    ]
+    with patch("osw.cli.terminal_create", create), \
+         patch("osw.reclaim.terminal_list",
+               AsyncMock(return_value=terminals)), \
+         patch("osw.cli._spawn_watcher", Mock(return_value=4567)):
+        result = runner.invoke(app, ["new", "claude", "do the task"])
+
+    assert result.exit_code == 1
+    assert "could not identify the caller terminal" in result.output
+    create.assert_not_awaited()
 
 
 def test_explicit_caller_terminal_beats_orca_env(tmp_path, monkeypatch):
@@ -4339,3 +4411,125 @@ def test_use_names_revive_when_a_finished_agents_pane_is_gone(tmp_path, monkeypa
     assert "Error: no such terminal" in result.output
     assert "osw revive code_001" in result.output
     spawn.assert_not_called()
+
+
+def _plant_pending_notice(
+    root: Path, agent_id: str, line: str, finished_at: str,
+) -> str:
+    """One terminal record plus the notice event a lost send would leave."""
+    state_mod.write_agent(root, {
+        "agent_id": agent_id,
+        "state": "done",
+        "terminal": f"term-{agent_id}",
+        "completion_source": "turn",
+        "finished_at": finished_at,
+        "handoff_path": "",
+        "report_file": "",
+        "warning": "",
+    })
+    emit_event(
+        state_mod.logs_dir(root),
+        component="watcher",
+        event="notify_skipped",
+        agent_id=agent_id,
+        data={"line": line, "reason": "no_caller"},
+    )
+    return line
+
+
+def test_inbox_lists_and_acks_a_pending_notice(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    line = _plant_pending_notice(
+        tmp_path, "misc_001", "# [osw] task-finished agent=misc_001",
+        "2020-01-01T00:00:00+00:00",
+    )
+
+    listed = runner.invoke(app, ["inbox"])
+    assert listed.exit_code == 0, listed.output
+    assert line in listed.output
+
+    payload = json.loads(runner.invoke(app, ["inbox", "--json"]).output)
+    assert payload["version"] == 1
+    assert payload["count"] == 1
+    assert payload["pending"][0]["agent_id"] == "misc_001"
+
+    acked = runner.invoke(app, ["inbox", "--ack"])
+    assert acked.exit_code == 0, acked.output
+    assert "Acknowledged 1" in acked.output
+
+    empty = json.loads(runner.invoke(app, ["inbox", "--json"]).output)
+    assert empty == {"version": 1, "count": 0, "pending": []}
+
+
+def test_inbox_with_nothing_pending_says_so(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+
+    result = runner.invoke(app, ["inbox"])
+
+    assert result.exit_code == 0, result.output
+    assert "No unread completions." in result.output
+
+
+def test_inbox_reconciles_legacy_records_once(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "legacy_001",
+        "state": "done",
+        "terminal": "term-legacy",
+        "completion_source": "turn",
+        "finished_at": "2020-01-01T00:00:00+00:00",
+        "handoff_path": "",
+        "report_file": "",
+    })
+    line = _plant_pending_notice(
+        tmp_path, "misc_001", "# [osw] task-finished agent=misc_001",
+        "2020-01-02T00:00:00+00:00",
+    )
+
+    payload = json.loads(runner.invoke(app, ["inbox", "--json"]).output)
+
+    assert payload["count"] == 1
+    assert [item["agent_id"] for item in payload["pending"]] == ["misc_001"]
+    marker = state_mod.state_dir(tmp_path) / notify_mod.LEGACY_MARKER_RELATIVE
+    assert json.loads(marker.read_text(encoding="utf-8"))["reconciled"] == 1
+
+    listed = runner.invoke(app, ["inbox"])
+    assert line in listed.output
+    assert "legacy_001" not in listed.output
+
+
+def test_status_reconciles_legacy_records_before_counting(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "legacy_001",
+        "state": "done",
+        "terminal": "term-legacy",
+        "completion_source": "turn",
+        "finished_at": "2020-01-01T00:00:00+00:00",
+    })
+
+    result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Unread completions" not in result.output
+    marker = state_mod.state_dir(tmp_path) / notify_mod.LEGACY_MARKER_RELATIVE
+    assert marker.exists()
+
+
+def test_status_reports_unread_completions(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    _plant_pending_notice(
+        tmp_path, "misc_001", "# [osw] task-finished agent=misc_001",
+        "2020-01-01T00:00:00+00:00",
+    )
+
+    result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Unread completions: 1 (osw inbox)" in result.output
+

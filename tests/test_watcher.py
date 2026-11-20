@@ -10,7 +10,9 @@ from unittest.mock import AsyncMock, Mock, patch
 import anyio
 import pytest
 
+from osw import hookcache as hookcache_mod
 from osw import hosts, state
+from osw import watcher as watcher_mod
 from osw.orca_cli import OrcaError
 from osw.watcher import (
     Watcher, _foreign_done, _prompt_truncated_at, format_completion_report,
@@ -28,6 +30,25 @@ def _no_host_session_cache(monkeypatch):
     """Keep watcher tests hermetic: never read the host's real Orca
     agent-hook cache (`last-status.json`) for session ids."""
     monkeypatch.setattr("osw.watcher.session_for_pane", lambda pane_key: "")
+
+
+@pytest.fixture(autouse=True)
+def _no_live_caller_inference():
+    """Never ask a live Orca which pane ran a command; caller inference
+    is exercised explicitly by the tests that want it."""
+    with patch("osw.watcher.infer_caller_pane", AsyncMock(return_value={})):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _no_live_notify_probe(monkeypatch):
+    """Notify never reaches a live Orca: no ps rows and no
+    handle->pane_key lookup unless a test supplies them. Without this
+    every guardian-path notify would probe the real runtime."""
+    monkeypatch.setattr("osw.watcher.worktree_ps", AsyncMock(return_value=[]))
+    monkeypatch.setattr("osw.watcher._PS_FULL_MIN_INTERVAL_SECS", 0)
+    watcher_mod.reset_ps_snapshots()
+    hookcache_mod.reset_cache()
 
 
 def _ps_result(pane: str, ps_state: str, state_started_at: int = 0) -> list[dict]:
@@ -1303,6 +1324,103 @@ async def test_notify_without_caller_records_error_event(tmp_path):
         await watcher._notify("# [osw] task-finished agent_001")
 
     send.assert_not_awaited()
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert '"event": "notify_skipped"' in events
+    assert '"level": "ERROR"' in events
+
+
+@pytest.mark.anyio
+async def test_notify_infers_caller_from_only_agent_pane(tmp_path):
+    """A record dispatched from an agent's tool pipeline has no caller;
+    the worktree's one non-OSW agent pane ran it, so the notice goes
+    there and the record is repaired with that handle."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "caller_terminal": None,
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    send = AsyncMock(return_value={})
+    infer = AsyncMock(return_value={
+        "handle": "term-dispatch",
+        "pane_key": "tab-d:leaf-d",
+        "title": "omp - dispatch",
+    })
+
+    with patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.infer_caller_pane", infer):
+        await watcher._notify("# [osw] task-finished agent_001")
+
+    send.assert_awaited_once()
+    assert send.await_args.args[0] == "term-dispatch"
+    record = state.read_agent(tmp_path, "agent_001")
+    assert record["caller_terminal"] == "term-dispatch"
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert '"event": "caller_inferred"' in events
+    assert '"event": "notify_delivered"' in events
+    assert '"event": "notify_skipped"' not in events
+
+
+@pytest.mark.anyio
+async def test_notify_infers_a_pane_and_resolves_its_handle(tmp_path):
+    """The hook cache names the pane, not the runtime handle: the
+    watcher resolves the handle before recording the caller."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "caller_terminal": None,
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    send = AsyncMock(return_value={})
+    infer = AsyncMock(return_value={
+        "handle": "", "pane_key": "tab-d:leaf-d", "title": "omp sess-1",
+    })
+
+    with patch("osw.watcher.terminal_send", send), \
+         patch("osw.watcher.infer_caller_pane", infer), \
+         patch.object(
+             Watcher, "_rebind_notify_target",
+             AsyncMock(return_value="term-dispatch"),
+         ):
+        await watcher._notify("# [osw] task-finished agent_001")
+
+    send.assert_awaited_once_with("term-dispatch", "# [osw] task-finished agent_001")
+    assert state.read_agent(tmp_path, "agent_001")["caller_terminal"] == "term-dispatch"
+    events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(encoding="utf-8")
+    assert '"event": "caller_inferred"' in events
+    assert '"event": "notify_delivered"' in events
+
+
+@pytest.mark.anyio
+async def test_notify_without_inferable_pane_skips(tmp_path):
+    """Several (or zero) candidate panes: nothing is guessed, so the
+    notice is dropped with the same ERROR event as before."""
+    state.init_state_dir(tmp_path)
+    state.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-a",
+        "prompt": "do the task",
+        "state": "assigned",
+        "caller_terminal": None,
+    })
+    watcher = Watcher(tmp_path, "agent_001")
+    send = AsyncMock(return_value={})
+
+    with patch("osw.watcher.terminal_send", send):
+        await watcher._notify("# [osw] task-finished agent_001")
+
+    send.assert_not_awaited()
+    assert state.read_agent(tmp_path, "agent_001")["caller_terminal"] is None
     events = (state.logs_dir(tmp_path) / "events.jsonl").read_text(
         encoding="utf-8"
     )
@@ -3939,6 +4057,7 @@ async def test_classic_local_handoff_has_no_evidence_and_no_sftp(tmp_path):
     machine = _RemoteMachine(present=True, reads=[b"# x\n", b"# x\n"])
 
     with patch("osw.hosts.anyio.run_process", machine), \
+         patch("osw.watcher._pane_key", AsyncMock(return_value="tab-t:leaf-t")), \
          patch.object(Watcher, "_wait_ready",
                       AsyncMock(return_value="ps_idle")), \
          patch.object(Watcher, "_phase0_ready_wait", AsyncMock()), \
@@ -4749,6 +4868,12 @@ async def test_notify_non_stale_failure_does_not_rebind(tmp_path):
     send.assert_awaited_once()
     terminals.assert_not_awaited()
     assert "notify_failed" in [e["event"] for e in _events(tmp_path)]
+
+
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -6463,28 +6588,49 @@ async def test_live_mailbox_lock_keeps_blocked_notice(tmp_path, spool_writes):
 
 
 
-# --- panes are never closed behind a running watcher ---------------------
+# --- a finished turn keeps its pane until someone closes it --------------
+
+def test_completion_report_carries_the_close_command():
+    line = format_completion_report(
+        "agent_001", "term-a", "report.json",
+        cleanup="manual", close_command="osw del agent_001 --close",
+    )
+    assert line.endswith(" cleanup=manual close=osw del agent_001 --close")
+    assert "\n" not in line
+    assert "close=" not in format_completion_report(
+        "agent_001", "term-a", "report.json",
+    )
+
 
 @pytest.mark.anyio
-async def test_finalize_closes_the_pane_of_a_clean_turn(tmp_path, spool_writes):
-    """A finished turn keeps nothing in its pane, so the watcher closes it
-    itself: leaving that to a human is what piles terminals up."""
+async def test_finalize_leaves_the_pane_of_a_clean_turn_open(
+    tmp_path, spool_writes,
+):
+    """A finished turn keeps its pane: closing it is the caller's step, and
+    the completion line carries the exact command."""
     _spool_agent(tmp_path, origin="new", pane_key="tab-a:leaf-b")
     watcher = Watcher(tmp_path, "agent_001")
     close = AsyncMock(return_value={})
+    sent: list[str] = []
 
-    with patch.object(Watcher, "_notify", AsyncMock(return_value=None)), \
+    async def fake_notify(self, message):
+        sent.append(message)
+
+    with patch.object(Watcher, "_notify", fake_notify), \
          patch("osw.reclaim.terminal_list",
                AsyncMock(return_value=[
                    {"handle": "term-a", "tabId": "tab-a", "leafId": "leaf-b"}])), \
          patch("osw.reclaim.terminal_close", close):
         await watcher._finalize("done", "ps_done")
 
-    close.assert_awaited_once()
-    assert close.await_args.args == ("term-a",)
+    close.assert_not_awaited()
     record = state.read_agent(tmp_path, "agent_001")
-    assert record["pane_reclaim"] == "auto"
-    assert record["pane_reclaimed_at"]
+    assert record["state"] == "done"
+    assert "pane_reclaim" not in record
+    assert "pane_reclaimed_at" not in record
+    assert sent
+    assert "cleanup=manual" in sent[0]
+    assert "close=osw del agent_001 --close" in sent[0]
 
 
 @pytest.mark.anyio
@@ -6493,8 +6639,12 @@ async def test_finalize_keeps_the_pane_of_a_failed_turn(tmp_path, spool_writes):
     _spool_agent(tmp_path, origin="new", pane_key="tab-a:leaf-b")
     watcher = Watcher(tmp_path, "agent_001")
     close = AsyncMock(return_value={})
+    sent: list[str] = []
 
-    with patch.object(Watcher, "_notify", AsyncMock(return_value=None)), \
+    async def fake_notify(self, message):
+        sent.append(message)
+
+    with patch.object(Watcher, "_notify", fake_notify), \
          patch("osw.reclaim.terminal_list",
                AsyncMock(return_value=[
                    {"handle": "term-a", "tabId": "tab-a", "leafId": "leaf-b"}])), \
@@ -6503,91 +6653,16 @@ async def test_finalize_keeps_the_pane_of_a_failed_turn(tmp_path, spool_writes):
 
     close.assert_not_awaited()
     assert "pane_reclaim" not in state.read_agent(tmp_path, "agent_001")
+    # The error line is unchanged: it names no cleanup and no close step.
+    assert sent and sent[0].startswith("# [osw] task-error")
+    assert "cleanup=" not in sent[0]
+    assert "close=" not in sent[0]
 
 
 @pytest.mark.anyio
-async def test_finalize_honours_the_keep_terminal_switch(
-    tmp_path, spool_writes, monkeypatch,
+async def test_finalize_flags_an_adopted_pane_for_manual_close(
+    tmp_path, spool_writes,
 ):
-    monkeypatch.setenv("OSW_KEEP_TERMINAL", "1")
-    _spool_agent(tmp_path, origin="new", pane_key="tab-a:leaf-b")
-    watcher = Watcher(tmp_path, "agent_001")
-    close = AsyncMock(return_value={})
-
-    with patch.object(Watcher, "_notify", AsyncMock(return_value=None)), \
-         patch("osw.reclaim.terminal_list",
-               AsyncMock(return_value=[
-                   {"handle": "term-a", "tabId": "tab-a", "leafId": "leaf-b"}])), \
-         patch("osw.reclaim.terminal_close", close):
-        await watcher._finalize("done", "ps_done")
-
-    close.assert_not_awaited()
-
-
-@pytest.mark.anyio
-async def test_a_failed_close_still_lands_the_turn(tmp_path, spool_writes):
-    """Housekeeping never decides the turn: a refused close is one warning."""
-    _spool_agent(tmp_path, origin="new", pane_key="tab-a:leaf-b")
-    watcher = Watcher(tmp_path, "agent_001")
-
-    with patch.object(Watcher, "_notify", AsyncMock(return_value=None)), \
-         patch("osw.reclaim.terminal_list",
-               AsyncMock(return_value=[
-                   {"handle": "term-a", "tabId": "tab-a", "leafId": "leaf-b"}])), \
-         patch("osw.reclaim.terminal_close",
-               AsyncMock(side_effect=OrcaError("runtime down", 1))):
-        await watcher._finalize("done", "ps_done")
-
-    assert state.read_agent(tmp_path, "agent_001")["state"] == "done"
-
-
-def test_completion_report_flags_a_reclaimable_pane():
-    line = format_completion_report(
-        "agent_001", "term-a", "report.json", cleanup="sweep",
-    )
-    assert line.endswith(" cleanup=sweep")
-    assert "\n" not in line
-
-
-@pytest.mark.anyio
-async def test_finalize_reports_the_cleanup_it_did(tmp_path, spool_writes):
-    """The completion line says what happened to the pane: `auto` when the
-    watcher closed it, `sweep` when it is gone already."""
-    _spool_agent(tmp_path, origin="new", pane_key="tab-a:leaf-b")
-    watcher = Watcher(tmp_path, "agent_001")
-    sent: list[str] = []
-
-    async def fake_notify(self, message):
-        sent.append(message)
-
-    with patch.object(Watcher, "_notify", fake_notify), \
-         patch("osw.reclaim.terminal_list", AsyncMock(return_value=[])):
-        await watcher._finalize("done", "ps_done")
-
-    assert sent and "cleanup=sweep" in sent[0]
-
-
-@pytest.mark.anyio
-async def test_finalize_says_auto_when_it_closed_the_pane(tmp_path, spool_writes):
-    _spool_agent(tmp_path, origin="new", pane_key="tab-a:leaf-b")
-    watcher = Watcher(tmp_path, "agent_001")
-    sent: list[str] = []
-
-    async def fake_notify(self, message):
-        sent.append(message)
-
-    with patch.object(Watcher, "_notify", fake_notify), \
-         patch("osw.reclaim.terminal_list",
-               AsyncMock(return_value=[
-                   {"handle": "term-a", "tabId": "tab-a", "leafId": "leaf-b"}])), \
-         patch("osw.reclaim.terminal_close", AsyncMock(return_value={})):
-        await watcher._finalize("done", "ps_done")
-
-    assert sent and "cleanup=auto" in sent[0]
-
-
-@pytest.mark.anyio
-async def test_finalize_does_not_flag_an_adopted_pane(tmp_path, spool_writes):
     _spool_agent(tmp_path, origin="use", pane_key="tab-a:leaf-b")
     watcher = Watcher(tmp_path, "agent_001")
     sent: list[str] = []
@@ -6598,4 +6673,5 @@ async def test_finalize_does_not_flag_an_adopted_pane(tmp_path, spool_writes):
     with patch.object(Watcher, "_notify", fake_notify):
         await watcher._finalize("done", "ps_done")
 
-    assert sent and "cleanup=" not in sent[0]
+    assert sent and "cleanup=manual" in sent[0]
+    assert "close=osw del agent_001 --close" in sent[0]

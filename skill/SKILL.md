@@ -23,14 +23,14 @@ directory containing this file.
 6. Accept results only after checking the handoff and actual workspace state.
 7. When the mailbox is running, route through it rather than dispatching
    inline: `mailbox wait` for cards, `mailbox decide` for the decision.
-8. **Finished panes close themselves; sweep what still stands.** A `done`
-   turn now ends with its pane closed by the watcher (`cleanup=auto` in the
-   completion line, `pane_reclaim: "auto"` in the record). Run
-   `python <skill-dir>/osw.py sweep` at the end of a batch anyway: it catches
-   a pane whose close was refused, and the `error`/`lost` panes you decide to
-   discard (`--force`). Keep a pane on purpose with `OSW_KEEP_TERMINAL=1`
-   before the turn ends — the default is that nothing idle survives.
-   Records and `session_id` stay either way, so `revive` still resumes.
+8. **Finished panes stay open; close them yourself.** A `done` turn ends with
+   its pane on screen on purpose, so the result is where you read it, and the
+   completion line names the close command: `cleanup=manual close=osw del
+   <agent-id> --close`. Close each finished agent with that command once you
+   have read it, and run `python <skill-dir>/osw.py sweep` at the end of a
+   batch for the finished panes left behind — plus the `error`/`lost` panes
+   you decide to discard (`--force`). Records and `session_id` stay either
+   way, so `revive` still resumes.
 
 For multiple workers, dependencies, shared-worktree coordination, or model
 selection, read [references/orchestration.md](references/orchestration.md)
@@ -118,26 +118,53 @@ python <skill-dir>/osw.py stop <agent-id>
 - `stop` interrupts the current turn; it ends as `error` with
   `completion_source: interrupted` and no handoff.
 
-A `done` turn closes its own pane as it finishes, so the desk stays clear
-without anyone remembering:
+A `done` turn leaves its pane open on purpose, so the result stays on
+screen where the caller can read it. Closing is an explicit step:
 
 ```text
+python <skill-dir>/osw.py del <agent-id> --close
 python <skill-dir>/osw.py sweep [--force] [--json]
 ```
 
-The watcher closes the pane when the record settles `done` (`cleanup=auto` on
-the completion line, `pane_reclaim: "auto"` in the record) and leaves it
-alone when the turn failed — a failed pane is where the failure is still
-readable. `sweep` is the backstop and the cleaner: it closes `done` panes a
-refused close left behind, plus `error`/`lost` panes when you pass `--force`,
-and prints what it kept and why. Records and `session_id` stay, so
-`revive <agent-id>` resumes the session in a fresh pane later. Never
-reclaimed automatically or otherwise: adopted panes (`use`/`enroll`),
-supervised dispatch terminals (Orca owns them; `del <id> --close` releases
-the worker first), and human-reopened turns (`guard`/`revive`). Set
-`OSW_KEEP_TERMINAL=1` on the watcher's environment to keep a `done` pane.
+The completion line names that command (`cleanup=manual close=osw del
+<agent-id> --close`), so the caller needs no lookup. `del <agent-id> --close`
+closes one finished pane and drops nothing the record needs; `sweep` is the
+bulk closer for `done` panes left behind, plus `error`/`lost` panes when you
+pass `--force`, and prints what it kept and why. Records and `session_id`
+stay, so `revive <agent-id>` resumes the session in a fresh pane later.
+`del <agent-id> --close` is the explicit close for one agent whatever its
+origin. `sweep` follows the shared policy and keeps the panes it does not own:
+adopted panes (`use`/`enroll`), supervised dispatch terminals (Orca owns them),
+and human-reopened turns (`guard`/`revive`).
 
 `list`/`status` show a mid-task agent whose watcher died as `lost`.
+
+## Completion Inbox
+
+A finished worker's notice is durable: the watcher appends a `notify_delivered`
+event after a successful send, and a notice that reached no caller stays
+pending. Check the inbox instead of reading silence as a dead worker:
+
+```text
+python <skill-dir>/osw.py inbox
+python <skill-dir>/osw.py inbox --ack --limit 5
+```
+
+- `inbox` lists pending notices newest first (20 by default); `--json` prints
+  `{count, pending}` and `--limit N` caps the list.
+- `--ack` records the listed notices as read in `.orca/osw/notify/acked.json`,
+  the CLI-owned ack store that only the ack path writes.
+- Nothing is retried from other commands: `new`, `use` and `status` leave
+  pending notices untouched, and `status` prints `Unread completions: N
+  (osw inbox)` while any are pending. A caller that is merely waiting on one
+  agent still reads its inbox this way.
+- A notice keeps the exact line recorded when delivery was skipped or failed —
+  that recorded completion line ends with `cleanup=manual close=osw del
+  <agent-id> --close`; with none recorded it is rebuilt from the agent record
+  and its newest report.
+- Read the notice with its handoff, close the finished pane when you are done
+  with it, then ack. Hand-editing `.orca/osw/notify/` is the same class of
+  mistake as editing an agent record.
 
 ## Mailbox
 
@@ -288,6 +315,14 @@ python <skill-dir>/osw.py new --on fnnas <provider> --prefix <role> "<task>"
 - Orca pairing is optional for operation; it is what lets a remote terminal be
   viewed in the Orca UI.
 
+When no caller identity is inherited — a dispatch run through an agent's own
+tool pipeline, where stdin/stdout are pipes and Orca exports no terminal
+handle — OSW asks the worktree instead: exactly one agent pane that no OSW
+record owns is the dispatcher, so the notice goes there and the record is
+marked `caller_inferred` (its `caller_terminal` is that pane's handle). Two
+or more such panes are ambiguous and nothing is guessed: pass
+`--caller-terminal <handle>` (or `--no-notify`).
+
 Notifications to expect besides `task-finished` / `task-error`:
 
 - `# [osw] blocked agent=<id> kind=<kind> ... screen=<excerpt>` — a dialog
@@ -324,10 +359,9 @@ Notifications to expect besides `task-finished` / `task-error`:
   clearing the inherited `ORCA_*` environment variables.
 - Use provider autonomy flags only in a trusted, externally controlled
   worktree.
-- **A finished agent leaves no terminal behind.** The watcher closes it when
-  the turn settles `done`; a refused close is a `pane_reclaim_failed`
-  warning, and `osw sweep` is the backstop you run before reporting a batch
-  complete. `OSW_KEEP_TERMINAL=1` is the only opt-out, and it is for a turn
-  you are about to inspect. Keep the record — `revive` needs it — and close
-  only panes OSW created; the policy decides that and prints why it kept what
-  it kept.
+- **A finished agent keeps its terminal until you close it.** A `done` pane
+  stays on screen on purpose, and its completion line carries `cleanup=manual
+  close=osw del <agent-id> --close`. Close each one you have read, and run
+  `osw sweep` before reporting a batch complete for the panes left behind.
+  Keep the record — `revive` needs it — and close only panes OSW created; the
+  policy decides that and prints why it kept what it kept.

@@ -9,6 +9,7 @@ A lightweight Python tool for managing Orca-backed agent sessions from the curre
 - **Directory-scoped** — each working directory is an independent management scope, even across git worktrees
 - **Detached watchers** — each managed agent gets a watcher process that monitors completion without blocking the CLI
 - **Automatic handoff** — detects task completion, sends a fixed wrap-up instruction with a pre-allocated handoff path, verifies the handoff markdown, notifies the caller terminal
+- **Durable completion notices** — a delivered notice is recorded as a `notify_delivered` event, and one that reached no caller stays pending for `osw inbox` instead of disappearing into the log
 - **omp-aware readiness and completion** — omp never goes output-idle and Orca emits no `tui-idle` for it, so OSW reads its terminal title (a spinner in front means a turn is running) for both the ready gate and the turn-done verdict
 - **Takeover and recovery** — `enroll` records agent terminals OSW did not start, `guard` makes you their notification target and follows a running turn, `revive` reopens provider sessions after an Orca or PC restart, and `stop` interrupts a turn
 - **Cross-host supervision** — register a machine once, dispatch with `--on <host>`, and collect the handoff locally: Orca pairing is the dispatch plane, SSH the data plane, and the remote side needs no OSW install
@@ -67,7 +68,8 @@ python skill/osw.py status
 | `sweep [--force] [--json]` | Close the terminals of finished agents; records and sessions stay |
 | `list [--all] [--json]` | List managed agents |
 | `logs [--agent <agent_id>] [--tail N]` | Show OSW logs and events |
-| `status [--all]` | Show OSW state and agent counts |
+| `status [--all]` | Show OSW state, agent counts and unread completions |
+| `inbox [--json] [--ack] [--limit N]` | List pending completion notices, newest first; `--ack` records the listed ones as read |
 | `mailbox start [--json]` | Start the local Mailbox daemon (control plane only); a second `start` is a success |
 | `mailbox stop [--json]` | Stop the daemon and wait for it to exit |
 | `mailbox status [--json]` | Queue depths, oldest age, spool lag, doorbell state and dead letters |
@@ -95,8 +97,41 @@ python skill/osw.py status
 - OSW adds the provider's non-blocking autonomy flag by default: `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`, `pi --approve`, `omp --auto-approve`, `kimi --yolo`, or `grok --always-approve --trust`.
 - `new` and `use` accept `--caller-terminal <handle>` to receive completion reports on a parent terminal. Run from an Orca chat (a structured agent session, which has no terminal handle), the caller is the injected `ORCA_AGENT_SESSION_ID`, recorded as `caller_session: orca_session_id:<id>`; the watcher delivers through `orca orchestration send`, which Orca injects into that chat as a user turn.
 - `del --close` also asks Orca to close the terminal.
-- **A `done` turn closes its own terminal.** When a turn settles `done` the watcher applies the reclamation policy and closes the pane it was given: the completion line then carries `cleanup=auto` and the record gains `pane_reclaim: "auto"`. Records and `session_id` stay, so `revive <agent_id>` resumes the session in a fresh terminal. `osw sweep` is still the backstop (and the only way to close a failed one, with `--force`); it prints what it kept and why. Panes never closed automatically: adopted ones (`use`/`enroll`), supervised dispatch terminals (Orca owns them; `del <id> --close` releases them), failed turns (`error`/`lost`), human-reopened turns (`guard`/`revive`), and a `done` turn with `OSW_KEEP_TERMINAL=1` in its environment.
+- **A `done` turn leaves its terminal open.** The pane stays on screen on purpose, so the result is where the caller can read it: the completion line carries `cleanup=manual close=osw del <agent_id> --close`, and closing is the caller's own explicit step. Records and `session_id` stay, so `revive <agent_id>` resumes the session in a fresh terminal once the pane is gone. Close one agent with `osw del <agent_id> --close`; close finished panes in bulk with `osw sweep` (and a failed `error`/`lost` one only with `--force` — its pane is where the failure is still readable), which prints what it kept and why. `del <agent_id> --close` is the explicit close for one agent whatever its origin; `sweep` follows the shared policy instead and keeps the panes it does not own — adopted ones (`use`/`enroll`), supervised dispatch terminals (Orca owns them), and human-reopened turns (`guard`/`revive`) — which `del --close` is there for.
 - `list --json` outputs raw JSON.
+
+## Completion Notices
+
+A completion notice is durable. After a successful send the watcher appends a
+`notify_delivered` event carrying the exact `line` and the `channel`
+(`terminal` or `session`); a record counts as delivered when such an event, or
+a `completion_notify_suppressed` one from the Mailbox channel, exists for that
+agent with a timestamp at or after its `finished_at`. A notice that found no
+caller stays pending instead of living only in the event log.
+
+```bash
+python skill/osw.py inbox                # pending notices, newest first
+python skill/osw.py inbox --limit 20     # cap the listing
+python skill/osw.py inbox --json         # {count, pending} for scripts
+python skill/osw.py inbox --ack          # record the listed notices as read
+```
+
+`osw status` reports `Unread completions: N (osw inbox)` when notices are
+pending. Delivery has no retry from another command: `new`, `use` and `status`
+leave pending notices untouched, so a caller that is merely waiting on one
+agent keeps waiting undisturbed. `osw inbox` is how you look without breaking
+that caller.
+
+The text is the historical `line` recorded when delivery was skipped or
+failed — that recorded line ends with `cleanup=manual close=osw del <agent_id>
+--close`; with none recorded, the notice is built in the
+`format_completion_report` shape from the agent record and its newest report.
+Read state
+lives in `.orca/osw/notify/acked.json`, keyed by
+`<agent_id>@<finished_at>`; only the ack and reconcile paths write that file,
+and the watcher stays the only writer of agent records. Notices finished
+before this tracking existed are reconciled once into
+`notify/legacy_reconciled.json`, so the inbox lists real gaps only.
 
 ## Orca Compatibility
 
