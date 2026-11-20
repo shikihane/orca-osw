@@ -320,14 +320,26 @@ async def terminal_list(
 
 async def terminal_create(
     command: str, worktree: str = "active", *, host: "Host | None" = None,
+    title: str = "",
 ) -> dict:
+    args = ["terminal", "create", "--worktree", worktree, "--command", command]
+    if title:
+        args += ["--title", title]
+    return await run_orca(*args, host=host)
+
+
+async def terminal_rename(
+    handle: str, title: str, *, host: "Host | None" = None,
+) -> dict:
+    """Set a tab's custom title; an empty `title` clears it.
+
+    A custom title outranks and blocks Orca's generated one: the
+    generator (`setGeneratedTabTitleFromAgentPrompt`) returns early when
+    the tab carries a custom title, so a pinned pane keeps its name for
+    its whole life.
+    """
     return await run_orca(
-        "terminal",
-        "create",
-        "--worktree",
-        worktree,
-        "--command",
-        command,
+        "terminal", "rename", "--terminal", handle, "--title", title,
         host=host,
     )
 

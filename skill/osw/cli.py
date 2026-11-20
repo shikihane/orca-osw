@@ -51,6 +51,7 @@ from osw.orca_cli import (
     terminal_interrupt,
     terminal_list,
     terminal_read,
+    terminal_rename,
     terminal_send,
     terminal_send_escape,
     terminal_show,
@@ -233,6 +234,35 @@ def _run_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     `host=` is keyword-only, so it needs a partial.
     """
     return anyio.run(functools.partial(fn, *args, **kwargs))
+
+
+def _pane_title(agent_id: str) -> str:
+    """The custom tab title that pins one pane's name.
+
+    Orca 1.4.26x can rename a tab to the agent's first prompt (cut to 40
+    characters, `tabAutoGenerateTitle`), which makes several panes
+    indistinguishable. A custom title is never overwritten by that
+    generator, so the pane keeps a name derived from its agent id.
+    """
+    return f"osw {agent_id}"
+
+
+def _pin_pane_title(
+    root: Path, handle: str, agent_id: str, *, host: Host,
+) -> None:
+    """Pin the title of an already-created pane; failure is a warning."""
+    try:
+        _run_async(terminal_rename, handle, _pane_title(agent_id), host=host)
+    except OrcaError as exc:
+        emit_event(
+            logs_dir(root),
+            component="cli",
+            event="pane_title_pin_failed",
+            level="WARNING",
+            agent_id=agent_id,
+            message=exc.message,
+            data={"terminal": handle, "host": host.name},
+        )
 
 
 @host_app.command("add")
@@ -1591,7 +1621,10 @@ def new(
         )
         try:
             result = _run_async(
-                terminal_create, provider_command, **create_kwargs,
+                terminal_create,
+                provider_command,
+                title=_pane_title(agent_id),
+                **create_kwargs,
             )
         except OrcaError as exc:
             emit_event(
@@ -2637,13 +2670,17 @@ def revive(
     else:
         placement = "new_terminal"
         try:
+            title = _pane_title(agent_id)
             if host.is_local:
-                result = _run_async(terminal_create, command, host=host)
+                result = _run_async(
+                    terminal_create, command, host=host, title=title,
+                )
             else:
                 # A remote terminal needs an explicit worktree upstream:
                 # `active`/`current` are refused for a paired server.
                 result = _run_async(
                     terminal_create, command, host.worktree, host=host,
+                    title=title,
                 )
         except OrcaError as exc:
             emit_event(

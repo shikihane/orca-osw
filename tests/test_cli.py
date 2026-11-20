@@ -221,9 +221,12 @@ def test_new_creates_provider_terminal_agent_file_and_detaches_watcher(tmp_path,
     assert "Created research_001" in result.output
     assert "(provider: claude)" in result.output
     # The launch command must not embed the task prompt: the watcher
-    # sends it as its own observable turn once the TUI is ready.
+    # sends it as its own observable turn once the TUI is ready. The
+    # title is the pane pin: Orca's generated titles skip a tab that
+    # already carries a custom one.
     create.assert_awaited_once_with(
-        "claude --dangerously-skip-permissions --model sonnet --effort high"
+        "claude --dangerously-skip-permissions --model sonnet --effort high",
+        title="osw research_001",
     )
     spawn.assert_called_once_with(tmp_path, "research_001")
 
@@ -3218,6 +3221,7 @@ def test_revive_lost_agent_resumes_session_and_continues_task(tmp_path, monkeypa
     create.assert_awaited_once_with(
         "claude --dangerously-skip-permissions --model sonnet --effort high --resume s-1",
         host=LOCAL,
+        title="osw code_001",
     )
     ps.assert_not_awaited()  # never judge from the old pane's ps state
     spawn.assert_called_once_with(tmp_path, "code_001")
@@ -3256,6 +3260,7 @@ def test_revive_idle_agent_only_restores_session(tmp_path, monkeypatch):
     create.assert_awaited_once_with(
         "codex resume s-pane --dangerously-bypass-approvals-and-sandbox",
         host=LOCAL,
+        title="osw code_001",
     )
     spawn.assert_not_called()
     agent = state_mod.read_agent(tmp_path, "code_001")
@@ -3284,7 +3289,9 @@ def test_revive_session_flag_beats_recorded_session(tmp_path, monkeypatch):
         result = runner.invoke(app, ["revive", "code_001", "--session", "s-flag"])
 
     assert result.exit_code == 0, result.output
-    create.assert_awaited_once_with("pi --approve --session s-flag", host=LOCAL)
+    create.assert_awaited_once_with(
+        "pi --approve --session s-flag", host=LOCAL, title="osw code_001",
+    )
     sessions.assert_not_called()
     assert state_mod.read_agent(tmp_path, "code_001")["session_id"] == "s-flag"
 
@@ -3474,7 +3481,9 @@ def test_revive_lost_omp_claims_new_terminal_with_worker_start(tmp_path, monkeyp
         result = runner.invoke(app, ["revive", "misc_001"])
 
     assert result.exit_code == 0, result.output
-    create.assert_awaited_once_with("omp --auto-approve --resume s-omp", host=LOCAL)
+    create.assert_awaited_once_with(
+        "omp --auto-approve --resume s-omp", host=LOCAL, title="osw misc_001",
+    )
     release.assert_awaited_once_with("ctx_old")
     identity.assert_awaited_with("term-new")
     kwargs = start.await_args.kwargs
@@ -4001,7 +4010,7 @@ def test_revive_remote_reads_its_own_cache_and_creates_on_that_host(
     # from PATH: the host's recorded absolute provider path heads argv.
     create.assert_awaited_once_with(
         "/opt/agents/claude/bin/claude --dangerously-skip-permissions --resume s-r",
-        "path:/srv/fnnas", host=fleet_host,
+        "path:/srv/fnnas", host=fleet_host, title="osw fnnas_001",
     )
     send.assert_not_awaited()
     agent = state_mod.read_agent(tmp_path, "fnnas_001")
