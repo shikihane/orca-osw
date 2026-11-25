@@ -117,6 +117,20 @@ line, at most 4 KiB, always carrying the decision id for audit.
   `new`, `use`, `status`, `list`, `revive`, `stop` and the current watcher
   notification path behave exactly as before. The spool keeps what producers
   wrote, a restart ingests it, and `status` reports `mailbox_down`.
+- **A fan-out is one Ticket.** `osw super` with the Mailbox opens one batch
+  Ticket (`dispatcher.open_batch`, human-authorized, bounded by the mandate's
+  `max_workers`), passes `--ticket <id>` to every dispatch, registers each
+  worker as an assignment, and seals the batch after the last dispatch. The
+  daemon then writes exactly one `# [osw] batch-finished ticket=...` line to
+  the Ticket origin once every assignment is terminal (the reconciliation
+  marks a dead or report-less worker `lost`). `--no-mailbox` dispatches
+  without a Ticket and every worker reports directly.
+- **Suppression needs a conclusion.** The watcher suppresses its direct
+  completion line only when all three hold: the record carries `ticket_id`,
+  the report reached the spool, and `daemon.is_live()` passes (live pid, a
+  lock written by that process, and a `status.json` heartbeat under 600 s).
+  Anything unknown keeps the direct line — a duplicate is preferred to
+  silence.
 - **One writer.** CLI, watchers and adapters only append envelopes to the
   spool; only the Mailbox writes the SQLite store. Delivery is at-least-once
   with idempotent application, so one worker, one answer and one stop happen
@@ -242,6 +256,7 @@ request overrides it; a task type with no row stays undecided (run
 |---|---|---|---|
 | implementation | pi | magpie/workbuddy/deepseek-v4.1-flash | high |
 | batch fan-out (`osw super`) | pi | magpie/workbuddy/deepseek-v4.1-flash | high |
+| review / design and incident review (`review` agents) | claude | rucode/claude-opus-5-5[1m] | xhigh |
 
 ## Host Seam and Cross-Host Operation
 

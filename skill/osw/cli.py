@@ -1090,6 +1090,51 @@ def _base_agent(
 REUSED_FIELDS = ("session_id", "support", "support_reason")
 
 
+def _apply_ticket(agent: dict, ticket: str) -> None:
+    """Record the batch Ticket this run belongs to; no ticket clears it."""
+    if ticket:
+        agent["ticket_id"] = ticket
+    else:
+        agent.pop("ticket_id", None)
+
+
+def _record_batch_assignment(
+    root: Path, ticket: str, agent_id: str, terminal: str,
+) -> None:
+    """Register this worker on its batch Ticket; a failure is a warning.
+
+    The fan-out that opened the Ticket reads the ids from `new`'s own
+    output, so it must never be a second registration: the record is the
+    one authority and a lost store only costs the daemon's reconciliation.
+    """
+    from osw.mailbox.paths import db_path
+    from osw.mailbox.store import Store
+
+    try:
+        store = Store(db_path(root))
+        try:
+            store.add_assignment(
+                ticket,
+                {"agent_id": agent_id, "terminal": terminal, "state": "working"},
+            )
+        finally:
+            store.close()
+    except Exception as exc:  # best effort: the worker is already running
+        try:
+            emit_event(
+                logs_dir(root),
+                component="cli",
+                event="batch_assignment_failed",
+                level="WARNING",
+                agent_id=agent_id,
+                terminal=terminal,
+                message=str(exc) or type(exc).__name__,
+                data={"ticket": ticket},
+            )
+        except OSError:
+            pass
+
+
 def _reuse_origin(existing: dict | None) -> str:
     return str((existing or {}).get("origin") or "use")
 
@@ -1447,6 +1492,7 @@ def new(
     prefix: str = typer.Option(None, "--prefix", help="Agent id prefix, e.g. research, code, test, debug, review, misc"),
     caller_terminal: str = typer.Option(None, "--caller-terminal", help="Terminal handle to receive completion reports"),
     no_notify: bool = typer.Option(False, "--no-notify", help="Proceed without a caller terminal; completion will not be reported"),
+    ticket: str = typer.Option("", "--ticket", help="Batch Ticket id this dispatch belongs to"),
     on: str = typer.Option(None, "--on", help="Registered host to dispatch to (default: this machine)"),
 ) -> None:
     """Create a new provider agent terminal and return after starting its watcher."""
@@ -1667,11 +1713,15 @@ def new(
             worktree_path=remote_root or None,
         )
 
+    _apply_ticket(agent, ticket)
     try:
         _start_watcher(root, agent)
     except OSError as exc:
         typer.echo(f"Error: failed to start watcher: {exc}")
         raise typer.Exit(1)
+
+    if ticket:
+        _record_batch_assignment(root, ticket, agent_id, handle)
 
     created = (
         f"Created {agent_id} on terminal {handle} (provider: {provider})"
@@ -1696,6 +1746,7 @@ def use(
     prefix: str = typer.Option(None, "--prefix", help="Agent id prefix, e.g. research, code, test, debug, review, misc"),
     caller_terminal: str = typer.Option(None, "--caller-terminal", help="Terminal handle to receive completion reports"),
     no_notify: bool = typer.Option(False, "--no-notify", help="Proceed without a caller terminal; completion will not be reported"),
+    ticket: str = typer.Option("", "--ticket", help="Batch Ticket id this run belongs to (clears it when omitted)"),
     on: str = typer.Option(None, "--on", help="Registered host the pane lives on (default: this machine)"),
 ) -> None:
     """Adopt an already-running terminal as a managed agent."""
@@ -1877,6 +1928,7 @@ def use(
             agent["pane_key"] = str(receipt["pane_key"])
         agent.update(_supervised_record_fields(receipt, provider))
 
+        _apply_ticket(agent, ticket)
         try:
             _start_watcher(root, agent)
         except OSError as exc:
@@ -1919,6 +1971,7 @@ def use(
     if guardian:
         agent["guardian"] = guardian
 
+    _apply_ticket(agent, ticket)
     try:
         _start_watcher(root, agent)
     except OSError as exc:

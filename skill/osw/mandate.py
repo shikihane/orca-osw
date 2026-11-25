@@ -259,12 +259,19 @@ def _committed(root: Path, ref: str) -> str | None:
 
 
 def load_mandate(root: Path, *, ref: str = "HEAD") -> dict:
-    """Load the committed mandate, falling back to the working-tree file."""
+    """Load the committed mandate, falling back to files on disk.
+
+    A project may commit its own ``skill/osw/mandate.json``. When it has none
+    — every project that is not the OSW repository — the mandate bundled with
+    this package is used, so the control plane keeps one code-checked policy
+    instead of refusing to run outside the OSW repository.
+    """
     root = Path(root)
     text = _committed(root, ref)
     if text is None:
-        path = root / MANDATE_RELATIVE_PATH
-        if not path.is_file():
+        candidates = (root / MANDATE_RELATIVE_PATH, Path(__file__).with_name("mandate.json"))
+        path = next((p for p in candidates if p.is_file()), None)
+        if path is None:
             raise _fail("mandate_missing", f"缺少 Mandate 文件: {MANDATE_RELATIVE_PATH}")
         try:
             text = path.read_text(encoding="utf-8")

@@ -9,6 +9,12 @@ The conversation address is transport, not routing: ``terminal:<handle>`` or
 ``session:<id>``. The caller supplies ``notify(conversation, line)``; it may be
 a plain function or a coroutine function.
 
+A failed send to a ``terminal:`` address gets one extra chance: when the
+hooks object offers ``rebind_conversation(conversation, payload)`` and answers
+with a different, non-empty address, the same line is sent there once. The
+hook is optional and its failures are ignored, so a mailbox without it keeps
+the plain retry/back-off/dead-letter behaviour.
+
 A process-local address (the headless ``local:<pid>`` form) names a pid, not a
 conversation: :func:`is_deliverable` refuses it, so a producer that would queue
 a notice there can see it is not a target before it writes an Outbox row that
@@ -84,6 +90,7 @@ async def deliver_outbox(
     store: Any,
     notify: Notify,
     *,
+    hooks: Any = None,
     limit: int = 50,
     now: float | None = None,
 ) -> list[dict]:
@@ -95,6 +102,7 @@ async def deliver_outbox(
     """
     now = time.time() if now is None else now
     limit = max(1, int(limit))
+    notify, hooks = _notify_owner(notify, hooks)
     scan_limit = max(limit * 4, 200)
     rows = store.outbox_pending(limit=scan_limit, now=_ALL_PENDING) or []
 
@@ -112,7 +120,7 @@ async def deliver_outbox(
             if _next_at(row) > now:
                 # Not due: this conversation waits, later seq included.
                 break
-            outcome = await _deliver_one(store, notify, row, now)
+            outcome = await _deliver_one(store, notify, row, now, hooks)
             outcomes.append(outcome)
             if outcome["state"] != SENT:
                 break
@@ -122,11 +130,12 @@ async def deliver_outbox(
 
 
 async def _deliver_one(
-    store: Any, notify: Notify, row: dict, now: float
+    store: Any, notify: Notify, row: dict, now: float, hooks: Any = None
 ) -> dict:
     row_id = str(row.get("id") or "")
     conversation = str(row.get("conversation") or "")
-    line = _line(row.get("payload"))
+    payload = row.get("payload")
+    line = _line(payload)
     outcome = {
         "id": row_id,
         "ticket_id": str(row.get("ticket_id") or ""),
@@ -136,9 +145,7 @@ async def _deliver_one(
         "line": line,
     }
     try:
-        result = notify(conversation, line)
-        if inspect.isawaitable(result):
-            await result
+        await _send(notify, hooks, conversation, line, payload)
     except Exception as exc:  # one bad send never kills the loop
         attempts = int(row.get("attempts") or 0) + 1
         error = str(exc) or exc.__class__.__name__
@@ -171,6 +178,63 @@ async def _deliver_one(
         "next_at": 0.0,
         "error": "",
     }
+
+
+def _notify_owner(notify: Any, hooks: Any) -> tuple[Notify, Any]:
+    """Split the send callable from the object that may own a rebind hook.
+
+    A hooks object with a ``notify`` method is accepted directly; a bound
+    ``notify`` method already names its owner, so the usual daemon call needs
+    no extra argument.
+    """
+    if not callable(notify):
+        inner = getattr(notify, "notify", None)
+        if not callable(inner):
+            raise TypeError("notify must be callable")
+        if hooks is None:
+            hooks = notify
+        notify = inner
+    if hooks is None:
+        hooks = getattr(notify, "__self__", None)
+    return notify, hooks
+
+
+async def _send(
+    notify: Notify, hooks: Any, conversation: str, line: str, payload: Any
+) -> None:
+    """Send one line, rebinding a dead ``terminal:`` address once."""
+    try:
+        await _call(notify, conversation, line)
+    except Exception:
+        if not conversation.startswith("terminal:"):
+            raise
+        rebound = await _rebind(hooks, conversation, payload)
+        if not rebound:
+            raise
+        await _call(notify, rebound, line)
+
+
+async def _call(notify: Notify, conversation: str, line: str) -> None:
+    result = notify(conversation, line)
+    if inspect.isawaitable(result):
+        await result
+
+
+async def _rebind(hooks: Any, conversation: str, payload: Any) -> str:
+    """Fresh address from the hooks, or ``""`` when there is no rebind."""
+    hook = None
+    if hooks is not None:
+        hook = getattr(hooks, "rebind_conversation", None)
+    if not callable(hook):
+        return ""
+    try:
+        result = hook(conversation, payload if isinstance(payload, dict) else {})
+        if inspect.isawaitable(result):
+            result = await result
+    except Exception:  # an optional hook never fails a delivery
+        return ""
+    address = _normalize(str(result or "").strip())
+    return "" if address == conversation else address
 
 
 def _line(payload: Any) -> str:

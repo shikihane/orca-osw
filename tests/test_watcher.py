@@ -6463,16 +6463,40 @@ async def test_spool_sink_failure_does_not_stop_ask_relay(tmp_path, monkeypatch)
 # blocked notices are unchanged and are always sent.
 # ---------------------------------------------------------------------------
 
-def _mailbox_lock(tmp_path, pid: int) -> Path:
-    """Write a daemon lock naming `pid`, as a live Mailbox would."""
-    from osw.mailbox.paths import ensure_mailbox_dirs, lock_path
+def _mailbox_lock(
+    tmp_path,
+    pid: int,
+    *,
+    started_at: str | None = None,
+    status_pid: int | None = None,
+    heartbeat: bool = True,
+) -> Path:
+    """Write a daemon lock and status.json, as a live Mailbox would.
+
+    `started_at` defaults to now, which is after this test process started,
+    so `daemon.is_live` accepts the lock for `os.getpid()`.
+    """
+    from datetime import datetime, timezone
+
+    from osw.mailbox.paths import ensure_mailbox_dirs, lock_path, status_path
 
     ensure_mailbox_dirs(tmp_path)
     path = lock_path(tmp_path)
     path.write_text(
-        json.dumps({"pid": pid, "started_at": "2026-11-14T00:00:00+00:00"}),
+        json.dumps({
+            "pid": pid,
+            "started_at": started_at or datetime.now(timezone.utc).isoformat(),
+        }),
         encoding="utf-8",
     )
+    if heartbeat:
+        status_path(tmp_path).write_text(
+            json.dumps({
+                "pid": pid if status_pid is None else status_pid,
+                "running": True,
+            }),
+            encoding="utf-8",
+        )
     return path
 
 
@@ -6490,7 +6514,7 @@ def _dead_pid() -> int:
 async def test_live_mailbox_lock_suppresses_direct_completion_line(
     tmp_path, spool_writes,
 ):
-    _spool_agent(tmp_path)
+    _spool_agent(tmp_path, ticket_id="tkt_001")
     _mailbox_lock(tmp_path, os.getpid())
     watcher = Watcher(tmp_path, "agent_001")
     notify = AsyncMock(return_value=None)
@@ -6500,6 +6524,7 @@ async def test_live_mailbox_lock_suppresses_direct_completion_line(
 
     assert [env["kind"] for env in spool_writes] == ["report"]
     assert spool_writes[0]["body"]["outcome"] == "ready"
+    assert spool_writes[0]["correlation"]["ticket"] == "tkt_001"
     notify.assert_not_awaited()
     agent = state.read_agent(tmp_path, "agent_001")
     assert agent["state"] == "done"
@@ -6515,6 +6540,104 @@ async def test_live_mailbox_lock_suppresses_direct_completion_line(
     ]
     assert len(suppressed) == 1
     assert suppressed[0]["data"] == {"state": "done", "source": "ps_done"}
+
+
+@pytest.mark.anyio
+async def test_live_mailbox_without_ticket_notifies_completion(
+    tmp_path, spool_writes,
+):
+    """No Ticket means no conclusion: the direct line must survive."""
+    _spool_agent(tmp_path)
+    _mailbox_lock(tmp_path, os.getpid())
+    watcher = Watcher(tmp_path, "agent_001")
+    notify = AsyncMock(return_value=None)
+
+    with patch.object(Watcher, "_notify", notify):
+        await watcher._finalize("done", "ps_done")
+
+    notify.assert_awaited_once()
+    events = _event_names(tmp_path)
+    assert "completion_notify_suppressed" not in events
+
+
+@pytest.mark.anyio
+async def test_stale_mailbox_heartbeat_notifies_completion(
+    tmp_path, spool_writes,
+):
+    """A lock whose status.json stopped moving is not a live daemon."""
+    from osw.mailbox.paths import status_path
+
+    _spool_agent(tmp_path, ticket_id="tkt_001")
+    _mailbox_lock(tmp_path, os.getpid())
+    stale = time.time() - 700
+    os.utime(status_path(tmp_path), (stale, stale))
+    watcher = Watcher(tmp_path, "agent_001")
+    notify = AsyncMock(return_value=None)
+
+    with patch.object(Watcher, "_notify", notify):
+        await watcher._finalize("done", "ps_done")
+
+    notify.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_reused_pid_lock_notifies_completion(tmp_path, spool_writes):
+    """A lock written before the holder started belongs to a dead daemon."""
+    _spool_agent(tmp_path, ticket_id="tkt_001")
+    _mailbox_lock(tmp_path, os.getpid(), started_at="2026-01-01T00:00:00+00:00")
+    watcher = Watcher(tmp_path, "agent_001")
+    notify = AsyncMock(return_value=None)
+
+    with patch.object(Watcher, "_notify", notify):
+        await watcher._finalize("done", "ps_done")
+
+    notify.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_status_pid_mismatch_notifies_completion(
+    tmp_path, spool_writes,
+):
+    """status.json naming another pid is not this daemon."""
+    _spool_agent(tmp_path, ticket_id="tkt_001")
+    _mailbox_lock(tmp_path, os.getpid(), status_pid=os.getpid() + 1)
+    watcher = Watcher(tmp_path, "agent_001")
+    notify = AsyncMock(return_value=None)
+
+    with patch.object(Watcher, "_notify", notify):
+        await watcher._finalize("done", "ps_done")
+
+    notify.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_spool_failure_keeps_direct_completion_line(
+    tmp_path, spool_writes,
+):
+    """A report that never reached the spool cannot be concluded."""
+    _spool_agent(tmp_path, ticket_id="tkt_001")
+    _mailbox_lock(tmp_path, os.getpid())
+    watcher = Watcher(tmp_path, "agent_001")
+    notify = AsyncMock(return_value=None)
+
+    with patch.object(Watcher, "_notify", notify), \
+         patch("osw.watcher._write_spool_envelope",
+               side_effect=OSError("disk full")):
+        await watcher._finalize("done", "ps_done")
+
+    notify.assert_awaited_once()
+    events = _event_names(tmp_path)
+    assert "spool_sink_failed" in events
+    assert "completion_notify_suppressed" not in events
+
+
+def _event_names(root) -> list[str]:
+    path = state.logs_dir(root) / "events.jsonl"
+    return [
+        json.loads(line)["event"]
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 @pytest.mark.anyio

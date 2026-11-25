@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import anyio
 import pytest
@@ -509,3 +509,130 @@ def test_dry_run_executes_nothing(project):
     assert result.exit_code == 0, _all(result)
     assert "mailbox start: " in result.output
     assert "task 1: " in result.output
+
+
+# ---------------------------------------------------------------------------
+# The batch Ticket
+# ---------------------------------------------------------------------------
+
+MATCHING_PANES = [{
+    "handle": "term_boss", "tabId": "tab-a", "leafId": "leaf-b",
+}]
+
+
+def _read_store(project):
+    from osw.mailbox.paths import db_path
+    from osw.mailbox.store import Store
+
+    return Store(db_path(project))
+
+
+def test_mailbox_fanout_opens_one_ticket_carried_by_every_dispatch(project):
+    spawn = Spawn(created={"a": ("code_001", "term_a"),
+                           "b": ("code_002", "term_b")})
+    with patch("osw.orca_cli.terminal_list",
+               AsyncMock(return_value=list(MATCHING_PANES))):
+        result = _run([
+            "--provider", "pi", "--caller-terminal", "term_boss",
+            "--task", "a", "--task", "b", "--json",
+        ], spawn, project)
+
+    assert result.exit_code == 0, _all(result)
+    store = _read_store(project)
+    try:
+        tickets = store.tickets()
+        assert len(tickets) == 1
+        ticket = tickets[0]
+        assert ticket["origin"] == {
+            "role": "human",
+            "id": "terminal:term_boss",
+            "pane_key": "tab-a:leaf-b",
+            "text": "super: 2 tasks",
+        }
+        assert ticket["stage"] == "working"
+        assert [entry["agent_id"] for entry in store.assignments(ticket["id"])] == [
+            "code_001", "code_002",
+        ]
+        assert all(
+            entry["state"] == "working"
+            for entry in store.assignments(ticket["id"])
+        )
+        assert store.kv_get(f"batch:sealed:{ticket['id']}")
+    finally:
+        store.close()
+    tails = [argv[-2:] for argv in spawn.dispatches()]
+    assert tails == [["--ticket", ticket["id"]], ["--ticket", ticket["id"]]]
+
+
+def test_origin_omits_the_pane_when_the_caller_pane_is_unknown(project):
+    spawn = Spawn(created={"a": ("code_001", "term_a")})
+    with patch("osw.orca_cli.terminal_list",
+               AsyncMock(return_value=[{"handle": "term_other",
+                                        "tabId": "tab-z", "leafId": "leaf-z"}])):
+        result = _run([
+            "--provider", "pi", "--caller-terminal", "term_boss",
+            "--task", "a", "--json",
+        ], spawn, project)
+
+    assert result.exit_code == 0, _all(result)
+    assert len(spawn.dispatches()) == 1
+    store = _read_store(project)
+    try:
+        origin = store.tickets()[0]["origin"]
+    finally:
+        store.close()
+    assert origin["id"] == "terminal:term_boss"
+    assert "pane_key" not in origin
+
+
+def test_a_failed_batch_ticket_still_dispatches_and_warns(project):
+    from osw import dispatcher
+    from osw.log import read_events
+    from osw.state import logs_dir
+
+    def explode(store, *, root, origin, tasks):
+        raise RuntimeError("ticket store unavailable")
+
+    sealed = Mock()
+    spawn = Spawn()
+    with patch.object(dispatcher, "open_batch", explode, create=True), \
+         patch.object(dispatcher, "seal_batch", sealed, create=True):
+        result = _run([
+            "--provider", "pi", "--task", "a", "--json",
+        ], spawn, project)
+
+    assert result.exit_code == 0, _all(result)
+    assert len(spawn.dispatches()) == 1
+    assert "--ticket" not in spawn.dispatches()[0]
+    sealed.assert_not_called()
+    warnings = [
+        event for event in read_events(logs_dir(project))
+        if event["level"] == "WARNING" and event["event"] == "batch_ticket_failed"
+    ]
+    assert len(warnings) == 1
+    assert "ticket store unavailable" in warnings[0]["message"]
+
+
+def test_a_failed_assignment_registration_still_dispatches_and_warns(project):
+    from osw import dispatcher
+    from osw.log import read_events
+    from osw.state import logs_dir
+
+    opened = Mock(return_value="tkt_missing")
+    spawn = Spawn(created={"a": ("code_001", "term_a")})
+    with patch.object(dispatcher, "open_batch", opened, create=True), \
+         patch.object(dispatcher, "seal_batch", Mock(), create=True):
+        result = _run([
+            "--provider", "pi", "--task", "a", "--json",
+        ], spawn, project)
+
+    assert result.exit_code == 0, _all(result)
+    assert len(spawn.dispatches()) == 1
+    assert spawn.dispatches()[0][-2:] == ["--ticket", "tkt_missing"]
+    warnings = [
+        event for event in read_events(logs_dir(project))
+        if event["level"] == "WARNING"
+        and event["event"] == "batch_assignment_failed"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["data"]["agent_id"] == "code_001"

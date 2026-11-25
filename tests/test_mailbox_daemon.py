@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 import anyio
 import pytest
@@ -700,3 +702,192 @@ def test_cli_hooks_notify_relays_a_logical_role_to_the_router(tmp_path, monkeypa
     anyio.run(hooks.notify, "human", "# [osw] attention escalate x")
 
     assert sent == [("term_router", "# [osw] attention escalate x")]
+
+
+# --- is_live: a lock is trusted only when the daemon is really there ------
+
+
+def _live_files(root, pid, *, started_at=None, status_pid=None, fresh=True):
+    """Write the lock and status.json a running daemon would leave."""
+    from datetime import datetime, timezone
+
+    from osw.mailbox.paths import status_path
+
+    ensure_mailbox_dirs(root)
+    lock_path(root).write_text(
+        json.dumps({
+            "pid": pid,
+            "started_at": started_at or datetime.now(timezone.utc).isoformat(),
+        }),
+        encoding="utf-8",
+    )
+    status_path(root).write_text(
+        json.dumps({
+            "pid": pid if status_pid is None else status_pid,
+            "running": True,
+        }),
+        encoding="utf-8",
+    )
+    if not fresh:
+        stale = time.time() - daemon.HEARTBEAT_MAX_AGE_S - 60
+        os.utime(status_path(root), (stale, stale))
+
+
+def test_is_live_accepts_a_fresh_daemon(tmp_path):
+    _live_files(tmp_path, os.getpid())
+    assert daemon.is_live(tmp_path) is True
+
+
+def test_is_live_rejects_a_missing_status(tmp_path):
+    from datetime import datetime, timezone
+
+    ensure_mailbox_dirs(tmp_path)
+    lock_path(tmp_path).write_text(
+        json.dumps({
+            "pid": os.getpid(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }),
+        encoding="utf-8",
+    )
+    assert daemon.is_live(tmp_path) is False
+
+
+def test_is_live_rejects_a_stale_heartbeat(tmp_path):
+    _live_files(tmp_path, os.getpid(), fresh=False)
+    assert daemon.is_live(tmp_path) is False
+
+
+def test_is_live_rejects_a_reused_pid(tmp_path):
+    _live_files(tmp_path, os.getpid(), started_at="2020-01-01T00:00:00+00:00")
+    assert daemon.is_live(tmp_path) is False
+
+
+def test_is_live_rejects_a_dead_pid(tmp_path):
+    _live_files(tmp_path, 0)
+    assert daemon.is_live(tmp_path) is False
+
+
+def test_cli_hooks_use_the_package_entry_point(tmp_path):
+    """A project without `skill/osw.py` still gets a working CLI argv."""
+    argv = daemon.CLIHooks(tmp_path)._osw_argv("new")
+    assert argv[1].endswith(os.sep + "osw.py")
+    assert Path(argv[1]).resolve() != (tmp_path / "skill" / "osw.py").resolve()
+    assert not (tmp_path / "skill" / "osw.py").exists()
+
+
+# --- sealed fan-out batches: one conclusion, never a doorbell again --------
+
+
+def _tick(root, store, *, now: float) -> None:
+    ensure_mailbox_dirs(root)
+    # No notify hook: a conclusion is a stored row, not a delivery in flight.
+    anyio.run(lambda: daemon.tick(root, store, object(), now=now))
+
+
+def _sealed_batch(
+    store,
+    agents: tuple[str, ...] = ("code_001", "code_002"),
+    *,
+    ticket_id: str = "batch_001",
+    sealed: bool = True,
+) -> str:
+    store.create_ticket(
+        origin={
+            "role": "human",
+            "id": "terminal:term_h",
+            "text": "fan out",
+        },
+        mandate=_mandate(),
+        ticket_id=ticket_id,
+    )
+    for agent in agents:
+        store.add_assignment(
+            ticket_id,
+            {"agent_id": agent, "terminal": f"term_{agent}", "state": "working"},
+        )
+    store.update_ticket(ticket_id, stage="working")
+    if sealed:
+        store.kv_set(f"batch:sealed:{ticket_id}", "1")
+    return ticket_id
+
+
+def _finish(store, ticket_id: str, agent: str, state: str = "done") -> None:
+    store.set_assignment_state(ticket_id, agent, state)
+
+
+def _queue_report(store, ticket_id: str, agent: str, outcome: str) -> None:
+    store.add_report(
+        ticket_id,
+        {"agent": agent, "outcome": outcome, "report_key": f"r_{agent}"},
+    )
+
+
+def test_a_sealed_batch_concludes_once_with_its_counts(tmp_path):
+    root = tmp_path
+    store = _store(root)
+    try:
+        ticket_id = _sealed_batch(store)
+        _finish(store, ticket_id, "code_001")
+        _finish(store, ticket_id, "code_002")
+        _queue_report(store, ticket_id, "code_001", "ready")
+        _queue_report(store, ticket_id, "code_002", "failed")
+
+        _tick(root, store, now=1000.0)
+
+        lines = _pending_lines(store)
+        assert lines == [
+            '# [osw] batch-finished ticket=batch_001 ready=1 failed=1 lost=0'
+            ' run="osw mailbox trace batch_001"'
+        ]
+        rows = store.outbox_pending(limit=10, now=float("inf"))
+        assert len(rows) == 1
+        assert rows[0]["conversation"] == "terminal:term_h"
+        assert store.ticket(ticket_id)["stage"] == "done"
+
+        # The marker and the settled Ticket make a second tick a no-op.
+        _tick(root, store, now=1001.0)
+        assert len(store.outbox_pending(limit=10, now=float("inf"))) == 1
+        assert store.kv_get("batch:concluded:batch_001") == "1"
+    finally:
+        store.close()
+
+
+def test_a_dead_worker_is_marked_lost_and_the_batch_still_concludes(tmp_path):
+    root = tmp_path
+    store = _store(root)
+    try:
+        ticket_id = _sealed_batch(store)
+        _finish(store, ticket_id, "code_001")
+        _queue_report(store, ticket_id, "code_001", "ready")
+        # code_002 never wrote a record: its pane is gone, not quiet.
+
+        _tick(root, store, now=1000.0)
+
+        states = {
+            entry["agent_id"]: entry["state"]
+            for entry in store.assignments(ticket_id)
+        }
+        assert states == {"code_001": "done", "code_002": "lost"}
+        assert _pending_lines(store) == [
+            '# [osw] batch-finished ticket=batch_001 ready=1 failed=0 lost=1'
+            ' run="osw mailbox trace batch_001"'
+        ]
+        assert store.ticket(ticket_id)["stage"] == "done"
+    finally:
+        store.close()
+
+
+def test_an_unsealed_ticket_never_concludes(tmp_path):
+    root = tmp_path
+    store = _store(root)
+    try:
+        ticket_id = _sealed_batch(store, sealed=False)
+        _finish(store, ticket_id, "code_001")
+        _finish(store, ticket_id, "code_002")
+
+        _tick(root, store, now=1000.0)
+
+        assert _pending_lines(store) == []
+        assert store.ticket(ticket_id)["stage"] == "working"
+    finally:
+        store.close()

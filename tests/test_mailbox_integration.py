@@ -217,6 +217,20 @@ def effect_rows(root: Path) -> list[tuple[str, str, str]]:
     return [tuple(row) for row in rows]
 
 
+def decision_rows(root: Path) -> list[tuple[str, str, str, str, str, str, str]]:
+    """Durable Decision rows as ``(id, action, author, ticket, reason, state,
+    result)``, read from the store file."""
+    conn = sqlite3.connect(str(paths.db_path(root)))
+    try:
+        rows = conn.execute(
+            "SELECT decision_id, action, author, ticket, reason, state, result"
+            " FROM decisions ORDER BY ts, decision_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [tuple(row) for row in rows]
+
+
 # ---------------------------------------------------------------------------
 # §19.1 Human request -> card -> accept -> new once -> report -> close
 # ---------------------------------------------------------------------------
@@ -1126,3 +1140,175 @@ def test_status_with_daemon_stopped_and_db_write_locked(root, monkeypatch):
     assert locked_data["queues"] == {
         "router": 0, "human": 0, "worker": 0, "broadcast": 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# Super fan-out: one batch Ticket, N workers, one conclusion line
+# ---------------------------------------------------------------------------
+
+
+def test_open_batch_opens_one_ticket_and_records_one_audit_decision(root, store):
+    ticket_id = dispatcher.open_batch(
+        store,
+        root=root,
+        origin={"role": "human", "id": "human", "text": "run three in parallel"},
+        tasks=3,
+        thread_key="chat:batch",
+    )
+
+    assert [ticket["id"] for ticket in store.tickets()] == [ticket_id]
+    ticket = store.ticket(ticket_id)
+    assert ticket["stage"] == "open"
+    assert ticket["thread_key"] == "chat:batch"
+    assert ticket["origin"]["id"] == "human"
+    assert ticket["assignments"] == []
+    assert ticket["mandate"]["max_workers"] >= 3
+    assert ticket["mandate"] == mandate.validate(mandate_doc())
+
+    rows = decision_rows(root)
+    assert len(rows) == 1
+    decision_id, action, author, decided_ticket, reason, state, result = rows[0]
+    assert action == "accept"
+    assert author == "human"
+    assert decided_ticket == ticket_id
+    assert reason == "super fan-out of 3 tasks"
+    assert state == "applied"
+    assert result == "batch_opened"
+    assert store.decision(decision_id)["message_id"] == ""
+
+    # The audit Decision plans no launch Effect: the caller spawns the workers.
+    assert effect_rows(root) == []
+
+
+def test_open_batch_refuses_more_tasks_than_the_mandate_allows(root, store):
+    limit = mandate.validate(mandate_doc())["max_workers"]
+    with pytest.raises(MailboxError) as info:
+        dispatcher.open_batch(
+            store,
+            root=root,
+            origin={"role": "human", "id": "human"},
+            tasks=limit + 1,
+        )
+    assert info.value.code == "mandate_denied"
+    assert store.tickets() == []
+    assert decision_rows(root) == []
+
+
+def test_batch_report_attaches_through_correlation_ticket(root, store):
+    ticket_id = dispatcher.open_batch(
+        store,
+        root=root,
+        origin={"role": "human", "id": "human"},
+        tasks=2,
+    )
+    store.add_assignment(
+        ticket_id,
+        {"agent_id": "agent_001", "terminal": "term-1", "state": "working"},
+    )
+    # No assignment and no thread key name this agent: only correlation.ticket
+    # can join the report to the batch.
+    report = send(
+        root,
+        fixture("report_ready.json"),
+        id="msg_batch_report_001",
+        correlation={"ticket": ticket_id, "agent": "agent_009"},
+        thread_key="agent_009",
+        dedupe_key="report_key_batch_1",
+    )
+    tick(root, FakeHooks())
+
+    assert [item["message_id"] for item in store.reports(ticket_id)] == [
+        report["id"]
+    ]
+    assert store.ticket(ticket_id)["stage"] == "review"
+
+
+def test_batch_ready_flips_only_after_seal_and_both_assignments(root, store):
+    ticket_id = dispatcher.open_batch(
+        store,
+        root=root,
+        origin={"role": "human", "id": "human"},
+        tasks=2,
+    )
+    for agent, terminal in (("agent_001", "term-1"), ("agent_002", "term-2")):
+        store.add_assignment(
+            ticket_id,
+            {"agent_id": agent, "terminal": terminal, "state": "working"},
+        )
+
+    assert dispatcher.batch_ready(store, ticket_id) is False  # not sealed yet
+
+    dispatcher.seal_batch(store, ticket_id)
+    assert store.kv_get(f"batch:sealed:{ticket_id}") == "1"
+    assert store.ticket(ticket_id)["stage"] == "working"
+    assert dispatcher.batch_ready(store, ticket_id) is False
+
+    store.set_assignment_state(ticket_id, "agent_001", "done")
+    assert dispatcher.batch_ready(store, ticket_id) is False
+    store.set_assignment_state(ticket_id, "agent_002", "stopped")
+    assert dispatcher.batch_ready(store, ticket_id) is True
+
+    # A worker the daemon declared lost is terminal too: it can never report,
+    # so it must not hold the batch open forever.
+    store.set_assignment_state(ticket_id, "agent_002", "lost")
+    assert dispatcher.batch_ready(store, ticket_id) is True
+
+
+def test_conclude_batch_writes_one_outbox_row_and_one_marker(root, store):
+    ticket_id = dispatcher.open_batch(
+        store,
+        root=root,
+        origin={"role": "human", "id": "human"},
+        tasks=2,
+    )
+    for agent, terminal in (("agent_001", "term-1"), ("agent_002", "term-2")):
+        store.add_assignment(
+            ticket_id,
+            {"agent_id": agent, "terminal": terminal, "state": "done"},
+        )
+    dispatcher.seal_batch(store, ticket_id)
+
+    # Two messages still carry the batch ticket; concluding settles them both.
+    for number in (1, 2):
+        env = make(
+            root,
+            fixture("report_ready.json"),
+            id=f"msg_batch_queued_{number:03d}",
+            correlation={"ticket": ticket_id, "agent": "agent_002"},
+            dedupe_key=f"report_key_batch_queued_{number}",
+        )
+        assert store.enqueue(env)[1] is True
+
+    line = "# [osw] batch done: 2 workers, 0 open asks"
+    assert dispatcher.conclude_batch(store, ticket_id, line) is True
+
+    outbox = store.outbox_pending()
+    assert [(row["ticket_id"], row["conversation"]) for row in outbox] == [
+        (ticket_id, "human")
+    ]
+    assert outbox[0]["payload"] == {"line": line}
+    assert store.kv_get(f"batch:concluded:{ticket_id}") == "1"
+    assert store.ticket(ticket_id)["stage"] == "done"
+    assert [
+        store.get_message(f"msg_batch_queued_{number:03d}")["state"]
+        for number in (1, 2)
+    ] == ["settled", "settled"]
+
+    # A second call is a no-op: no second row, no second marker write.
+    assert dispatcher.conclude_batch(store, ticket_id, line) is False
+    assert len(store.outbox_pending()) == 1
+    assert store.kv_get(f"batch:concluded:{ticket_id}") == "1"
+
+
+def test_conclude_batch_without_an_origin_id_is_a_no_op(root, store):
+    ticket_id = dispatcher.open_batch(
+        store,
+        root=root,
+        origin={"role": "human", "text": "no conversation behind this"},
+        tasks=1,
+    )
+
+    assert dispatcher.conclude_batch(store, ticket_id, "# [osw] batch done") is False
+    assert store.outbox_pending() == []
+    assert store.kv_get(f"batch:concluded:{ticket_id}") is None
+    assert store.ticket(ticket_id)["stage"] == "open"

@@ -192,12 +192,38 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{stamp}_{uuid.uuid4().hex[:6]}"
 
 
+def new_ticket_id(prefix: str = "batch") -> str:
+    """A fresh id for a Ticket the caller creates itself (a fan-out batch)."""
+    return _new_id(prefix)
+
+
 def _require_str(value: Any, field: str, *, default: str = "") -> str:
     if value is None:
         return default
     if not isinstance(value, str):
         raise MailboxError("invalid_field", f"{field} must be a string")
     return value
+
+
+def _settle_message(
+    conn: sqlite3.Connection, message_id: str, outcome: str = ""
+) -> None:
+    """Mark one message settled inside the caller's transaction."""
+    stamp = time.time()
+    row = conn.execute(
+        "SELECT trace FROM messages WHERE id = ?", (message_id,)
+    ).fetchone()
+    if row is None:
+        raise MailboxError("unknown_message", f"no message {message_id!r}")
+    trace = row["trace"] or ""
+    if outcome:
+        note = f"settled:{outcome}"
+        trace = f"{trace}\n{note}" if trace else note
+    conn.execute(
+        "UPDATE messages SET state = 'settled', settled_at = ?,"
+        " lease_owner = NULL, lease_until = NULL, trace = ? WHERE id = ?",
+        (stamp, trace, message_id),
+    )
 
 
 class Store:
@@ -484,22 +510,8 @@ class Store:
 
     def settle(self, message_id: str, *, outcome: str = "") -> None:
         """Settle a message after it has been applied."""
-        stamp = time.time()
         with self._tx() as conn:
-            row = conn.execute(
-                "SELECT trace FROM messages WHERE id = ?", (message_id,)
-            ).fetchone()
-            if row is None:
-                raise MailboxError("unknown_message", f"no message {message_id!r}")
-            trace = row["trace"] or ""
-            if outcome:
-                note = f"settled:{outcome}"
-                trace = f"{trace}\n{note}" if trace else note
-            conn.execute(
-                "UPDATE messages SET state = 'settled', settled_at = ?,"
-                " lease_owner = NULL, lease_until = NULL, trace = ? WHERE id = ?",
-                (stamp, trace, message_id),
-            )
+            _settle_message(conn, message_id, outcome)
 
     def counts(self, now: float | None = None) -> dict[str, int]:
         """Queued plus leased messages by destination role."""
@@ -753,6 +765,75 @@ class Store:
                 " WHERE id = ?",
                 (stamp, stamp, ticket_id),
             )
+
+    def conclude(
+        self,
+        ticket_id: str,
+        *,
+        conversation: str,
+        line: str,
+        marker_key: str,
+        pane_key: str = "",
+    ) -> bool:
+        """Emit one batch conclusion line and settle the Ticket, once.
+
+        Checks ``marker_key`` and, in the same transaction, inserts the Outbox
+        row, sets the marker, settles every queued or leased message of this
+        Ticket and closes it. A repeat returns ``False`` and writes nothing.
+        """
+        if not isinstance(conversation, str) or not conversation:
+            raise MailboxError("decision_invalid", "conversation is required")
+        if not isinstance(line, str):
+            raise MailboxError("decision_invalid", "line must be a string")
+        if not isinstance(marker_key, str) or not marker_key:
+            raise MailboxError("decision_invalid", "marker_key is required")
+        stamp = time.time()
+        with self._tx() as conn:
+            if conn.execute(
+                "SELECT 1 FROM kv WHERE key = ?", (marker_key,)
+            ).fetchone() is not None:
+                return False
+            _require_ticket(conn, ticket_id)
+            seq = _scalar(
+                conn,
+                "SELECT COALESCE(MAX(seq), 0) FROM outbox"
+                " WHERE ticket_id = ? AND conversation = ?",
+                (ticket_id, conversation),
+            ) + 1
+            conn.execute(
+                "INSERT INTO outbox (id, ticket_id, conversation, seq, payload,"
+                " state, attempts, next_at, sent_at, receipt, created_at)"
+                " VALUES (?,?,?,?,?,'pending',0,0.0,NULL,'',?)",
+                (
+                    _new_id("out"),
+                    ticket_id,
+                    conversation,
+                    seq,
+                    _dumps(
+                        {"line": line, "pane_key": str(pane_key or "")}
+                        if pane_key else {"line": line}
+                    ),
+                    stamp,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO kv (key, value) VALUES (?, '1')"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (marker_key,),
+            )
+            rows = conn.execute(
+                "SELECT id FROM messages WHERE ticket = ?"
+                " AND state IN ('queued', 'leased') ORDER BY id",
+                (ticket_id,),
+            ).fetchall()
+            for row in rows:
+                _settle_message(conn, row["id"], "concluded")
+            conn.execute(
+                "UPDATE tickets SET stage = 'done', closed_at = ?,"
+                " updated_at = ? WHERE id = ?",
+                (stamp, stamp, ticket_id),
+            )
+        return True
 
     # -- decisions, effects, outbox ---------------------------------------
 

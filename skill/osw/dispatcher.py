@@ -19,8 +19,10 @@ from typing import Any, Protocol
 
 from osw import log
 from osw.mailbox.errors import MailboxError
+from osw.mailbox.store import new_ticket_id
 from osw.mandate import (
     HUMAN_SOURCE,
+    MandateError,
     answer_allowed,
     check_action,
     check_open_from,
@@ -330,6 +332,110 @@ def commit(store, decision: dict, *, message_id: str = "") -> bool:
         elif duplicates:
             _record_duplicates(store, d, ticket_id, duplicates)
     return written
+
+
+# ---------------------------------------------------------------------------
+# super fan-out batches
+
+
+_BATCH_TERMINAL = frozenset({"done", "stopped", "lost"})
+
+
+def open_batch(
+    store,
+    *,
+    root,
+    origin: dict,
+    tasks: int,
+    thread_key: str = "",
+    now: float | None = None,
+) -> str:
+    """Open one Ticket covering ``tasks`` parallel workers; return its id.
+
+    The fan-out is one Ticket carrying the validated base Mandate. Its only
+    Decision is an audit ``accept`` by the human: the caller spawns the
+    workers and records one assignment each, so no launch Effect is planned.
+    """
+    mandate = load_mandate(Path(root))
+    if isinstance(tasks, bool) or not isinstance(tasks, int) or tasks < 1:
+        raise MailboxError("decision_invalid", "a batch needs at least one task")
+    limit = int(mandate["max_workers"])
+    if tasks > limit:
+        raise MandateError(
+            "mandate_denied",
+            f"批量派发 {tasks} 个 worker 超过 Mandate 上限 {limit}",
+        )
+    _check_expiry(mandate, time.time() if now is None else float(now))
+    ticket_id = new_ticket_id("batch")
+    store.create_ticket(
+        origin=dict(origin),
+        mandate=mandate,
+        ticket_id=ticket_id,
+        thread_key=thread_key or ticket_id,
+        stage="open",
+    )
+    decision = {
+        "decision_id": new_ticket_id("dec"),
+        "action": "accept",
+        "author": "human",
+        "ticket": ticket_id,
+        "reason": f"super fan-out of {tasks} tasks",
+        "payload": {"tasks": tasks},
+        "confidence": 1.0,
+    }
+    store.commit_decision(decision)
+    store.mark_decision(decision["decision_id"], "applied", result="batch_opened")
+    return ticket_id
+
+
+def seal_batch(store, ticket_id: str) -> None:
+    """Mark a batch working and sealed: its reports become one conclusion."""
+    store.update_ticket(ticket_id, stage="working")
+    store.kv_set(f"batch:sealed:{ticket_id}", "1")
+
+
+def batch_ready(store, ticket_id: str) -> bool:
+    """Whether a sealed batch has at least one assignment and all are terminal.
+
+    Terminal means ``done``, ``stopped`` or ``lost``: a worker the daemon
+    declared lost can never report again, so it must not block the batch.
+    """
+    if not store.kv_get(f"batch:sealed:{ticket_id}"):
+        return False
+    assignments = store.assignments(ticket_id)
+    if not assignments:
+        return False
+    return all(
+        str(entry.get("state") or "") in _BATCH_TERMINAL
+        for entry in assignments
+        if isinstance(entry, dict)
+    )
+
+
+def conclude_batch(store, ticket_id: str, line: str) -> bool:
+    """Emit the one conclusion line of a batch into its origin conversation.
+
+    Returns ``True`` only for the call that wrote it; a repeat is ``False``.
+    A Ticket whose origin names no conversation never concludes.
+    """
+    ticket = store.ticket(ticket_id)
+    if ticket is None:
+        raise MailboxError("unknown_ticket", ticket_id)
+    origin = ticket.get("origin")
+    conversation = ""
+    pane_key = ""
+    if isinstance(origin, dict):
+        conversation = str(origin.get("id") or "")
+        pane_key = str(origin.get("pane_key") or "")
+    if not conversation:
+        return False
+    return store.conclude(
+        ticket_id,
+        conversation=conversation,
+        line=line,
+        marker_key=f"batch:concluded:{ticket_id}",
+        pane_key=pane_key,
+    )
 
 
 async def run_pending(

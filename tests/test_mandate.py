@@ -263,15 +263,20 @@ def test_load_falls_back_when_the_directory_is_not_a_repository(
     assert load_mandate(root) == DEFAULT
 
 
-def test_load_reports_mandate_missing(tmp_path: Path) -> None:
+def test_load_uses_the_bundled_mandate_when_the_repo_has_none(
+    tmp_path: Path,
+) -> None:
+    """A project repository without a mandate file gets the bundled one.
+
+    The control plane serves any project root, so `mandate_missing` is no
+    longer the answer for "this repo does not carry OSW's file"; only a
+    missing *bundled* mandate would be.
+    """
     root = _repo(tmp_path / "repo")
     (root / "README.md").write_text("empty\n", encoding="utf-8")
     _git(root, "add", "--", "README.md")
     _git(root, "commit", "-q", "-m", "init")
-    with pytest.raises(MandateError) as excinfo:
-        load_mandate(root)
-    assert _code(excinfo) == "mandate_missing"
-    assert CJK.search(excinfo.value.message)
+    assert load_mandate(root) == DEFAULT
 
 
 def test_load_reports_invalid_committed_json(tmp_path: Path) -> None:
@@ -428,3 +433,19 @@ def test_chinese_reason_survives_as_operator_text() -> None:
     assert CJK.search(excinfo.value.message)
     mandate = narrow(DEFAULT, {"answer": "free_text"})
     assert answer_allowed(mandate, "先跑构建，失败再回滚。")
+
+
+def test_load_mandate_falls_back_to_the_bundled_file(tmp_path: Path) -> None:
+    """A project that is not the OSW repository still gets a mandate."""
+    assert not (tmp_path / MANDATE_RELATIVE_PATH).exists()
+    mandate = load_mandate(tmp_path)
+    assert mandate["max_workers"] == DEFAULT["max_workers"]
+    assert mandate["close"] == "router"
+
+
+def test_load_mandate_prefers_the_project_file(tmp_path: Path) -> None:
+    target = tmp_path / MANDATE_RELATIVE_PATH
+    target.parent.mkdir(parents=True)
+    narrowed = dict(DEFAULT, max_workers=1)
+    target.write_text(json.dumps(narrowed), encoding="utf-8")
+    assert load_mandate(tmp_path)["max_workers"] == 1

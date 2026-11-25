@@ -32,9 +32,14 @@ import anyio
 
 from osw import dispatcher, fastpath
 from osw.log import emit_event
-from osw.orca_cli import orchestration_send, run_orca, terminal_send
+from osw.orca_cli import (
+    orchestration_send,
+    run_orca,
+    terminal_list,
+    terminal_send,
+)
 from osw.process import hidden_subprocess_kwargs
-from osw.state import logs_dir, pid_is_running
+from osw.state import logs_dir, pid_is_running, process_started_at, read_agent
 
 from . import adapters, spool
 from .delivery import conversation_address, deliver_outbox, is_deliverable
@@ -75,6 +80,19 @@ STRIPPED_ENV_KEYS = ("OSW_ROLE", "OSW_ROLE_TOKEN", "ORCA_TERMINAL_HANDLE")
 
 #: Ticket stages in which a Ticket no longer wants a conversation woken.
 CLOSED_STAGES = ("done", "stopped")
+
+BATCH_SEALED_KEY = "batch:sealed:{ticket_id}"
+BATCH_CONCLUDED_KEY = "batch:concluded:{ticket_id}"
+BATCH_FINISHED_LINE = (
+    '# [osw] batch-finished ticket={ticket_id} ready={ready} failed={failed}'
+    ' lost={lost} run="osw mailbox trace {ticket_id}"'
+)
+#: Assignment states that need no reconciliation: the turn reported itself.
+ASSIGNMENT_TERMINAL = ("done", "stopped")
+#: Agent-record states that mean the pane is gone, not merely quiet.
+AGENT_DEAD_STATES = ("lost", "error")
+#: A record that says ``done`` but never reported gets this long to spool.
+BATCH_FINISHED_GRACE_S = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +179,51 @@ def is_running(root: Path) -> tuple[bool, int]:
     if pid and pid_is_running(pid):
         return True, pid
     return False, 0
+
+
+#: How stale ``status.json`` may be before a lock stops counting as live.
+#: The daemon rewrites it every tick (about one second).
+HEARTBEAT_MAX_AGE_S = 600.0
+#: Slack when comparing a lock's ``started_at`` with the holder's start time.
+START_TIME_SLACK_S = 5.0
+
+
+def is_live(root: Path) -> bool:
+    """Whether a *usable* daemon owns this project, not merely a live pid.
+
+    Stricter than :func:`is_running`: the pid must be alive, the lock must
+    have been written after that process started (so a reused pid fails), and
+    ``status.json`` must name the same pid with a fresh heartbeat. Every
+    unknown counts as not live, because the caller then keeps its direct
+    notification: a duplicate line is preferred to silence.
+    """
+    root = Path(root)
+    existing = _read_lock(root)
+    if existing is None:
+        return False
+    pid = _lock_pid(existing)
+    if not pid or not pid_is_running(pid):
+        return False
+    try:
+        started_at = datetime.fromisoformat(str(existing.get("started_at") or ""))
+    except ValueError:
+        return False
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    started_epoch = started_at.timestamp()
+    process_start = process_started_at(pid)
+    if process_start is None:
+        return False
+    if started_epoch < process_start - START_TIME_SLACK_S:
+        return False
+    status = read_status(root)
+    if not isinstance(status, dict) or int(status.get("pid") or 0) != pid:
+        return False
+    try:
+        age = time.time() - status_path(root).stat().st_mtime
+    except OSError:
+        return False
+    return age <= HEARTBEAT_MAX_AGE_S
 
 
 def read_status(root: Path) -> dict | None:
@@ -499,6 +562,11 @@ async def tick(
 
     _ingest_and_fastpath(root, store, now)
 
+    try:
+        _conclude_batches(root, store, now)
+    except Exception as exc:
+        _event(root, "batch_conclude_failed", level="ERROR", message=str(exc))
+
     _run_adapters(root, now)
 
     try:
@@ -660,6 +728,195 @@ def _ingest_and_fastpath(root: Path, store: Store, now: float) -> None:
                 message=str(exc),
                 data={"message": message_id},
             )
+
+
+def _conclude_batches(root: Path, store: Store, now: float) -> None:
+    """Give every sealed fan-out batch exactly one conclusion.
+
+    A sealed batch stays ``working`` while its workers run; the report itself
+    is not a Router card. Once every assignment is terminal, the batch puts
+    one ``batch-finished`` line into the origin's conversation and stops: the
+    ``batch:concluded`` marker makes a later tick a no-op, and the store
+    settles the batch's queued messages so the doorbell cannot ring again.
+    """
+    try:
+        tickets = store.tickets()
+    except Exception as exc:
+        _event(root, "batch_conclude_failed", level="ERROR", message=str(exc))
+        return
+    for ticket in tickets or []:
+        if not isinstance(ticket, dict):
+            continue
+        ticket_id = str(ticket.get("id") or "")
+        if not ticket_id or str(ticket.get("stage") or "") != "working":
+            continue
+        if not _batch_flag(store, BATCH_SEALED_KEY.format(ticket_id=ticket_id)):
+            continue
+        if _batch_flag(store, BATCH_CONCLUDED_KEY.format(ticket_id=ticket_id)):
+            continue
+        try:
+            _reconcile_assignments(root, store, ticket_id, now)
+        except Exception as exc:
+            _event(
+                root,
+                "batch_reconcile_failed",
+                level="WARNING",
+                message=str(exc),
+                data={"ticket": ticket_id},
+            )
+            continue
+        try:
+            if not dispatcher.batch_ready(store, ticket_id):
+                continue
+        except Exception as exc:
+            _event(
+                root,
+                "batch_conclude_failed",
+                level="ERROR",
+                message=str(exc),
+                data={"ticket": ticket_id},
+            )
+            continue
+        counts = _batch_counts(store, ticket_id)
+        line = BATCH_FINISHED_LINE.format(ticket_id=ticket_id, **counts)
+        try:
+            concluded = dispatcher.conclude_batch(store, ticket_id, line)
+        except Exception as exc:
+            _event(
+                root,
+                "batch_conclude_failed",
+                level="ERROR",
+                message=str(exc),
+                data={"ticket": ticket_id},
+            )
+            continue
+        if concluded:
+            _event(
+                root,
+                "batch_concluded",
+                message="sealed batch concluded",
+                data={"ticket": ticket_id, **counts},
+            )
+
+
+def _batch_flag(store: Store, key: str) -> bool:
+    """One batch marker; an unreadable store is simply not a marker."""
+    try:
+        return bool(store.kv_get(key))
+    except Exception:
+        return False
+
+
+def _reconcile_assignments(
+    root: Path, store: Store, ticket_id: str, now: float
+) -> None:
+    """Mark assignments whose worker cannot report any more as ``lost``.
+
+    The watcher is the only writer that settles an assignment, so a worker
+    that died without a report would hold the batch open forever. A missing
+    record, a record in a dead state, or a ``done`` record that has had its
+    grace period without spooling a report all mean the same thing here.
+    """
+    for entry in store.assignments(ticket_id):
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("state") or "") in ASSIGNMENT_TERMINAL:
+            continue
+        agent_id = str(entry.get("agent_id") or "")
+        if not agent_id:
+            continue
+        reason = _lost_reason(root, store, ticket_id, agent_id, now)
+        if not reason:
+            continue
+        store.set_assignment_state(ticket_id, agent_id, "lost")
+        _event(
+            root,
+            "batch_assignment_lost",
+            level="WARNING",
+            message=reason,
+            data={"ticket": ticket_id, "agent": agent_id},
+        )
+
+
+def _lost_reason(
+    root: Path, store: Store, ticket_id: str, agent_id: str, now: float
+) -> str:
+    try:
+        record = read_agent(root, agent_id)
+    except Exception:
+        return "agent record missing"
+    if not isinstance(record, dict):
+        return "agent record unreadable"
+    agent_state = str(record.get("state") or "")
+    if agent_state in AGENT_DEAD_STATES:
+        return f"agent state {agent_state}"
+    if agent_state != "done":
+        return ""
+    if _report_for(store, ticket_id, agent_id):
+        return ""
+    finished = _finished_ago(record, now)
+    if finished is None or finished <= BATCH_FINISHED_GRACE_S:
+        return ""
+    return "finished without a report"
+
+
+def _report_for(store: Store, ticket_id: str, agent_id: str) -> bool:
+    try:
+        reports = store.reports(ticket_id)
+    except Exception:
+        return False
+    for report in reports or []:
+        if _report_agent(report) == agent_id:
+            return True
+    return False
+
+
+def _report_agent(report: Any) -> str:
+    """The agent a stored report belongs to, when it carries one."""
+    if not isinstance(report, dict):
+        return ""
+    for key in ("agent", "agent_id"):
+        value = report.get(key)
+        if isinstance(value, str) and value:
+            return value
+    body = report.get("body")
+    if isinstance(body, dict):
+        for key in ("agent", "agent_id"):
+            value = body.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
+def _finished_ago(record: dict, now: float) -> float | None:
+    raw = str(record.get("finished_at") or "")
+    if not raw:
+        return None
+    try:
+        finished = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if finished.tzinfo is None:
+        finished = finished.replace(tzinfo=timezone.utc)
+    return now - finished.timestamp()
+
+
+def _batch_counts(store: Store, ticket_id: str) -> dict:
+    """``ready``/``failed`` from reports, ``lost`` from assignments."""
+    ready = 0
+    failed = 0
+    for report in store.reports(ticket_id) or []:
+        outcome = str((report or {}).get("outcome") or "")
+        if outcome == "ready":
+            ready += 1
+        elif outcome in ("failed", "dropped"):
+            failed += 1
+    lost = sum(
+        1
+        for entry in store.assignments(ticket_id) or []
+        if isinstance(entry, dict) and str(entry.get("state") or "") == "lost"
+    )
+    return {"ready": ready, "failed": failed, "lost": lost}
 
 
 def _pending_names(root: Path) -> list[str]:
@@ -825,6 +1082,34 @@ class CLIHooks:
             return
         raise RuntimeError(f"unknown conversation: {address}")
 
+    async def rebind_conversation(self, conversation: str, payload: dict) -> str:
+        """Fresh handle for a dead ``terminal:`` address, or ``""``.
+
+        Runtime handles die with the Orca runtime; the pane key does not.
+        The outbox row carries the origin's pane key (written by
+        ``Store.conclude``), and ``terminal list`` maps it back to the
+        current handle. Anything unknown returns ``""`` so the caller keeps
+        its normal backoff instead of guessing.
+        """
+        if not str(conversation or "").startswith("terminal:"):
+            return ""
+        pane_key = str((payload or {}).get("pane_key") or "")
+        if not pane_key:
+            return ""
+        try:
+            terminals = await terminal_list()
+        except Exception:
+            return ""
+        for term in terminals or ():
+            if not isinstance(term, dict):
+                continue
+            key = f"{term.get('tabId')}:{term.get('leafId')}"
+            if key != pane_key:
+                continue
+            handle = str(term.get("handle") or "")
+            return f"terminal:{handle}" if handle else ""
+        return ""
+
     def _router_address(self) -> str:
         from .paths import db_path
         from .store import Store
@@ -844,9 +1129,12 @@ class CLIHooks:
         )
 
     def _osw_argv(self, *args: str) -> list[str]:
+        # The package's own entry point, not `<project>/skill/osw.py`: the
+        # control plane serves any project root, and only the OSW repository
+        # has that path inside it.
         return [
             sys.executable,
-            str(self.root / "skill" / "osw.py"),
+            str(Path(__file__).resolve().parents[2] / "osw.py"),
             *args,
         ]
 

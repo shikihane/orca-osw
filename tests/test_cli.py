@@ -4542,3 +4542,104 @@ def test_status_reports_unread_completions(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "Unread completions: 1 (osw inbox)" in result.output
 
+
+def test_new_records_a_batch_ticket_and_its_assignment(tmp_path, monkeypatch):
+    from osw.mailbox.paths import db_path
+    from osw.mailbox.store import Store
+
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+
+    store = Store(db_path(tmp_path))
+    try:
+        ticket_id = store.create_ticket(
+            origin={"role": "human", "id": "", "text": "super: 1 tasks"},
+            mandate={"open_from": []},
+        )
+    finally:
+        store.close()
+
+    create = AsyncMock(return_value={"result": {"terminal": {
+        "handle": "term-new",
+        "tabId": "tab-a",
+        "leafId": "leaf-b",
+    }}})
+    with patch("osw.cli.terminal_create", create), \
+         patch("osw.cli._spawn_watcher", Mock(return_value=4567)):
+        result = runner.invoke(
+            app,
+            [
+                "new", "claude", "--caller-terminal", "caller-1",
+                "--ticket", ticket_id, "do the task",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert state_mod.read_agent(tmp_path, "agent_001")["ticket_id"] == ticket_id
+    store = Store(db_path(tmp_path))
+    try:
+        assert store.assignments(ticket_id) == [{
+            "agent_id": "agent_001",
+            "terminal": "term-new",
+            "state": "working",
+            "attempt": 1,
+        }]
+    finally:
+        store.close()
+
+    with patch("osw.cli.terminal_create", create), \
+         patch("osw.cli._spawn_watcher", Mock(return_value=4568)):
+        result = runner.invoke(
+            app,
+            ["new", "claude", "--prefix", "quiet",
+             "--caller-terminal", "caller-1", "another task"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "ticket_id" not in state_mod.read_agent(tmp_path, "quiet_001")
+
+
+def test_use_clears_the_batch_ticket_unless_passed(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_mod.init_state_dir(tmp_path)
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    state_mod.write_agent(tmp_path, {
+        "agent_id": "agent_001",
+        "terminal": "term-existing",
+        "worktree_path": str(tmp_path),
+        "provider": "claude",
+        "provider_command": "claude",
+        "model_name": "",
+        "thinking": "",
+        "state": "done",
+        "phase": "",
+        "caller_terminal": None,
+        "prompt": "old task",
+        "ticket_id": "tkt_old",
+        "created_at": "2026-07-09T00:00:00+00:00",
+        "updated_at": "2026-07-09T00:00:00+00:00",
+    })
+    show = AsyncMock(return_value=_show_pane(tmp_path, handle="term-existing"))
+    spawn = Mock(return_value=9876)
+    with patch("osw.cli.terminal_show", show), \
+         patch("osw.cli._spawn_watcher", spawn):
+        result = runner.invoke(
+            app, ["use", "agent_001", "--no-notify", "continue this"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "ticket_id" not in state_mod.read_agent(tmp_path, "agent_001")
+
+    record = state_mod.read_agent(tmp_path, "agent_001")
+    record["state"] = "done"
+    record.pop("watcher_pid", None)
+    state_mod.write_agent(tmp_path, record)
+    with patch("osw.cli.terminal_show", show), \
+         patch("osw.cli._spawn_watcher", spawn):
+        result = runner.invoke(
+            app,
+            ["use", "agent_001", "--ticket", "tkt_new", "--no-notify", "again"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert state_mod.read_agent(tmp_path, "agent_001")["ticket_id"] == "tkt_new"

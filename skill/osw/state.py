@@ -305,6 +305,64 @@ def new_handoff_path(root: Path, agent_id: str) -> Path:
     return handoffs_dir(root) / f"{agent_id}_{ts}.md"
 
 
+def process_started_at(pid: int) -> float | None:
+    """Epoch seconds when *pid* started, or ``None`` when unknowable.
+
+    Used to tell a live daemon from a reused pid: a lock is trusted only when
+    it was written after the process that holds the pid actually started.
+    """
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            kernel32 = ctypes.windll.kernel32
+            kernel32.OpenProcess.argtypes = [
+                wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+            ]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return None
+            try:
+                created = wintypes.FILETIME()
+                exited = wintypes.FILETIME()
+                kernel = wintypes.FILETIME()
+                user = wintypes.FILETIME()
+                ok = kernel32.GetProcessTimes(
+                    handle,
+                    ctypes.byref(created),
+                    ctypes.byref(exited),
+                    ctypes.byref(kernel),
+                    ctypes.byref(user),
+                )
+                if not ok:
+                    return None
+                ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+                # FILETIME counts 100 ns intervals since 1601-01-01.
+                return ticks / 10_000_000.0 - 11_644_473_600.0
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        fields = stat.rsplit(")", 1)[1].split()
+        start_ticks = int(fields[19])  # field 22, 1-based, after the comm field
+        hz = os.sysconf("SC_CLK_TCK")
+        boot = next(
+            int(line.split()[1])
+            for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines()
+            if line.startswith("btime ")
+        )
+        return boot + start_ticks / float(hz)
+    except Exception:
+        return None
+
+
 def pid_is_running(pid: int) -> bool:
     """Check whether a process with the given PID is currently running."""
     if pid <= 0:

@@ -518,22 +518,46 @@ def _outbox_row(op: dict) -> tuple[str, dict]:
     return conversation, payload
 
 
+def _sealed_batch(store: Any, ticket_id: str) -> bool:
+    """Whether this Ticket is a sealed fan-out batch (one conclusion instead).
+
+    The marker is written by ``dispatcher.seal_batch``; an unreadable store or
+    a plain Ticket is simply not a batch, and the ordinary rules apply.
+    """
+    try:
+        return bool(store.kv_get(f"batch:sealed:{ticket_id}"))
+    except Exception:
+        return False
+
+
 def _apply_op(store: Any, op: dict, env: dict | None = None) -> None:
     name = op.get("op")
     if name == "attach":
         report = op.get("report")
+        ticket_id = op["ticket"]
         if report is not None:
-            store.add_report(op["ticket"], report)
-            _finalize_assignment(store, op["ticket"], report, env)
+            store.add_report(ticket_id, report)
+            _finalize_assignment(store, ticket_id, report, env)
+            # A sealed batch turns its reports into one conclusion, so the
+            # report itself must not become a Router card (and must not ring
+            # the doorbell): settle it as soon as it is attached.
+            message_id = str(op.get("message_id") or "")
+            if message_id and _sealed_batch(store, ticket_id):
+                store.settle(message_id, outcome="attached")
         ask = op.get("ask")
         if ask:
             store.open_ask(
-                op["ticket"],
+                ticket_id,
                 ask,
                 agent=op.get("agent", ""),
                 message_id=op.get("message_id", ""),
             )
     elif name == "stage":
+        # A sealed batch keeps "working" until the daemon concludes it; the
+        # per-report "review" stage would hide it from that scan.
+        if str(op.get("stage") or "") == "review" \
+                and _sealed_batch(store, op["ticket"]):
+            return
         store.update_ticket(op["ticket"], stage=op["stage"])
     elif name == "settle":
         store.settle(op["message_id"], outcome=op.get("outcome", ""))

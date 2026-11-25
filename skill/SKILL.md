@@ -253,6 +253,13 @@ python <skill-dir>/osw.py super --plan plan.json --json
   At most `--max-parallel` run at once (default 32, clamped to 1..32, 300s each),
   one failed dispatch never aborts the rest, and the command exits 1 if any
   dispatch failed.
+- With the mailbox started, the whole fan-out is **one batch Ticket**: each
+  dispatch carries `--ticket <id>`, every worker is an assignment, and once
+  the batch is sealed and every assignment is terminal the daemon writes one
+  `# [osw] batch-finished ticket=...` line to the caller instead of one line
+  per worker. If the Ticket cannot be opened the dispatch still runs and falls
+  back to direct lines (a `batch_ticket_failed` WARNING is recorded).
+  `--no-mailbox` skips the Ticket entirely and each worker reports directly.
 - `--json` reports `{mailbox, requested, started, agents, errors}`; `--dry-run`
   prints the argv lists without executing them, so the resolved provider, model
   and thinking are visible before anything runs. Verify each result by reading

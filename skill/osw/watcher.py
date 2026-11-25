@@ -887,19 +887,26 @@ class Watcher:
         dedupe_key: str = "",
         correlation: dict | None = None,
         priority: int | None = None,
-    ) -> None:
+    ) -> bool:
         """Write one envelope to the Mailbox spool, best effort.
 
         The direct notification path stays authoritative: a mailbox that
         is absent, not running, or out of spool space must never fail or
-        end the turn, so every failure is a WARNING event only.
+        end the turn, so every failure is a WARNING event only. Returns
+        whether the envelope actually reached the spool, because the
+        completion line may only be suppressed for a turn the Mailbox can
+        really see.
         """
         try:
             envelope = {
                 "from": {"role": "watcher", "id": self.agent_id},
                 "to": {"role": "router", "id": ""},
                 "kind": kind,
-                "correlation": {"agent": self.agent_id, **(correlation or {})},
+                "correlation": {
+                    "agent": self.agent_id,
+                    "ticket": str(self.agent.get("ticket_id") or ""),
+                    **(correlation or {}),
+                },
                 "thread_key": self._thread_key(),
                 "dedupe_key": (
                     dedupe_key
@@ -910,6 +917,7 @@ class Watcher:
             if priority is not None:
                 envelope["priority"] = priority
             _write_spool_envelope(self.root, envelope)
+            return True
         except Exception as exc:  # the sink is never allowed to raise
             log.warning(
                 "watcher(%s): spool_sink_failed kind=%s: %s",
@@ -924,26 +932,30 @@ class Watcher:
                 )
             except Exception:  # the log itself may be unwritable
                 pass
+            return False
 
-    def _mailbox_running(self) -> bool:
-        """True when a live Mailbox daemon owns this project (spec §14).
+    def _mailbox_will_conclude(self, spooled: bool) -> bool:
+        """True only when the Mailbox can really conclude this turn.
 
-        Watchers always write their report to the spool; the per-agent
-        direct completion line is only the direct-mode fallback, because
-        with a live Mailbox one conclusion per Ticket replaces them. The
-        import stays lazy and every failure — no mailbox package, an
-        unreadable lock, a dead pid — means direct mode, so the line is
-        sent exactly as before when the control plane is absent.
+        Suppression trades a guaranteed direct line for one conclusion per
+        Ticket, so it needs all three: the record carries a Ticket id, this
+        turn's report reached the spool, and the daemon is live in the
+        strict sense (pid, lock written by that process, fresh heartbeat).
+        Anything unknown keeps the direct line — a duplicate is preferred
+        to silence.
         """
+        if not str(self.agent.get("ticket_id") or "").strip():
+            return False
+        if not spooled:
+            return False
         try:
-            from osw.mailbox.daemon import is_running
+            from osw.mailbox.daemon import is_live
         except Exception:  # mailbox absent or broken: direct mode
             return False
         try:
-            running, _pid = is_running(self.root)
+            return bool(is_live(self.root))
         except Exception:  # an unreadable lock is direct mode too
             return False
-        return bool(running)
 
     def _discard_stale_stop_request(self) -> None:
         """Drop a stop request older than this run's record.
@@ -3492,9 +3504,10 @@ class Watcher:
             data={"report": str(report_path), "state": final_state, "source": source},
         )
         # Control-plane copy of the turn's verdict, best effort; the
-        # direct notification below is unchanged. The report key is the
-        # dedupe key, resolved inside the sink's own guard.
-        self._spool(
+        # direct notification below is unchanged unless the Mailbox can
+        # really conclude this turn. The report key is the dedupe key,
+        # resolved inside the sink's own guard.
+        spooled = self._spool(
             "report",
             {
                 "outcome": _spool_report_outcome(final_state, source),
@@ -3549,10 +3562,12 @@ class Watcher:
                 cleanup="manual",
                 close_command=f"osw del {self.agent_id} --close",
             )
-        if self._mailbox_running():
-            # §14: the spool report above is this turn's conclusion and the
-            # Mailbox collapses them per Ticket, so no direct per-agent
-            # line is sent while the daemon lock names a live pid.
+        if self._mailbox_will_conclude(spooled):
+            # §14: the Mailbox collapses this turn's report into one
+            # conclusion per Ticket, so no direct per-agent line is sent —
+            # but only when a Ticket exists, the report reached the spool,
+            # and the daemon is really live. Otherwise the direct line is
+            # the only thing that would tell the caller anything.
             self._event(
                 "completion_notify_suppressed",
                 data={"state": final_state, "source": source},

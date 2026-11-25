@@ -26,6 +26,9 @@ from typing import Any, Mapping, Sequence
 
 import anyio
 
+from osw.log import emit_event
+from osw.state import logs_dir
+
 DEFAULT_MAX_PARALLEL = 32
 MAX_PARALLEL_CAP = 32
 DEFAULT_PREFIX = "code"
@@ -127,7 +130,9 @@ def mailbox_argv() -> list[str]:
     return [sys.executable, str(script_path()), "mailbox", "start", "--json"]
 
 
-def new_argv(job: Job, *, no_notify: bool = False) -> list[str]:
+def new_argv(
+    job: Job, *, no_notify: bool = False, ticket: str = "",
+) -> list[str]:
     """The exact `new` invocation for one task; empty flags are omitted."""
     argv = [sys.executable, str(script_path()), "new", job.provider, job.task]
     if job.prefix:
@@ -140,6 +145,8 @@ def new_argv(job: Job, *, no_notify: bool = False) -> list[str]:
         argv += ["--caller-terminal", job.caller_terminal]
     elif no_notify:
         argv += ["--no-notify"]
+    if ticket:
+        argv += ["--ticket", ticket]
     return argv
 
 
@@ -475,12 +482,165 @@ async def _start_mailbox(root: Path) -> dict:
     return {"running": bool(data.get("running")), "pid": pid}
 
 
-async def _dispatch_one(job: Job, root: Path, no_notify: bool) -> dict:
+def _batch_warning(root: Path, event: str, message: str, data: dict | None = None) -> None:
+    """One WARNING event; a log that cannot be written never fails a dispatch."""
+    try:
+        emit_event(
+            logs_dir(root),
+            component="fanout",
+            event=event,
+            level="WARNING",
+            message=message,
+            data=data or {},
+        )
+    except OSError:
+        pass
+
+
+def batch_caller(jobs: Sequence[Job]) -> str:
+    """The one caller handle every job shares, or "" when they disagree."""
+    handles = {job.caller_terminal for job in jobs if job.caller_terminal}
+    return next(iter(handles)) if len(handles) == 1 else ""
+
+
+def batch_origin(jobs: Sequence[Job], pane_key: str = "") -> dict:
+    """The Ticket origin a human fan-out of `jobs` stands for."""
+    handle = batch_caller(jobs)
+    origin = {
+        "role": "human",
+        "id": f"terminal:{handle}" if handle else "",
+        "text": f"super: {len(jobs)} tasks",
+    }
+    if pane_key:
+        origin["pane_key"] = pane_key
+    return origin
+
+
+async def caller_pane_key(handle: str) -> str:
+    """The pane identity of the caller terminal, or "" when it cannot be read.
+
+    The pane (`tabId:leafId`) outlives its runtime handle, so it is what the
+    daemon rebinds the conclusion's delivery address to. A failed listing is
+    not a fan-out failure: the origin simply carries no pane key.
+    """
+    if not handle:
+        return ""
+    from osw.orca_cli import terminal_list
+
+    try:
+        terminals = await terminal_list()
+    except Exception:
+        return ""
+    for entry in terminals:
+        if not isinstance(entry, dict):
+            continue
+        if handle not in (entry.get("handle"), entry.get("terminal"),
+                          entry.get("paneKey")):
+            continue
+        key = str(entry.get("paneKey") or "")
+        if not key:
+            tab = str(entry.get("tabId") or "")
+            leaf = str(entry.get("leafId") or "")
+            key = f"{tab}:{leaf}" if tab and leaf else ""
+        return key
+    return ""
+
+
+def _open_batch(root: Path, jobs: Sequence[Job], pane_key: str = "") -> str:
+    """One batch Ticket for the whole fan-out; "" (direct mode) on any failure."""
+    from osw import dispatcher
+    from osw.mailbox.paths import db_path
+    from osw.mailbox.store import Store
+
+    try:
+        store = Store(db_path(root))
+        try:
+            opened = dispatcher.open_batch(
+                store,
+                root=root,
+                origin=batch_origin(jobs, pane_key),
+                tasks=len(jobs),
+            )
+        finally:
+            store.close()
+    except Exception as exc:  # best effort: the dispatch must still run
+        _batch_warning(
+            root,
+            "batch_ticket_failed",
+            str(exc) or type(exc).__name__,
+            {"tasks": len(jobs)},
+        )
+        return ""
+    if isinstance(opened, dict):
+        opened = opened.get("id") or opened.get("ticket_id") or ""
+    return str(opened or "")
+
+
+def _seal_batch(root: Path, ticket_id: str) -> None:
+    """Seal the batch Ticket after every dispatch finished; best effort."""
+    from osw import dispatcher
+    from osw.mailbox.paths import db_path
+    from osw.mailbox.store import Store
+
+    try:
+        store = Store(db_path(root))
+        try:
+            dispatcher.seal_batch(store, ticket_id)
+        finally:
+            store.close()
+    except Exception as exc:  # best effort: dispatches already happened
+        _batch_warning(
+            root,
+            "batch_seal_failed",
+            str(exc) or type(exc).__name__,
+            {"ticket": ticket_id},
+        )
+
+
+def _record_assignment(
+    root: Path, ticket_id: str, agent_id: str, terminal: str,
+) -> None:
+    """Register one worker on the batch Ticket; a failure never stops it.
+
+    `new --ticket` already records its own assignment, so this is only the
+    fallback for a dispatch whose record the store did not keep; an agent
+    that is already assigned is never added twice.
+    """
+    from osw.mailbox.paths import db_path
+    from osw.mailbox.store import Store
+
+    try:
+        store = Store(db_path(root))
+        try:
+            entries = store.assignments(ticket_id)
+            if any(
+                isinstance(entry, dict) and entry.get("agent_id") == agent_id
+                for entry in entries
+            ):
+                return
+            store.add_assignment(
+                ticket_id,
+                {"agent_id": agent_id, "terminal": terminal, "state": "working"},
+            )
+        finally:
+            store.close()
+    except Exception as exc:  # best effort: the worker is already running
+        _batch_warning(
+            root,
+            "batch_assignment_failed",
+            str(exc) or type(exc).__name__,
+            {"ticket": ticket_id, "agent_id": agent_id},
+        )
+
+
+async def _dispatch_one(
+    job: Job, root: Path, no_notify: bool, ticket: str = "",
+) -> dict:
     """One `new`; a failure is reported, never raised."""
     base = {"index": job.index, "task": job.task}
     try:
         result = await run_command(
-            new_argv(job, no_notify=no_notify), root,
+            new_argv(job, no_notify=no_notify, ticket=ticket), root,
         )
     except TimeoutError:
         return {**base, "error": f"timed out after {COMMAND_TIMEOUT_S:.0f}s"}
@@ -496,11 +656,14 @@ async def _dispatch_one(job: Job, root: Path, no_notify: bool) -> dict:
                      + f"(exit code {result.returncode})",
         }
     agent_id, terminal = created
+    if ticket:
+        _record_assignment(root, ticket, agent_id, terminal)
     return {**base, "agent_id": agent_id, "terminal": terminal}
 
 
 async def _dispatch_all(
     jobs: Sequence[Job], root: Path, *, limit: int, no_notify: bool,
+    ticket: str = "",
 ) -> tuple[list[dict], list[dict]]:
     """Run every job with at most `limit` subprocesses in flight."""
     limiter = anyio.CapacityLimiter(limit)
@@ -509,7 +672,7 @@ async def _dispatch_all(
 
     async def one(job: Job) -> None:
         async with limiter:
-            outcome = await _dispatch_one(job, root, no_notify)
+            outcome = await _dispatch_one(job, root, no_notify, ticket)
         if "error" in outcome:
             errors.append(outcome)
         else:
@@ -591,9 +754,15 @@ async def _execute(
     no_notify: bool, json_output: bool,
 ) -> int:
     record = await _start_mailbox(root) if mailbox else None
+    ticket = ""
+    if record is not None:
+        pane_key = await caller_pane_key(batch_caller(jobs))
+        ticket = _open_batch(root, jobs, pane_key)
     agents, errors = await _dispatch_all(
-        jobs, root, limit=limit, no_notify=no_notify,
+        jobs, root, limit=limit, no_notify=no_notify, ticket=ticket,
     )
+    if ticket:
+        _seal_batch(root, ticket)
     data = payload(record, len(jobs), agents, errors)
     if json_output:
         print(json.dumps(data, ensure_ascii=False))
